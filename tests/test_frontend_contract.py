@@ -22,3 +22,6 @@ def test_vocal_ready_contract_uses_staged_generation_and_long_svg_first() -> Non
     assert "/vocal/generate" in source
     assert "Demucs 分离人声 → GAME" in source
     assert "score_svg_long" in source
+    assert 'name="separation-model"' in source
+    assert "htdemucs_ft" in source
+    assert "切换只对新任务生效" in source

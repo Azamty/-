@@ -19,6 +19,7 @@ from .job_manager import JobManager, _error_payload, safe_filename
 from .jianpu_score.analysis import MAX_AUDIO_BYTES, SUPPORTED_EXTENSIONS, probe_audio
 from .jianpu_score.capabilities import get_capabilities
 from .jianpu_score.domain import normalize_key, normalize_time_signature
+from .jianpu_score.models.demucs import DEFAULT_DEMUCS_MODEL, demucs_model_catalog, normalize_demucs_model
 from .jianpu_score.pipeline import SUPPORTED_ENGINES
 from .soundfont import ensure_soundfont, soundfont_status
 
@@ -294,7 +295,16 @@ def create_app(
                 "vocal_engine": "GAME",
                 "routes": {
                     "instrumental": {"engine": "muscriptor", "model": "medium", "use_demucs": False},
-                    "vocal": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                    "vocal": {
+                        "engine": "game",
+                        "use_demucs": True,
+                        "separation_engine": "demucs",
+                        "separation_model": DEFAULT_DEMUCS_MODEL,
+                        "separation_models": {
+                            "default": DEFAULT_DEMUCS_MODEL,
+                            "options": demucs_model_catalog(),
+                        },
+                    },
                 },
             },
             "upload_extensions": sorted(SUPPORTED_EXTENSIONS),
@@ -356,16 +366,26 @@ def create_app(
         file: UploadFile = File(...),
         source_kind: str = Form("instrumental"),
         title: str | None = Form(None),
+        separation_model: str | None = Form(None),
     ) -> JobResponse:
         suffix = _safe_upload_extension(file.filename)
         if source_kind not in {"instrumental", "vocal"}:
             raise _form_error("V2 来源只能是伴奏/纯音乐或人声")
+        try:
+            selected_model = normalize_demucs_model(separation_model)
+        except ValueError as exc:
+            raise _form_error(str(exc)) from exc
+        # The instrumental route never invokes Demucs.  Accepting a valid
+        # value here keeps the API tolerant of generic clients, but do not
+        # persist or apply that choice to MuScriptor jobs.
+        selected_model = selected_model if source_kind == "vocal" else None
         original_name = safe_filename(file.filename)
         clean_title = safe_filename(title) if title and title.strip() else Path(original_name).stem
         job_id, input_path = manager.create_v2_job(
             original_name=original_name,
             source_kind=source_kind,
             title=clean_title,
+            separation_model=selected_model,
         )
         try:
             bytes_count, input_path = await _write_upload(manager, job_id, file, max_bytes=max_upload_bytes)

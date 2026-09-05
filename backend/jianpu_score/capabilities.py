@@ -10,6 +10,7 @@ from typing import Any
 
 from .analysis import resolve_ffmpeg, resolve_ffprobe
 from .models.game import DEFAULT_GAME_MODEL, GAME_ROOT, game_config_path, game_model_path, game_python, load_game_language_map
+from .models.demucs import DEFAULT_DEMUCS_MODEL, demucs_model_catalog
 from .models.tsumugi import STEM_MODEL_TYPES, TSUMUGI_CHECKPOINTS, TSUMUGI_ROOT, tsumugi_python
 
 
@@ -324,7 +325,13 @@ def _compute_capabilities() -> dict[str, Any]:
                 "reason": demucs_reason,
                 "environment": os.fspath(demucs_python),
                 "stems": ["vocals", "drums", "bass", "other"],
-            }
+            },
+            "demucs-htdemucs_ft": {
+                "available": demucs_available,
+                "reason": demucs_reason,
+                "environment": os.fspath(demucs_python),
+                "stems": ["vocals", "drums", "bass", "other"],
+            },
         },
         "rendering": {
             "jianpu-ly": {
@@ -369,7 +376,11 @@ def _compute_capabilities() -> dict[str, Any]:
                 "engine": "game",
                 "use_demucs": True,
                 "separation_engine": "demucs",
-                "separation_model": "htdemucs",
+                "separation_model": DEFAULT_DEMUCS_MODEL,
+                "separation_models": {
+                    "default": DEFAULT_DEMUCS_MODEL,
+                    "options": demucs_model_catalog(),
+                },
             },
         },
     }

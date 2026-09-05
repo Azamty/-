@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 
 from backend.app import create_app
 from backend.jianpu_score.analysis import probe_audio
+from backend.jianpu_score.models.demucs import DEMUCS_MODEL_IDS
 
 
 def _wait(client: TestClient, job_id: str, expected: set[str], timeout: float = 300.0) -> dict[str, object]:
@@ -47,6 +48,7 @@ def main() -> int:
     parser.add_argument("--audio", type=Path, default=ROOT / "artifacts" / "review" / "scale_reference.wav")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts" / "review" / "stageC-api" / "smoke.json")
     parser.add_argument("--source-kind", choices=("instrumental", "vocal"), default="instrumental")
+    parser.add_argument("--separation-model", choices=sorted(DEMUCS_MODEL_IDS), default="htdemucs")
     args = parser.parse_args()
     if not args.audio.is_file():
         raise SystemExit(f"audio fixture not found: {args.audio}")
@@ -57,7 +59,11 @@ def main() -> int:
         with args.audio.open("rb") as handle:
             response = client.post(
                 "/api/v2/jobs",
-                data={"source_kind": args.source_kind, "title": f"V2 {args.source_kind} API fixture"},
+                data={
+                    "source_kind": args.source_kind,
+                    "title": f"V2 {args.source_kind} API fixture",
+                    **({"separation_model": args.separation_model} if args.source_kind == "vocal" else {}),
+                },
                 files={"file": (args.audio.name, handle, "audio/wav")},
             )
         response.raise_for_status()
@@ -99,7 +105,7 @@ def main() -> int:
                 raise RuntimeError("V2 vocal API smoke found no score SVG and MIDI")
             evidence = {
                 "status": "passed",
-                "route": {"source_kind": "vocal", "engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                "route": (completed.get("v2") or {}).get("route"),
                 "job_id": job_id,
                 "phases": {"vocal_ready": vocal_ready["phase"], "generate_queued": queued["phase"], "completed": completed["phase"]},
                 "vocal_audio_duration_sec": float(vocal_probe["duration_sec"]),

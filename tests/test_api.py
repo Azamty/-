@@ -65,6 +65,22 @@ def test_v2_capabilities_report_route_specific_demucs(tmp_path: Path) -> None:
     assert routes["instrumental"]["use_demucs"] is False
     assert routes["vocal"]["use_demucs"] is True
     assert routes["vocal"]["separation_model"] == "htdemucs"
+    assert routes["vocal"]["separation_models"]["default"] == "htdemucs"
+    assert [item["id"] for item in routes["vocal"]["separation_models"]["options"]] == ["htdemucs", "htdemucs_ft"]
+    assert "约慢 4 倍" in routes["vocal"]["separation_models"]["options"][1]["speed_note"]
+
+
+def test_v2_rejects_unknown_separation_model_before_upload_probe(tmp_path: Path) -> None:
+    app = create_app(jobs_root=tmp_path / "jobs")
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/jobs",
+            data={"source_kind": "vocal", "separation_model": "unknown-model"},
+            files={"file": ("voice.wav", b"not audio", "audio/wav")},
+        )
+    assert response.status_code == 422
+    assert "htdemucs_ft" in response.json()["detail"]["message"]
+    assert not list((tmp_path / "jobs").iterdir())
 
 
 @pytest.mark.parametrize(

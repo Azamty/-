@@ -77,6 +77,18 @@ h1 em { color: var(--coral); font-style: normal; }
 .field-stack label, .override-fields label { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; font-size: 12px; font-weight: 700; }
 input:not([type="checkbox"]):not([type="range"]), select { width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 0; background: rgba(255, 255, 255, .48); color: var(--ink); font-family: var(--mono); font-size: 12px; }
 select { appearance: auto; }
+.demucs-options { margin: 18px 0 0; border: 1px solid var(--line); padding: 12px; min-width: 0; }
+.demucs-options legend { padding: 0 6px; color: var(--ink-soft); font-size: 11px; font-weight: 800; letter-spacing: .04em; }
+.model-choice-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.model-choice { display: flex; align-items: flex-start; gap: 9px; border: 1px solid var(--line); padding: 10px; cursor: pointer; background: rgba(255,255,255,.22); }
+.model-choice.selected { border-color: var(--coral); background: #f3e6d7; }
+.model-choice input { margin-top: 3px; accent-color: var(--coral-dark); }
+.model-choice span { display: grid; gap: 3px; }
+.model-choice strong { font-size: 12px; }
+.model-choice small { color: #717a74; line-height: 1.35; }
+.demucs-options:disabled { opacity: .74; }
+.model-note { margin: 9px 0 0; color: #717a74; font-size: 11px; line-height: 1.45; }
+.model-readout { color: var(--coral-dark); font-weight: 700; }
 .primary-action, .outline-action, .listen-button { min-height: 44px; border: 1px solid var(--coral-dark); padding: 0 15px; display: inline-flex; align-items: center; justify-content: center; gap: 12px; color: var(--paper); background: var(--coral-dark); font-family: var(--mono); font-size: 11px; letter-spacing: .05em; }
 .primary-action { width: 100%; margin-top: 20px; justify-content: space-between; }
 .primary-action strong { font-size: 18px; font-weight: 400; }
@@ -225,6 +237,7 @@ input[type="range"] { width: 70px; accent-color: var(--coral); }
   .source-panel, .control-panel, .status-panel, .instrument-workspace, .vocal-result { padding: 20px; }
   .panel-heading h2 { font-size: 23px; }
   .track-list { grid-template-columns: 1fr; }
+  .model-choice-list { grid-template-columns: 1fr; }
   .roll-tools { display: grid; gap: 6px; }
   .export-rail { grid-template-columns: 1fr; }
   .override-fields { display: grid; grid-template-columns: repeat(3, 1fr); }

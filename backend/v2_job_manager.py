@@ -18,7 +18,12 @@ import numpy as np
 from .jianpu_score.analysis import analyze_audio, load_audio, probe_audio
 from .jianpu_score.domain import MusicAnalysis, NoteEvent, normalize_key, normalize_time_signature
 from .jianpu_score.models.adapter import EngineResult, run_engine
-from .jianpu_score.models.demucs import separate_htdemucs
+from .jianpu_score.models.demucs import (
+    DEFAULT_DEMUCS_MODEL,
+    demucs_model_catalog,
+    normalize_demucs_model,
+    separate_htdemucs,
+)
 from .jianpu_score.quantize import NoNotesError, quantize_events
 from .jianpu_score.render import render_score, write_score_json
 from .jianpu_score.svg_long import merge_svg_pages
@@ -81,9 +86,19 @@ class V2JobService:
     def __init__(self, manager: Any) -> None:
         self.manager = manager
 
-    def create_job(self, *, original_name: str, source_kind: str, title: str) -> tuple[str, Path]:
+    def create_job(
+        self,
+        *,
+        original_name: str,
+        source_kind: str,
+        title: str,
+        separation_model: str | None = None,
+    ) -> tuple[str, Path]:
         if source_kind not in V2_SOURCE_KINDS:
             raise ValueError("V2 source_kind must be instrumental or vocal")
+        selected_model = normalize_demucs_model(separation_model)
+        if source_kind != "vocal":
+            selected_model = None
         job_id = str(uuid.uuid4())
         directory = self.manager._safe_job_dir(job_id)
         directory.mkdir(parents=True, exist_ok=False)
@@ -109,6 +124,7 @@ class V2JobService:
                 "language": "mixed",
                 "separate": False,
                 "title": title,
+                "separation_model": selected_model,
             },
             "input": {
                 "original_name": self._filename(original_name),
@@ -128,7 +144,14 @@ class V2JobService:
                 "route": {
                     "engine": engine,
                     "use_demucs": source_kind == "vocal",
-                    **({"separation_engine": "demucs", "separation_model": "htdemucs"} if source_kind == "vocal" else {}),
+                    **(
+                        {
+                            "separation_engine": "demucs",
+                            "separation_model": selected_model,
+                        }
+                        if source_kind == "vocal"
+                        else {}
+                    ),
                 },
                 "tracks": [],
                 "notes": [],
@@ -151,6 +174,31 @@ class V2JobService:
 
     def is_v2(self, job_id: str) -> bool:
         return self.manager._read(job_id).get("kind") == "v2"
+
+    @staticmethod
+    def _vocal_model(state: Mapping[str, Any]) -> str:
+        """Read the durable model choice, with v2.0 compatibility fallback."""
+
+        v2 = state.get("v2") or {}
+        separation = v2.get("separation") or {}
+        route = v2.get("route") or {}
+        options = state.get("options") or {}
+        return normalize_demucs_model(
+            separation.get("model") or route.get("separation_model") or options.get("separation_model") or DEFAULT_DEMUCS_MODEL
+        )
+
+    @staticmethod
+    def _vocal_route(model: str) -> dict[str, Any]:
+        return {
+            "engine": "game",
+            "use_demucs": True,
+            "separation_engine": "demucs",
+            "separation_model": model,
+        }
+
+    @staticmethod
+    def _vocal_model_info(model: str) -> dict[str, Any]:
+        return next(item for item in demucs_model_catalog() if item["id"] == model)
 
     def generate_vocal(self, job_id: str) -> dict[str, Any]:
         """Queue GAME for a previously separated vocal stem.
@@ -177,8 +225,16 @@ class V2JobService:
             prepared = self._prepared_vocal_path(job_id, state)
             self._validate_internal_vocal_path(job_id, prepared)
             v2 = dict(state.get("v2", {}))
+            model = self._vocal_model(state)
             v2["stage"] = "vocal_generate"
-            v2["progress_detail"] = {"status": "queued", "engine": "game", "input": "v2-vocals-audio"}
+            v2["route"] = self._vocal_route(model)
+            v2["progress_detail"] = {
+                "status": "queued",
+                "engine": "game",
+                "input": "v2-vocals-audio",
+                "model": model,
+                "separation_model": model,
+            }
             state.update(
                 {
                     "v2": v2,
@@ -517,7 +573,10 @@ class V2JobService:
         output.mkdir(parents=True, exist_ok=True)
         input_path = self.manager.input_path(job_id)
         _samples, analysis = analyze_audio(input_path)
-        stems = separate_htdemucs(input_path, output / "demucs", process_holder=self.manager)
+        state = self.manager._read(job_id)
+        model = self._vocal_model(state)
+        model_info = self._vocal_model_info(model)
+        stems = separate_htdemucs(input_path, output / "demucs", model=model, process_holder=self.manager)
         vocal_path = stems.get("vocals") if isinstance(stems, Mapping) else None
         if vocal_path is None:
             raise ValueError("Demucs 未生成 vocals 人声结果，请更换音频后重试")
@@ -567,7 +626,8 @@ class V2JobService:
         ]
         separation = {
             "engine": "demucs",
-            "model": "htdemucs",
+            "model": model,
+            "model_info": model_info,
             "source": "vocal",
             "stem": "vocals",
             "artifact_id": "v2-vocals-audio",
@@ -582,10 +642,10 @@ class V2JobService:
             v2.update(
                 {
                     "stage": "vocal_ready",
-                    "route": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                    "route": self._vocal_route(model),
                     "analysis": analysis_suggestion,
                     "separation": separation,
-                    "progress_detail": {"status": "vocal_ready", "engine": "demucs", "model": "htdemucs"},
+                    "progress_detail": {"status": "vocal_ready", "engine": "demucs", "model": model, "separation_model": model},
                 }
             )
             state.update(
@@ -600,7 +660,7 @@ class V2JobService:
                     "progress": 1.0,
                     "summary": {
                         "source_kind": "vocal",
-                        "route": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                        "route": self._vocal_route(model),
                         "stage": "vocal_ready",
                         "separation": separation,
                         "analysis": analysis_suggestion,
@@ -616,6 +676,7 @@ class V2JobService:
 
         state = self.manager._read(job_id)
         options = dict(state.get("options", {}))
+        model = self._vocal_model(state)
         vocal_path = self._prepared_vocal_path(job_id, state)
         analysis = self._prepared_analysis(job_id, state)
         self.manager._set_phase(job_id, "recognizing")
@@ -689,13 +750,15 @@ class V2JobService:
             if artifact.get("kind") in {"score_svg", "score_json", "jianpu_source", "lilypond_source", "midi", "stem_svg", "stem_midi"}:
                 artifact["label"] = "人声主旋律" + (f"（{artifact['label']}）" if artifact.get("label") else "")
         separation = dict((state.get("v2") or {}).get("separation") or {})
+        separation["model"] = model
+        separation.setdefault("model_info", self._vocal_model_info(model))
         with self.manager._lock:
             current = self.manager._read(job_id)
             current_v2 = dict(current.get("v2", {}))
             current_v2.update(
                 {
                     "stage": "vocal_complete",
-                    "route": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                    "route": self._vocal_route(model),
                     "analysis": _analysis_suggestion(analysis),
                     "generation": {
                         "engine": "game",
@@ -704,7 +767,7 @@ class V2JobService:
                         "analysis_reused_from_original": True,
                     },
                     "separation": separation,
-                    "progress_detail": {"status": "completed", "engine": "game", "stem": "vocals"},
+                    "progress_detail": {"status": "completed", "engine": "game", "stem": "vocals", "model": model, "separation_model": model},
                 }
             )
             current.update(
@@ -719,7 +782,7 @@ class V2JobService:
                     "warnings": list(dict.fromkeys([*analysis.warnings, *score.warnings, *separation.get("warnings", [])])),
                     "summary": {
                         "source_kind": "vocal",
-                        "route": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                        "route": self._vocal_route(model),
                         "stage": "completed",
                         "note_count": len(analysis.note_events),
                         "voice_count": len(score.voices),

@@ -100,7 +100,7 @@ API 入口为 `GET /api/capabilities`、`POST /api/jobs`、`GET /api/jobs/{job_i
 
 ### V2 MuScriptor 工作台
 
-`v2/muscriptor` 的页面只使用 `/api/v2/...` 任务入口，来源固定为“伴奏 / 纯音乐（MuScriptor）”或“人声（GAME）”。纯音乐任务会先做一次 MuScriptor medium 全量识别，进入“识别完成，等待选择”，页面按中文乐器名、模型分类名和 note count 展示轨道，并用颜色对应时间同步钢琴卷帘。每条轨道只有一个 checkbox，它同时控制卷帘显示、SpessaSynth 试听、选择 MIDI 和分谱；鼓组可以试听并保留在选择 MIDI 中，但不会生成简谱。人声任务先运行 Demucs htdemucs，只登记并展示 `vocals` stem 供原曲/分离人声试听，用户点击“下一步 · 生成人声简谱”后才把该 stem 交给 GAME；刷新会保留 `vocal_ready`。页面的本机合成试听使用浏览器 SpessaSynth + 官方 MuseScore General SF3，识别 NoteEvent 的 `velocity` 保持 `None`，试听只使用固定 playback default。
+`v2/muscriptor` 的页面只使用 `/api/v2/...` 任务入口，来源固定为“伴奏 / 纯音乐（MuScriptor）”或“人声（GAME）”。纯音乐任务会先做一次 MuScriptor medium 全量识别，进入“识别完成，等待选择”，页面按中文乐器名、模型分类名和 note count 展示轨道，并用颜色对应时间同步钢琴卷帘。每条轨道只有一个 checkbox，它同时控制卷帘显示、SpessaSynth 试听、选择 MIDI 和分谱；鼓组可以试听并保留在选择 MIDI 中，但不会生成简谱。人声任务先运行 Demucs：默认是快速的 `htdemucs`，也可在上传前选择质量优先的 `htdemucs_ft`；任务创建后控件锁定并显示实际模型，避免误以为切换会作用于已经生成的 stem。分离阶段只登记并展示 `vocals` stem 供原曲/分离人声试听，用户点击“下一步 · 生成人声简谱”后才把该 stem 交给 GAME；刷新会保留 `vocal_ready` 和模型选择。页面的本机合成试听使用浏览器 SpessaSynth + 官方 MuseScore General SF3，识别 NoteEvent 的 `velocity` 保持 `None`，试听只使用固定 playback default。
 
 识别阶段会复用 `MusicAnalysis` 返回 BPM、调性、拍号建议、候选值和警告；拍号自动分析未启用时会按 `4/4` 回退并要求生成前确认。选择导出前的覆盖值会写入 selection revision，并实际作用于选择 MIDI 与每轨分谱渲染。原曲 `<audio>` 与合成试听分开。每个多页结果都登记纵向合并的矢量长图并在页面首位默认展示，分页 SVG 仍按页保留并放入可展开区域，全部分页页面仍进入 ZIP；长图合并器通过 XML 解析重命名重复 id 和引用，拒绝脚本、外部资源和超限尺寸。刷新会按 job UUID 恢复 V2 job、选择、覆盖值和钢琴卷帘状态；创建新任务会清空旧任务的覆盖值。`?fixture=multitrack` 可载入不调用模型的受控三轨（钢琴、小提琴、鼓组）页面，`?fixture=vocal-ready` 可载入分离完成的人声页面，用于验证两阶段试听和下一步按钮。
 
@@ -110,7 +110,7 @@ API 入口为 `GET /api/capabilities`、`POST /api/jobs`、`GET /api/jobs/{job_i
 - 基础档调用独立环境中的 Basic Pitch，适合先快速试谱；专用档按来源调用 GAME 或 tsumugi。所有模型优先 CPU，耗时取决于时长和机器性能。阶段验收中 6 秒样本约 51 秒，180 秒合成曲的完整 API 任务约 214 秒；这些是本机参考值，不是性能保证。
 - BPM、调性和拍号可以在生成前覆盖。自动拍号当前只给出 `2/4`、`3/4`、`4/4`、`6/8` 候选并回退到 `4/4`，结果会提示确认；音符先经过共享拍点时间线和 Score，再生成 SVG 与 MIDI。
 - 简谱级数、主旋律连续性和分轨结果会受到混音、噪声、复音和模型能力影响。现有真实模型验收使用短参考音阶和 180 秒合成规模样本；没有把中日文或混合语言真实歌曲准确度宣称为已验证，生成结果需要人工复核。
-- MuScriptor 负责伴奏/纯音乐的全量识别但不提供原始音轨分离；乐器误分类、漏检、复音重叠和鼓音高映射都可能影响轨道与分谱。V2 instrumental 不调用 Demucs；V2 vocal 只用 Demucs 提取 vocals，GAME 不接收原始混音或伴奏 stem，分离残留和 GAME 漏检仍需人工复核。自动拍号当前只提供 `2/4`、`3/4`、`4/4`、`6/8` 候选，无法可靠判断时回退到 `4/4` 并显示警告。
+- MuScriptor 负责伴奏/纯音乐的全量识别但不提供原始音轨分离；乐器误分类、漏检、复音重叠和鼓音高映射都可能影响轨道与分谱。V2 instrumental 不调用 Demucs；V2 vocal 只用所选 Demucs 模型提取 vocals，GAME 不接收原始混音或伴奏 stem，分离残留和 GAME 漏检仍需人工复核。Demucs 官方 README 将 `htdemucs` 列为默认模型，并说明 `htdemucs_ft` 是 fine-tuned 版本，分离约慢 4 倍但可能略好；本地页面沿用这两个官方模型 ID 和提示，来源为 [Demucs 官方 README](https://github.com/facebookresearch/demucs#separating-tracks)。自动拍号当前只提供 `2/4`、`3/4`、`4/4`、`6/8` 候选，无法可靠判断时回退到 `4/4` 并显示警告。
 - 180 秒规模验收记录在 `artifacts\review\stage5-final\run-20260904T120124Z\summary.json`：输入 180.0 秒，真实 Demucs + Basic Pitch 用时约 213.8 秒，分析首个事件约 0.012 秒、末个事件约 178.792 秒，Score 为 2 页，总谱和器乐分谱 MIDI 都是 180.0 秒。该目录中的 JSON、SVG、MIDI 和 ZIP 是可复查证据。
 
 后台启动可双击 `scripts\start_server.cmd`，或执行 `.\scripts\start_server.ps1 -Background`；当前 `v2/muscriptor` checkout 启动的是 V2 页面。服务 PID 保存在 `artifacts\server.pid`。停止后台服务可双击 `scripts\stop_server.cmd`，或执行 `.\scripts\stop_server.ps1`，脚本会结束已核验的服务进程树，避免模型子进程残留和下一次启动重复 worker。前台运行 `.\scripts\start_server.ps1` 时，在该窗口按 Ctrl+C 退出。
@@ -121,7 +121,7 @@ GAME 源码随项目放在 `vendor\GAME-1.0.3`，其 `LICENSE` 为 MIT；使用�
 
 ## V2 阶段B（本机 MuScriptor smoke）
 
-V2 的伴奏路径直接把完整混音交给 MuScriptor，先完成一次全量识别，再按识别出的乐器选择分谱；鼓保留试听和 MIDI，跳过简谱渲染。人声路径先由 Demucs htdemucs 提取并持久化 vocals，再由用户操作触发 GAME。依赖安装在独立的 `.venv-model-muscriptor` 中，Windows GPU 默认选择 CUDA 12.8：
+V2 的伴奏路径直接把完整混音交给 MuScriptor，先完成一次全量识别，再按识别出的乐器选择分谱；鼓保留试听和 MIDI，跳过简谱渲染。人声路径在任务创建时选择 Demucs `htdemucs`（默认）或 `htdemucs_ft`，把选择持久化并按模型名写入分离目录，先提取并持久化 vocals，再由用户操作触发 GAME。依赖安装在独立的 `.venv-model-muscriptor` 中，Windows GPU 默认选择 CUDA 12.8：
 
 ```powershell
 .\scripts\install_muscriptor.ps1
@@ -147,7 +147,8 @@ MuScriptor medium CUDA worker 全量识别一次，任务进入 `selection_ready
 `no_pitched_tracks` 简谱拒绝。合并主旋律是单声部可选产物，会明确标记和声损失，
 不称为总谱。每次选择都会产生递增 revision，旧 artifact 保留并使用不同 ID。
 
-人声路径先由 `POST /api/v2/jobs` 排入 Demucs，任务到达 `vocal_ready` 后提供原曲和
+人声路径先由 `POST /api/v2/jobs` 排入所选 Demucs 模型（`separation_model` 只接受
+`htdemucs` 和 `htdemucs_ft`，缺省兼容为 `htdemucs`），任务到达 `vocal_ready` 后提供原曲和
 `v2-vocals-audio` 分离 stem；`POST /api/v2/jobs/{id}/vocal/generate` 才排入 GAME，
 并复用原音 `MusicAnalysis`，不会重复分离或把伴奏送入 GAME。完成后提供人声主旋律
 Score/SVG/MIDI 和长图 SVG。MuScriptor NoteEvent 的 `velocity` 保持 `null`，MIDI 试听

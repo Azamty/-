@@ -15,5 +15,5 @@ evidence/
 
 # Keep source and scripts in the repository; local models and the rebuildable
 # LilyPond bundle stay outside the index.
-models/
+/models/
 tools/lilypond-*/

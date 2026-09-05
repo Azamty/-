@@ -168,6 +168,9 @@ def test_v2_vocal_separation_then_game_reuses_only_vocals_stem(monkeypatch, tmp_
     manager = JobManager(tmp_path / "jobs")
     job_id, input_path = manager.create_v2_job(original_name="voice.wav", source_kind="vocal", title="voice")
     input_path.write_bytes(b"fixture")
+    initial = manager._read(job_id)
+    assert initial["options"]["separation_model"] == "htdemucs"
+    assert initial["v2"]["route"]["separation_model"] == "htdemucs"
     manager._update(job_id, status="running", phase="separating")
     analysis = MusicAnalysis(
         sample_rate=16000,
@@ -177,8 +180,9 @@ def test_v2_vocal_separation_then_game_reuses_only_vocals_stem(monkeypatch, tmp_
     )
     game_calls: list[dict[str, object]] = []
 
-    def fake_demucs(_audio: Path, output: Path, **_kwargs: object) -> dict[str, Path]:
-        stem_dir = output / "htdemucs" / "input"
+    def fake_demucs(_audio: Path, output: Path, *, model: str, **_kwargs: object) -> dict[str, Path]:
+        assert model == "htdemucs"
+        stem_dir = output / model / "input"
         stem_dir.mkdir(parents=True)
         stems = {name: stem_dir / f"{name}.wav" for name in ("vocals", "drums", "bass", "other")}
         for path in stems.values():
@@ -227,7 +231,47 @@ def test_v2_vocal_separation_then_game_reuses_only_vocals_stem(monkeypatch, tmp_
     assert call["stem_id"] == "vocals"
     assert result["summary"]["source_kind"] == "vocal"
     assert result["summary"]["route"]["use_demucs"] is True
+    assert result["summary"]["route"]["separation_model"] == "htdemucs"
+    assert result["v2"]["progress_detail"]["separation_model"] == "htdemucs"
     assert result["v2"]["generation"]["analysis_reused_from_original"] is True
+
+
+def test_v2_vocal_ft_model_is_persisted_through_retry(tmp_path: Path) -> None:
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input_path = manager.create_v2_job(
+        original_name="voice.wav",
+        source_kind="vocal",
+        title="voice",
+        separation_model="htdemucs_ft",
+    )
+    state = manager._read(job_id)
+    assert state["options"]["separation_model"] == "htdemucs_ft"
+    assert state["v2"]["route"]["separation_model"] == "htdemucs_ft"
+    state.update(
+        {
+            "status": "failed",
+            "phase": "failed",
+            "error": {"code": "processing_error", "message": "fixture"},
+            "v2": {**state["v2"], "stage": "vocal_generate"},
+        }
+    )
+    manager._write(state)
+    retried = manager.retry(job_id)
+    assert retried["v2"]["route"]["separation_model"] == "htdemucs_ft"
+    assert retried["options"]["separation_model"] == "htdemucs_ft"
+
+
+def test_v2_instrumental_does_not_apply_demucs_model_choice(tmp_path: Path) -> None:
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input_path = manager.create_v2_job(
+        original_name="mix.wav",
+        source_kind="instrumental",
+        title="mix",
+        separation_model="htdemucs_ft",
+    )
+    state = manager._read(job_id)
+    assert state["options"]["separation_model"] is None
+    assert "separation_model" not in state["v2"]["route"]
 
 
 def test_v2_vocal_generate_rejects_invalid_state_and_cross_job_stem(tmp_path: Path) -> None:

@@ -14,7 +14,7 @@ export const FIXTURE_VOCAL_JOB = {
   v2: {
     source_kind: "vocal",
     source_label: "人声",
-    route: { engine: "game", use_demucs: true, separation_engine: "demucs", separation_model: "htdemucs" },
+    route: { engine: "game", use_demucs: true, separation_engine: "demucs", separation_model: "htdemucs_ft" },
     analysis: {
       bpm: 92,
       key: "Am",
@@ -23,6 +23,6 @@ export const FIXTURE_VOCAL_JOB = {
       warnings: ["自动拍号识别尚未启用，暂按 4/4；生成后请确认"],
       sources: { bpm: "fixture", key: "fixture", time_signature: "fallback" },
     },
-    separation: { artifact_id: "v2-vocals-audio", duration_sec: 5.98, warnings: ["这是模型分离结果，可能含伴奏残留。"] },
+    separation: { artifact_id: "v2-vocals-audio", model: "htdemucs_ft", duration_sec: 5.98, warnings: ["这是模型分离结果，可能含伴奏残留。"] },
   },
 } as const;

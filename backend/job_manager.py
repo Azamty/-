@@ -375,10 +375,22 @@ class JobManager:
         self._log(job_id, f"created: {state['input']['original_name']}")
         return job_id, input_path
 
-    def create_v2_job(self, *, original_name: str, source_kind: str, title: str) -> tuple[str, Path]:
+    def create_v2_job(
+        self,
+        *,
+        original_name: str,
+        source_kind: str,
+        title: str,
+        separation_model: str | None = None,
+    ) -> tuple[str, Path]:
         """Create a V2 task while keeping its queue on this manager's worker."""
 
-        return self.v2.create_job(original_name=original_name, source_kind=source_kind, title=title)
+        return self.v2.create_job(
+            original_name=original_name,
+            source_kind=source_kind,
+            title=title,
+            separation_model=separation_model,
+        )
 
     def select_v2(
         self,
