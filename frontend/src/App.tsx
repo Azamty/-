@@ -90,6 +90,9 @@ type SoundfontStatus = {
   source?: string;
   license?: string;
   message?: string;
+  media_type?: string;
+  download_url?: string;
+  range_supported?: boolean;
 };
 
 type AnalysisSuggestion = {
@@ -125,6 +128,392 @@ const formatBytes = (value?: number | null) => {
   if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
 };
+
+class SynthPlaybackError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "SynthPlaybackError";
+    this.code = code;
+  }
+}
+
+type BrowserAudioWindow = Window & { webkitAudioContext?: typeof AudioContext };
+
+const isLocalBrowserHost = () => {
+  const hostname = window.location.hostname.toLowerCase();
+  return hostname === "localhost"
+    || hostname === "127.0.0.1"
+    || hostname === "[::1]"
+    || hostname.endsWith(".localhost");
+};
+
+const getAudioContextConstructor = (): typeof AudioContext | undefined => {
+  const browserWindow = window as BrowserAudioWindow;
+  const nativeAudioContext = (browserWindow as unknown as { AudioContext?: typeof AudioContext }).AudioContext;
+  return nativeAudioContext || browserWindow.webkitAudioContext;
+};
+
+const isSoundfontContentType = (value: string | null) => {
+  if (!value) return true;
+  const mediaType = value.split(";", 1)[0].trim().toLowerCase();
+  return mediaType === "audio/x-soundfont-sf3"
+    || mediaType === "application/octet-stream"
+    || mediaType === "audio/sf2";
+};
+
+const isRiffContainer = (buffer: ArrayBuffer) => {
+  if (buffer.byteLength < 12) return false;
+  const header = new Uint8Array(buffer, 0, 4);
+  const form = new Uint8Array(buffer, 8, 4);
+  return String.fromCharCode(...header) === "RIFF"
+    && ["sfbk", "sfen"].includes(String.fromCharCode(...form).toLowerCase());
+};
+
+async function readSoundfontResponse(
+  response: Response,
+  expectedBytes: number | null | undefined,
+  onProgress: (received: number, total: number | null) => void,
+): Promise<ArrayBuffer> {
+  const rawLength = response.headers.get("content-length");
+  const declaredBytes = rawLength ? Number.parseInt(rawLength, 10) : null;
+  const total = declaredBytes && Number.isFinite(declaredBytes) ? declaredBytes : (expectedBytes || null);
+  const expectedBodyBytes = expectedBytes || (declaredBytes && Number.isFinite(declaredBytes) ? declaredBytes : null);
+  if (declaredBytes && expectedBytes && declaredBytes !== expectedBytes) {
+    throw new SynthPlaybackError(
+      "soundfont_size_mismatch",
+      `音色库响应大小异常（声明 ${formatBytes(declaredBytes)}，应为约 ${formatBytes(expectedBytes)}）。隧道可能截断了大文件。`,
+    );
+  }
+
+  if (!response.body) {
+    const buffer = await response.arrayBuffer();
+    onProgress(buffer.byteLength, total);
+    if (expectedBodyBytes && buffer.byteLength !== expectedBodyBytes) {
+      throw new SynthPlaybackError(
+        "soundfont_incomplete",
+        `音色库只收到 ${formatBytes(buffer.byteLength)}，应为约 ${formatBytes(expectedBodyBytes)}。请检查隧道的大文件传输。`,
+      );
+    }
+    if (!isRiffContainer(buffer)) {
+      throw new SynthPlaybackError("soundfont_invalid_body", "音色库响应不是有效 SF3 文件，隧道可能返回了 HTML 登录页或错误页。");
+    }
+    return buffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  while (true) {
+    const result = await reader.read();
+    if (result.done) break;
+    if (!result.value?.byteLength) continue;
+    const chunk = new Uint8Array(result.value);
+    chunks.push(chunk);
+    received += chunk.byteLength;
+    onProgress(received, total);
+  }
+
+  if (expectedBodyBytes && received !== expectedBodyBytes) {
+    throw new SynthPlaybackError(
+      "soundfont_incomplete",
+      `音色库只收到 ${formatBytes(received)}，应为约 ${formatBytes(expectedBodyBytes)}。请检查隧道的大文件传输。`,
+    );
+  }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  chunks.forEach((chunk) => {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  });
+  const buffer = bytes.buffer;
+  if (!isRiffContainer(buffer)) {
+    throw new SynthPlaybackError("soundfont_invalid_body", "音色库响应不是有效 SF3 文件，隧道可能返回了 HTML 登录页或错误页。");
+  }
+  return buffer;
+}
+
+const SOUND_FONT_CACHE_NAME = "jianpu-v2-soundfont-v2";
+const SOUND_FONT_CHUNK_BYTES = 512 * 1024;
+const SOUND_FONT_CHUNK_RETRIES = 2;
+const SOUND_FONT_CHUNK_TIMEOUT_MS = 15_000;
+
+type SoundfontCacheReadResult = {
+  buffer: ArrayBuffer | null;
+  notice?: string;
+};
+
+type SoundfontCacheWriteResult = {
+  saved: boolean;
+  notice: string;
+};
+
+const soundfontVersion = (status: SoundfontStatus | null) => {
+  const candidate = (status?.expected_sha256 || status?.sha256 || "").trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(candidate) ? candidate : null;
+};
+
+const soundfontCacheKey = (version: string | null) => (
+  version ? `/api/v2/soundfont?sha256=${version}` : null
+);
+
+const cacheFailureReason = (caught: unknown) => {
+  if (caught instanceof DOMException) {
+    if (caught.name === "QuotaExceededError") return "浏览器存储空间不足";
+    if (caught.name === "SecurityError") return "浏览器隐私或安全策略阻止缓存";
+    if (caught.name === "NotAllowedError") return "浏览器未允许缓存";
+    return `浏览器缓存不可用（${caught.name || "DOMException"}）`;
+  }
+  return "浏览器缓存不可用";
+};
+
+const waitForRetry = (milliseconds: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+  if (signal.aborted) {
+    reject(new DOMException("Aborted", "AbortError"));
+    return;
+  }
+  const timer = window.setTimeout(() => {
+    signal.removeEventListener("abort", onAbort);
+    resolve();
+  }, milliseconds);
+  const onAbort = () => {
+    window.clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
+    reject(new DOMException("Aborted", "AbortError"));
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+});
+
+async function fetchSoundfontRangeChunk(
+  start: number,
+  end: number,
+  expectedTotal: number | null,
+  outerSignal: AbortSignal,
+  onProgress: (received: number, total: number) => void,
+): Promise<{ bytes: Uint8Array; total: number }> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= SOUND_FONT_CHUNK_RETRIES; attempt += 1) {
+    const controller = new AbortController();
+    const forwardAbort = () => controller.abort();
+    outerSignal.addEventListener("abort", forwardAbort, { once: true });
+    let timeoutId = window.setTimeout(() => controller.abort(), SOUND_FONT_CHUNK_TIMEOUT_MS);
+    const refreshTimeout = () => {
+      window.clearTimeout(timeoutId);
+      timeoutId = window.setTimeout(() => controller.abort(), SOUND_FONT_CHUNK_TIMEOUT_MS);
+    };
+    try {
+      const response = await fetch("/api/v2/soundfont", {
+        cache: "no-store",
+        headers: { Range: `bytes=${start}-${end}` },
+        signal: controller.signal,
+      });
+      if (response.status !== 206) {
+        throw new SynthPlaybackError("soundfont_range_unsupported", `隧道未返回分块响应（HTTP ${response.status}），无法稳定传输 SF3。`);
+      }
+      if (!isSoundfontContentType(response.headers.get("content-type"))) {
+        throw new SynthPlaybackError("soundfont_content_type", "SF3 分块响应不是音频类型，隧道可能返回了 HTML 登录页。");
+      }
+      const contentRange = response.headers.get("content-range")?.match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/);
+      if (!contentRange) {
+        throw new SynthPlaybackError("soundfont_range_invalid", "SF3 分块响应缺少有效 Content-Range，无法安全拼接音色库。");
+      }
+      const responseStart = Number(contentRange[1]);
+      const responseEnd = Number(contentRange[2]);
+      const total = Number(contentRange[3]);
+      if (responseStart !== start || responseEnd !== end || !Number.isFinite(total) || total <= end || (expectedTotal && total !== expectedTotal)) {
+        throw new SynthPlaybackError("soundfont_range_invalid", "SF3 分块范围与总大小不一致，已停止拼接以避免损坏音色库。");
+      }
+      const bytes: Uint8Array[] = [];
+      let received = 0;
+      if (response.body) {
+        const reader = response.body.getReader();
+        while (true) {
+          const result = await reader.read();
+          if (result.done) break;
+          if (!result.value?.byteLength) continue;
+          const chunk = new Uint8Array(result.value);
+          bytes.push(chunk);
+          received += chunk.byteLength;
+          onProgress(start + received, total);
+          refreshTimeout();
+        }
+      } else {
+        const buffer = await response.arrayBuffer();
+        const chunk = new Uint8Array(buffer);
+        bytes.push(chunk);
+        received = chunk.byteLength;
+        onProgress(start + received, total);
+        refreshTimeout();
+      }
+      const merged = new Uint8Array(received);
+      let offset = 0;
+      bytes.forEach((chunk) => {
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      });
+      const bytesReceived = merged;
+      if (bytesReceived.byteLength !== end - start + 1) {
+        throw new SynthPlaybackError("soundfont_incomplete", `SF3 分块只收到 ${formatBytes(bytesReceived.byteLength)}，预期 ${formatBytes(end - start + 1)}。`);
+      }
+      return { bytes: bytesReceived, total };
+    } catch (caught) {
+      if (outerSignal.aborted) throw caught;
+      lastError = caught;
+      if (attempt < SOUND_FONT_CHUNK_RETRIES) await waitForRetry(350 * (attempt + 1), outerSignal);
+    } finally {
+      window.clearTimeout(timeoutId);
+      outerSignal.removeEventListener("abort", forwardAbort);
+    }
+  }
+  if (lastError instanceof SynthPlaybackError) throw lastError;
+  throw new SynthPlaybackError("soundfont_chunk_failed", "SF3 分块下载多次失败，已准备切换轻量试听。");
+}
+
+async function downloadSoundfontInChunks(
+  expectedTotal: number | null,
+  onProgress: (received: number, total: number | null) => void,
+  externalSignal: AbortSignal,
+): Promise<ArrayBuffer> {
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  let total = expectedTotal;
+  try {
+    onProgress(0, total);
+    while (total === null || received < total) {
+      const end = total === null
+        ? received + SOUND_FONT_CHUNK_BYTES - 1
+        : Math.min(total - 1, received + SOUND_FONT_CHUNK_BYTES - 1);
+      const chunk = await fetchSoundfontRangeChunk(received, end, total, externalSignal, (progressReceived, progressTotal) => {
+        onProgress(progressReceived, progressTotal);
+      });
+      total = chunk.total;
+      if (total > 128 * 1024 * 1024) {
+        throw new SynthPlaybackError("soundfont_size_mismatch", "隧道报告的 SF3 大小超过安全上限，已停止下载。");
+      }
+      chunks.push(chunk.bytes);
+      received += chunk.bytes.byteLength;
+      onProgress(received, total);
+    }
+  } catch (caught) {
+    if (externalSignal.aborted) {
+      throw new SynthPlaybackError("soundfont_user_fallback", "已停止高质量音色加载，正在改用轻量试听；本次不会写入缓存。");
+    }
+    if (caught instanceof SynthPlaybackError) throw caught;
+    throw new SynthPlaybackError("soundfont_chunk_failed", `SF3 分块传输中断（已收到 ${formatBytes(received)}），已准备切换轻量试听。`);
+  }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  chunks.forEach((chunk) => {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  });
+  const buffer = bytes.buffer;
+  if (!isRiffContainer(buffer)) throw new SynthPlaybackError("soundfont_invalid_body", "分块拼接后不是有效 SF3，已停止加载。");
+  return buffer;
+}
+
+async function readCachedSoundfont(
+  expectedBytes: number | null | undefined,
+  cacheKey: string | null,
+  expectedVersion: string | null,
+  onProgress: (received: number, total: number | null) => void,
+): Promise<SoundfontCacheReadResult> {
+  if (!cacheKey || !expectedVersion) {
+    return { buffer: null, notice: "音色版本校验信息不可用，已跳过浏览器缓存。" };
+  }
+  if (!("caches" in window) || typeof window.caches?.open !== "function") {
+    return { buffer: null, notice: "当前浏览器不支持 Cache Storage，音色不会持久化。" };
+  }
+  try {
+    const cache = await window.caches.open(SOUND_FONT_CACHE_NAME);
+    const cached = await cache.match(cacheKey);
+    if (!cached) return { buffer: null };
+    const contentType = cached.headers.get("content-type");
+    const declaredBytes = Number.parseInt(cached.headers.get("content-length") || "", 10);
+    const cachedVersion = cached.headers.get("x-soundfont-sha256");
+    if (
+      cachedVersion !== expectedVersion
+      || !contentType
+      || !isSoundfontContentType(contentType)
+      || !Number.isFinite(declaredBytes)
+      || declaredBytes <= 0
+    ) {
+      await cache.delete(cacheKey).catch(() => undefined);
+      return { buffer: null, notice: "浏览器缓存校验失败，已清理并重新下载。" };
+    }
+    try {
+      const buffer = await readSoundfontResponse(cached, expectedBytes, () => undefined);
+      if (
+        buffer.byteLength !== declaredBytes
+        || (expectedBytes !== null && expectedBytes !== undefined && buffer.byteLength !== expectedBytes)
+        || !isRiffContainer(buffer)
+      ) {
+        throw new Error("cache_validation_failed");
+      }
+      onProgress(buffer.byteLength, expectedBytes || declaredBytes);
+      return { buffer };
+    } catch {
+      await cache.delete(cacheKey).catch(() => undefined);
+      return { buffer: null, notice: "浏览器缓存内容校验失败，已清理并重新下载。" };
+    }
+  } catch (caught) {
+    return { buffer: null, notice: `浏览器缓存读取失败（${cacheFailureReason(caught)}），将重新下载。` };
+  }
+}
+
+async function storeCachedSoundfont(
+  buffer: ArrayBuffer,
+  expectedBytes: number | null | undefined,
+  cacheKey: string | null,
+  expectedVersion: string | null,
+): Promise<SoundfontCacheWriteResult> {
+  if (!cacheKey || !expectedVersion) {
+    return { saved: false, notice: "浏览器未能保存缓存，下次可能重新下载（音色版本校验信息不可用）。" };
+  }
+  if (!("caches" in window) || typeof window.caches?.open !== "function") {
+    return { saved: false, notice: "浏览器未能保存缓存，下次可能重新下载（当前浏览器不支持 Cache Storage）。" };
+  }
+  try {
+    const cache = await window.caches.open(SOUND_FONT_CACHE_NAME);
+    await cache.put(cacheKey, new Response(buffer.slice(0), {
+      headers: {
+        "Content-Length": String(buffer.byteLength),
+        "Content-Type": "audio/x-soundfont-sf3",
+        "X-Soundfont-SHA256": expectedVersion,
+      },
+    }));
+    const cached = await cache.match(cacheKey);
+    if (!cached) {
+      return { saved: false, notice: "浏览器未能保存缓存，下次可能重新下载（写入后无法回读）。" };
+    }
+    const contentType = cached.headers.get("content-type");
+    const declaredBytes = Number.parseInt(cached.headers.get("content-length") || "", 10);
+    if (
+      cached.headers.get("x-soundfont-sha256") !== expectedVersion
+      || !contentType
+      || !isSoundfontContentType(contentType)
+      || !Number.isFinite(declaredBytes)
+      || declaredBytes !== buffer.byteLength
+    ) {
+      await cache.delete(cacheKey).catch(() => undefined);
+      return { saved: false, notice: "浏览器未能保存缓存，下次可能重新下载（写入后的类型或大小校验失败）。" };
+    }
+    try {
+      const roundTrip = await readSoundfontResponse(cached, expectedBytes, () => undefined);
+      if (roundTrip.byteLength !== buffer.byteLength || !isRiffContainer(roundTrip)) {
+        throw new Error("cache_validation_failed");
+      }
+    } catch {
+      await cache.delete(cacheKey).catch(() => undefined);
+      return { saved: false, notice: "浏览器未能保存缓存，下次可能重新下载（写入后的 RIFF/SF3 校验失败）。" };
+    }
+    return { saved: true, notice: "高质量音色已缓存，可在此浏览器和域名复用。" };
+  } catch (caught) {
+    return { saved: false, notice: `浏览器未能保存缓存，下次可能重新下载（${cacheFailureReason(caught)}）。` };
+  }
+}
+
 const formatDuration = (value?: number | null) => {
   if (!value || !Number.isFinite(value)) return "—";
   return `${Math.floor(value / 60)}:${Math.floor(value % 60).toString().padStart(2, "0")}`;
@@ -169,7 +558,12 @@ function App() {
   const [originalTime, setOriginalTime] = useState(0);
   const [synthTime, setSynthTime] = useState(0);
   const [synthPlaying, setSynthPlaying] = useState(false);
+  const [synthLoading, setSynthLoading] = useState(false);
+  const [soundfontDownloading, setSoundfontDownloading] = useState(false);
+  const [lightweightActive, setLightweightActive] = useState(false);
   const [synthResource, setSynthResource] = useState("正在检查官方音色库…");
+  const [synthError, setSynthError] = useState("");
+  const [soundfontCacheNotice, setSoundfontCacheNotice] = useState("");
   const [soundfontStatus, setSoundfontStatus] = useState<SoundfontStatus | null>(null);
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [error, setError] = useState("");
@@ -180,6 +574,8 @@ function App() {
   const loadedJobRef = useRef("");
   const audioContextRef = useRef<AudioContext | null>(null);
   const synthRef = useRef<WorkletSynthesizer | null>(null);
+  const lightweightNodesRef = useRef<OscillatorNode[]>([]);
+  const soundfontAbortRef = useRef<AbortController | null>(null);
   const synthLoadRef = useRef<Promise<WorkletSynthesizer> | null>(null);
   const synthOriginRef = useRef<number | null>(null);
   const synthTimerRef = useRef<number | null>(null);
@@ -205,6 +601,11 @@ function App() {
 
   const stopSynth = useCallback(() => {
     synthRef.current?.stopAll(true);
+    lightweightNodesRef.current.forEach((node) => {
+      try { node.stop(); } catch { /* already stopped */ }
+      try { node.disconnect(); } catch { /* already disconnected */ }
+    });
+    lightweightNodesRef.current = [];
     if (synthTimerRef.current !== null) window.cancelAnimationFrame(synthTimerRef.current);
     if (synthStopTimerRef.current !== null) window.clearTimeout(synthStopTimerRef.current);
     synthTimerRef.current = null;
@@ -217,25 +618,130 @@ function App() {
     if (synthRef.current) return synthRef.current;
     if (synthLoadRef.current) return synthLoadRef.current;
     const load = (async () => {
-      setSynthResource("首次缓存官方 MuseScore General SF3…");
-      const context = audioContextRef.current || new AudioContext();
-      audioContextRef.current = context;
-      await context.resume();
-      await context.audioWorklet.addModule("/vendor/spessasynth_processor.min.js");
-      const response = await fetch("/api/v2/soundfont");
-      if (!response.ok) {
-        const detail = await response.json().catch(() => ({}));
-        throw new Error(detail?.detail?.message || "音色库不可用");
+      let receivedBytes = 0;
+      let downloadTimedOut = false;
+      const AudioContextConstructor = getAudioContextConstructor();
+      if (!AudioContextConstructor) {
+        throw new SynthPlaybackError("audio_context_unsupported", "当前浏览器没有 AudioContext，无法播放本机合成音频。请改用最新版 Chrome、Edge 或 Safari。 ");
       }
-      const soundfont = await response.arrayBuffer();
-      const synth = new WorkletSynthesizer(context, { eventsEnabled: false });
-      synth.connect(context.destination);
-      await synth.soundBankManager.addSoundBank(soundfont, "MuseScore_General");
-      await synth.isReady;
-      synthRef.current = synth;
-      setSoundfontStatus((current) => current ? { ...current, available: true, status: "ready" } : current);
-      setSynthResource("MuseScore General · SpessaSynth / SF3");
-      return synth;
+
+      let context: AudioContext;
+      try {
+        context = audioContextRef.current || new AudioContextConstructor();
+      } catch {
+        throw new SynthPlaybackError("audio_context_create", "浏览器无法创建音频上下文，请检查设备声音权限后重试。");
+      }
+      audioContextRef.current = context;
+      try {
+        await context.resume();
+      } catch {
+        throw new SynthPlaybackError("audio_context_blocked", "浏览器没有在播放按钮手势中启用音频，请再次点击播放并允许声音。");
+      }
+      if (context.state !== "running") {
+        throw new SynthPlaybackError("audio_context_blocked", "浏览器仍将音频上下文保持为暂停，请再次点击播放并检查设备声音权限。");
+      }
+      if (window.isSecureContext === false && !isLocalBrowserHost()) {
+        throw new SynthPlaybackError(
+          "secure_context_required",
+          "真实 SF3 合成需要 HTTPS：当前地址不是安全上下文，浏览器禁用了 AudioWorklet；将尝试轻量音色试听。请使用 HTTPS 隧道获得 MuseScore 音色。",
+        );
+      }
+      if (!context.audioWorklet || typeof context.audioWorklet.addModule !== "function") {
+        throw new SynthPlaybackError("audio_worklet_unsupported", "当前浏览器不支持 AudioWorklet（部分旧版 iOS/Safari 会受限），将尝试轻量音色试听。使用最新版 Chrome、Edge 或 Safari 可获得真实 SF3 音色。 ");
+      }
+      try {
+        await context.audioWorklet.addModule("/vendor/spessasynth_processor.min.js");
+      } catch {
+        throw new SynthPlaybackError(
+          "processor_load_failed",
+          "SpessaSynth 处理器脚本加载失败，将尝试轻量音色试听。请确认 HTTPS 隧道同源转发了 /vendor/spessasynth_processor.min.js，且响应不是登录页或 HTML。",
+        );
+      }
+
+      const expectedBytes = soundfontStatus?.size_bytes || null;
+      const expectedVersion = soundfontVersion(soundfontStatus);
+      const cacheKey = soundfontCacheKey(expectedVersion);
+      setSoundfontCacheNotice("");
+      const reportProgress = (received: number, total: number | null) => {
+        receivedBytes = received;
+        const denominator = total || expectedBytes || 0;
+        const percent = denominator ? ` · ${Math.min(100, Math.round((received / denominator) * 100))}%` : "";
+        setSynthResource(`正在下载官方 MuseScore General SF3 · ${formatBytes(received)}${denominator ? ` / ${formatBytes(denominator)}` : ""}${percent}`);
+      };
+      const cachedResult = await readCachedSoundfont(expectedBytes, cacheKey, expectedVersion, reportProgress);
+      if (cachedResult.notice) setSoundfontCacheNotice(cachedResult.notice);
+      let soundfont = cachedResult.buffer;
+      if (!soundfont) {
+        if (!isLocalBrowserHost()) {
+          setSynthResource("正在分块下载官方 MuseScore General SF3…");
+          const remoteController = new AbortController();
+          soundfontAbortRef.current = remoteController;
+          setSoundfontDownloading(true);
+          try {
+            soundfont = await downloadSoundfontInChunks(expectedBytes, reportProgress, remoteController.signal);
+          } finally {
+            setSoundfontDownloading(false);
+            if (soundfontAbortRef.current === remoteController) soundfontAbortRef.current = null;
+          }
+        } else {
+          setSynthResource("正在下载官方 MuseScore General SF3…");
+          const timeoutMs = 180_000;
+          const controller = new AbortController();
+          const timeoutId = window.setTimeout(() => {
+            downloadTimedOut = true;
+            controller.abort();
+          }, timeoutMs);
+          try {
+            let response: Response;
+            try {
+              response = await fetch("/api/v2/soundfont", { cache: "force-cache", signal: controller.signal });
+            } catch (caught) {
+              if (downloadTimedOut || (caught instanceof DOMException && caught.name === "AbortError")) {
+                throw new SynthPlaybackError("soundfont_timeout", `音色库下载超时（已收到 ${formatBytes(receivedBytes)}），请保持页面打开重试。`);
+              }
+              throw new SynthPlaybackError("soundfont_network", "音色库网络请求失败，请确认本机服务仍在线并转发 /api/v2/soundfont。");
+            }
+            if (!response.ok) {
+              const detail = await response.json().catch(() => ({}));
+              throw new SynthPlaybackError("soundfont_http", `音色库请求失败（HTTP ${response.status}）。${detail?.detail?.message || "请确认服务转发 /api/v2/soundfont。"}`);
+            }
+            if (!isSoundfontContentType(response.headers.get("content-type"))) {
+              throw new SynthPlaybackError("soundfont_content_type", `音色库响应类型为 ${response.headers.get("content-type") || "未知"}，不是 SF3；服务可能返回了 HTML 错误页。`);
+            }
+            try {
+              soundfont = await readSoundfontResponse(response, expectedBytes, reportProgress);
+            } catch (caught) {
+              if (downloadTimedOut || (caught instanceof DOMException && caught.name === "AbortError")) {
+                throw new SynthPlaybackError("soundfont_timeout", `音色库下载超时（已收到 ${formatBytes(receivedBytes)}），请保持页面打开重试。`);
+              }
+              if (caught instanceof SynthPlaybackError) throw caught;
+              throw new SynthPlaybackError("soundfont_network", `音色库传输中断（已收到 ${formatBytes(receivedBytes)}），请确认本机服务仍在线。`);
+            }
+          } finally {
+            window.clearTimeout(timeoutId);
+          }
+        }
+        const cacheResult = await storeCachedSoundfont(soundfont, expectedBytes, cacheKey, expectedVersion);
+        setSoundfontCacheNotice(cacheResult.notice);
+      } else {
+        setSoundfontCacheNotice("高质量音色已从本机浏览器缓存读取，可直接复用。");
+        setSynthResource("已从本机浏览器缓存读取 MuseScore General SF3");
+      }
+        setSynthResource("SF3 下载完成，正在初始化 SpessaSynth…");
+        let synth: WorkletSynthesizer;
+        try {
+          synth = new WorkletSynthesizer(context, { eventsEnabled: false });
+          synth.connect(context.destination);
+          await synth.soundBankManager.addSoundBank(soundfont, "MuseScore_General");
+          await synth.isReady;
+        } catch {
+          throw new SynthPlaybackError("synth_init_failed", "SF3 已下载，但浏览器初始化 SpessaSynth 失败；请尝试最新版 Chrome/Edge 或释放设备内存后重试。");
+        }
+        synthRef.current = synth;
+        setLightweightActive(false);
+        setSoundfontStatus((current) => current ? { ...current, available: true, status: "ready" } : current);
+        setSynthResource("MuseScore General · SpessaSynth / SF3");
+        return synth;
     })();
     synthLoadRef.current = load;
     try {
@@ -245,7 +751,7 @@ function App() {
       setSynthResource("音色库不可用 · 无法合成试听");
       throw caught;
     }
-  }, []);
+  }, [soundfontStatus]);
 
   const loadJob = useCallback(async (jobId: string) => {
     const next = await readResponse(await fetch(`/api/v2/jobs/${jobId}`)) as Job;
@@ -417,6 +923,65 @@ function App() {
     setSelectedTrackIds((current) => current.includes(trackId) ? current.filter((id) => id !== trackId) : [...current, trackId]);
   };
 
+  const playLightweightSynth = async (playable: RollNote[], fallbackReason = "真实 SF3 未在当前网络或浏览器中加载") => {
+    const AudioContextConstructor = getAudioContextConstructor();
+    if (!AudioContextConstructor) throw new SynthPlaybackError("lightweight_unsupported", "当前浏览器没有 Web Audio，无法启动轻量试听。");
+    let context = audioContextRef.current;
+    if (!context) {
+      try {
+        context = new AudioContextConstructor();
+        audioContextRef.current = context;
+      } catch {
+        throw new SynthPlaybackError("lightweight_unsupported", "浏览器无法创建轻量试听的音频上下文，请检查设备声音权限。");
+      }
+    }
+    try {
+      await context.resume();
+    } catch {
+      throw new SynthPlaybackError("audio_context_blocked", "浏览器没有启用轻量试听，请再次点击播放并允许声音。");
+    }
+    if (context.state !== "running") throw new SynthPlaybackError("audio_context_blocked", "浏览器仍将音频上下文保持为暂停，请再次点击播放。");
+    const trackById = new Map(tracks.map((track) => [track.track_id, track]));
+    const maxEnd = Math.max(...playable.map((note) => note.end_sec), 0);
+    const start = context.currentTime + 0.08;
+    const waveforms: OscillatorType[] = ["sine", "triangle", "square", "sawtooth"];
+    playable.forEach((note) => {
+      const track = note.track_id ? trackById.get(note.track_id) : undefined;
+      if (!track) return;
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      const when = start + Math.max(0, note.start_sec);
+      const until = start + Math.max(note.start_sec + 0.06, note.end_sec);
+      const frequency = track.is_drum
+        ? Math.max(80, Math.min(900, 55 * Math.pow(2, (note.pitch - 36) / 12)))
+        : Math.max(55, Math.min(1800, 440 * Math.pow(2, (note.pitch - 69) / 12)));
+      oscillator.type = track.is_drum ? "square" : waveforms[Math.abs(track.program) % waveforms.length];
+      oscillator.frequency.setValueAtTime(frequency, when);
+      gain.gain.setValueAtTime(0.0001, when);
+      gain.gain.exponentialRampToValueAtTime(track.is_drum ? 0.07 : 0.11, when + 0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001, Math.max(when + 0.035, until));
+      oscillator.connect(gain).connect(context.destination);
+      oscillator.start(when);
+      oscillator.stop(Math.max(when + 0.05, until + 0.04));
+      lightweightNodesRef.current.push(oscillator);
+    });
+    if (!lightweightNodesRef.current.length) throw new SynthPlaybackError("lightweight_empty", "当前选择没有可播放的音符。");
+    setSynthPlaying(true);
+    const hasDrums = playable.some((note) => note.track_id && trackById.get(note.track_id)?.is_drum);
+    setLightweightActive(true);
+    setSynthError(`${fallbackReason} 已改用轻量试听；音高、节奏和所选轨道仍保持。${hasDrums ? "鼓组使用电子近似音色。" : ""}`);
+    setSynthResource("轻量音色 · Web Audio 波形 · 选择轨道已应用");
+    synthOriginRef.current = performance.now();
+    const tick = () => {
+      const elapsed = synthOriginRef.current === null ? 0 : (performance.now() - synthOriginRef.current) / 1000;
+      setSynthTime(Math.min(maxEnd, elapsed));
+      if (elapsed < maxEnd + 0.15) synthTimerRef.current = window.requestAnimationFrame(tick);
+      else stopSynth();
+    };
+    synthTimerRef.current = window.requestAnimationFrame(tick);
+    synthStopTimerRef.current = window.setTimeout(stopSynth, (maxEnd + 0.35) * 1000);
+  };
+
   const submitSelection = async (kind: "midi" | "score") => {
     if (!job || fixtureMode) { setNotice(kind === "midi" ? "受控预览只演示选择逻辑；真实任务会在这里生成选择版本 MIDI。" : "受控预览只演示选择逻辑；真实任务会在这里生成分谱。"); return; }
     if (!selectedTrackIds.length) { setError("至少选择一条轨道；全不选时不会生成 MIDI 或简谱。"); return; }
@@ -434,12 +999,16 @@ function App() {
     if (synthPlaying) { stopSynth(); return; }
     const playable = notes.filter((note) => note.track_id && selectedTrackIds.includes(note.track_id));
     if (!playable.length) { setError("当前没有可试听的已选轨道；鼓组也可以试听，但需先勾选。"); return; }
+    if (synthLoading) return;
     setError("");
+    setSynthError("");
+    setSynthLoading(true);
     try {
       const synth = await loadSoundfontSynth();
       const context = audioContextRef.current;
-      if (!context) throw new Error("音频上下文不可用");
+      if (!context) throw new SynthPlaybackError("audio_context_missing", "音频上下文不可用，请重新点击播放。");
       await context.resume();
+      if (context.state !== "running") throw new SynthPlaybackError("audio_context_blocked", "浏览器仍将音频上下文保持为暂停，请再次点击播放并检查设备声音权限。");
       synth.stopAll(true);
       const selectedPlayableTracks = tracks.filter((track) => selectedTrackIds.includes(track.track_id) && playable.some((note) => note.track_id === track.track_id));
       const channels = new Map<string, number>();
@@ -479,9 +1048,57 @@ function App() {
       synthTimerRef.current = window.requestAnimationFrame(tick);
       synthStopTimerRef.current = window.setTimeout(stopSynth, (maxEnd + 0.35) * 1000);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "音色库不可用，无法合成试听。");
+      let fallbackDiagnostic = "";
+      const fallbackCodes = new Set([
+        "secure_context_required",
+        "audio_worklet_unsupported",
+        "processor_load_failed",
+        "soundfont_range_unsupported",
+        "soundfont_range_invalid",
+        "soundfont_chunk_failed",
+        "soundfont_user_fallback",
+        "soundfont_timeout",
+        "soundfont_network",
+        "soundfont_http",
+        "soundfont_content_type",
+        "soundfont_incomplete",
+        "soundfont_invalid_body",
+        "soundfont_size_mismatch",
+        "synth_init_failed",
+      ]);
+      if (caught instanceof SynthPlaybackError && fallbackCodes.has(caught.code)) {
+        try {
+          await playLightweightSynth(playable, caught.message);
+          setError("");
+          return;
+        } catch (lightweightCaught) {
+          const reason = lightweightCaught instanceof Error ? lightweightCaught.message : "未知原因";
+          fallbackDiagnostic = `${caught.message} 轻量试听也未能启动：${reason}`;
+        }
+      }
+      const diagnostic = caught instanceof SynthPlaybackError
+        ? (fallbackDiagnostic || caught.message)
+        : (caught instanceof Error ? `合成试听初始化失败：${caught.message}` : "音色库不可用，无法合成试听。");
+      setSynthError(diagnostic);
+      setError(diagnostic);
       setSynthResource("音色库不可用 · 无法合成试听");
+    } finally {
+      setSynthLoading(false);
     }
+  };
+
+  const useLightweightNow = () => {
+    if (!soundfontAbortRef.current) return;
+    setSynthError("正在停止高质量音色加载，准备轻量试听；本次不会写入缓存…");
+    soundfontAbortRef.current.abort();
+  };
+
+  const reloadHighQuality = () => {
+    stopSynth();
+    setLightweightActive(false);
+    setSynthError("");
+    setSynthResource("正在重新加载高质量 MuseScore SF3…");
+    void playSynth();
   };
 
   const activeTime = synthPlaying ? synthTime : originalTime;
@@ -507,7 +1124,7 @@ function App() {
       <div className="desk-grid upload-grid"><section className="control-panel panel"><div className="panel-heading"><div><p className="section-kicker">02 · INPUT</p><h2>放入一段音频</h2></div><span className="step-badge">{source === "instrumental" ? "M" : "G"}</span></div><div className={`dropzone ${file ? "has-file" : ""}`} onClick={() => inputRef.current?.click()} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") inputRef.current?.click(); }} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} role="button" tabIndex={0} aria-label="选择音频文件"><input ref={inputRef} type="file" accept=".mp3,.wav,.flac,.m4a,audio/*" onChange={onFileChange} hidden /><span className="drop-orbit">{file ? "✓" : "↑"}</span>{file ? <><strong>{file.name}</strong><small>{formatBytes(file.size)} · 点击更换</small></> : <><strong>拖入一段音频</strong><small>或点击选择 · MP3 / WAV / FLAC / M4A</small></>}</div><div className="field-stack"><label htmlFor="title">任务标题 <small>可留空，使用文件名</small></label><input id="title" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：夜行片段" /></div>{source === "vocal" && <fieldset className="demucs-options" disabled={activeVocalJob}><legend>人声分离模型</legend><div className="model-choice-list">{DEMUCS_MODEL_OPTIONS.map((option) => <label className={`model-choice ${separationModel === option.id ? "selected" : ""}`} key={option.id}><input type="radio" name="separation-model" value={option.id} checked={separationModel === option.id} onChange={() => setSeparationModel(option.id)} /><span><strong>{option.label}</strong><small>{option.speed} · {option.quality}</small></span></label>)}</div><p className="model-note">{activeVocalJob ? `本任务已使用 ${actualDemucsModel.label}（${actualDemucsModel.id}）；切换只对新任务生效。` : "默认使用快速模型；质量优先模型由 Demucs 官方说明约慢 4 倍，但可能略好。"}</p></fieldset>}{error && <div className="error-message" role="alert"><span>!</span>{error}</div>}{notice && <div className="notice-message" role="status"><span>✦</span>{notice}</div>}<button type="button" className="primary-action" onClick={() => void submit()} disabled={busy || !file}><span>{busy ? "正在送入队列…" : "开始本机识别"}</span><strong>↗</strong></button><p className="privacy-note"><span>⌁</span> 文件只保留在本机任务目录，完成后按服务策略清理。</p></section>
         <section className="status-panel panel" aria-live="polite"><div className="panel-heading"><div><p className="section-kicker">03 · QUEUE</p><h2>{shortStatus(job)}</h2></div>{job && <span className={`status-chip ${job.status}`}><i />{job.status === "completed" ? "完成" : job.status === "failed" ? "失败" : job.status === "selection_ready" ? "可选择" : job.status === "vocal_ready" ? "可生成" : "处理中"}</span>}</div>{job ? <><div className="job-meta"><span><b>{job.input?.original_name || sourceLabel(source)}</b><small>{sourceLabel(job.v2?.source_kind || source)} · 第 {job.attempt || 1} 次</small>{activeVocalJob && <small className="model-readout">Demucs · {actualDemucsModel.label} · {actualDemucsModel.id}</small>}</span><span className="job-id">{job.id.slice(0, 8)}</span></div><div className="phase-rail">{PHASES.map(([phase, label], index) => <span key={phase} className={`${index < statusIndex ? "done" : ""} ${index === statusIndex ? "active" : ""}`} title={label}><i /></span>)}</div><div className="phase-labels">{PHASES.map(([phase, label]) => <span key={phase} className={phase === job.status || phase === job.phase ? "current" : ""}>{label}</span>)}</div>{job.progress !== null && job.progress !== undefined && <div className="progress-meter"><span style={{ width: `${Math.max(2, Math.min(100, job.progress * 100))}%` }} /></div>}{(job.status === "failed" || job.status === "interrupted") && <div className="failure-state"><span className="failure-mark">×</span><div><strong>{job.status === "interrupted" ? "任务中断" : "这次识别没有完成"}</strong><p>{job.error?.message || "可以保留当前选择并重试。"}</p><button type="button" className="outline-action" onClick={() => void retry()} disabled={!job.retryable || busy}>重新排队</button></div></div>}</> : <div className="empty-state"><span className="empty-wave">∿</span><p>上传后，这里会显示识别进度与可用产物。</p><small>{capabilities?.hardware?.cuda ? `CUDA · ${capabilities.hardware.gpu || "本机 GPU"}` : "本机任务队列"}</small></div>}</section></div>
 
-      {isInstrumental && isReady && <section className="instrument-workspace panel" aria-labelledby="workspace-heading" data-selection-policy="single-checkbox-controls-roll-synth-midi-score"><div className="panel-heading workspace-title"><div><p className="section-kicker">04 · SELECTION READY</p><h2 id="workspace-heading">全量识别完成，选出要留下的轨道</h2><p className="heading-note">{trackCountLabel} · 勾选变化不会重新运行 MuScriptor。</p></div><span className="selection-revision">R{job?.v2?.selection_revision || 0}</span></div><div className="listen-strip"><div className="listen-card original-listen"><span className="listen-icon">◉</span><div><strong>原曲试听</strong><small>音频文件的真实播放</small></div>{originalArtifact?.url ? <audio ref={audioRef} controls src={originalArtifact.url} onTimeUpdate={(event) => setOriginalTime(event.currentTarget.currentTime)} onEnded={() => setOriginalTime(0)} /> : <span className="listen-pending">识别后可用</span>}</div><div className="listen-card synth-listen"><span className="listen-icon">⌁</span><div><strong>本机合成试听</strong><small title={soundfontStatus?.sha256 || "官方 SF3 音色库"}>{synthResource}</small></div><button type="button" className={`listen-button ${synthPlaying ? "playing" : ""}`} onClick={() => void playSynth()}>{synthPlaying ? "停止" : "播放选中轨"}</button><span className="synth-time">{formatDuration(synthTime)} / {formatDuration(duration)}</span></div></div><div className="workspace-grid"><div className="roll-column"><div className="subhead"><div><span className="section-kicker">PIANO ROLL</span><strong>时间同步试听轨</strong></div><div className="roll-tools"><label><input type="checkbox" checked={rollVisible} onChange={(event) => setRollVisible(event.target.checked)} />显示</label><label>缩放 <input aria-label="钢琴卷帘缩放" type="range" min="1" max="4" step="0.5" value={rollZoom} onChange={(event) => setRollZoom(Number(event.target.value))} /></label></div></div>{renderPianoRoll()}<p className="roll-caption">播放原曲或本机合成时，米白播放头沿原始秒数移动。颜色只表示轨道，音符时间不经过简谱量化。</p></div><aside className="track-roster"><div className="subhead"><div><span className="section-kicker">TRACK ROSTER</span><strong>乐器清单</strong></div><span className="roster-count">{selectedTrackIds.length}/{tracks.length}</span></div><div className="track-list">{tracks.map((track, index) => { const color = LANE_COLORS[index % LANE_COLORS.length]; const selected = selectedTrackIds.includes(track.track_id); return <div className={`track-row ${selected ? "selected" : ""}`} key={track.track_id}><span className="track-color" style={{ background: color }} /><label className="track-check"><input type="checkbox" checked={selected} onChange={() => toggleTrack(track.track_id)} /><span><strong>{track.label_zh}</strong><small>{track.instrument_group} · {track.note_count} notes · {track.is_drum ? "不生成简谱" : `program ${track.program}`}</small></span></label></div>; })}</div>{selectedTracks.some((track) => track.is_drum) && <p className="drum-note">鼓组保留在试听与选择 MIDI 中，但不会生成简谱。</p>}{!pitchedSelected && selectedTrackIds.length > 0 && <p className="drum-note">当前只选中鼓组：可以下载 MIDI，简谱按钮会保持禁用。</p>}</aside></div><div className="export-rail"><div className="analysis-advice" role="status"><div><strong>识别建议，可修改</strong><span>{analysisSuggestion ? `${analysisSuggestion.bpm} BPM · ${analysisSuggestion.key} · ${analysisSuggestion.time_signature}` : "等待原音分析"}</span></div>{analysisSuggestion?.candidates && <small>候选：BPM {analysisSuggestion.candidates.bpm?.join(" / ") || "—"} · 调性 {analysisSuggestion.candidates.key?.join(" / ") || "—"} · 拍号 {analysisSuggestion.candidates.time_signature?.join(" / ") || "—"}</small>}{analysisSuggestion?.warnings?.map((warning, index) => <small key={`analysis-warning-${index}`}>{warning}</small>)}</div><div className="override-fields"><div><label htmlFor="export-bpm">BPM</label><input id="export-bpm" inputMode="decimal" value={bpm} onChange={(event) => setBpm(event.target.value)} /></div><div><label htmlFor="export-key">调性</label><select id="export-key" value={key} onChange={(event) => setKey(event.target.value)}>{KEYS.map((item) => <option key={item}>{item}</option>)}</select></div><div><label htmlFor="export-meter">拍号</label><select id="export-meter" value={meter} onChange={(event) => setMeter(event.target.value)}>{METERS.map((item) => <option key={item}>{item}</option>)}</select></div></div><label className="merge-option"><input type="checkbox" checked={mergeMainMelody} onChange={(event) => setMergeMainMelody(event.target.checked)} />另外生成单声部主旋律 <small>会丢失和声</small></label><div className="export-actions"><button type="button" className="outline-action" onClick={() => void submitSelection("midi")} disabled={busy || selectedTrackIds.length === 0}>下载所选 MIDI</button><button type="button" className="primary-action compact" onClick={() => void submitSelection("score")} disabled={busy || !pitchedSelected}><span>生成分谱</span><strong>↗</strong></button></div></div>{scoreArtifacts.length > 0 && <div className="score-deck"><div className="subhead"><div><span className="section-kicker">SCORE PAGES</span><strong>已选有音高乐器分谱</strong></div><span className="score-warning">鼓组不在分谱中</span></div><div className="score-grid">{longScoreArtifacts.map((artifact) => <a className="score-card score-long-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>纵向长图 SVG · 默认预览</small></a>)}</div>{pagedScoreArtifacts.length > 0 && <details className="score-pages"><summary>分页 SVG（{pagedScoreArtifacts.length} 页）</summary><div className="score-grid">{pagedScoreArtifacts.map((artifact) => <a className="score-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>分页 SVG · 下载或新窗口查看</small></a>)}</div></details>}{longScoreArtifacts.map((artifact) => <a className="download-line" key={`${artifact.artifact_id}-download`} href={artifact.url || "#"}>↓ 下载长图 SVG · {artifact.label}</a>)}{selectedZip?.url && <a className="download-line" href={selectedZip.url}>↓ 下载全部分页 SVG ZIP</a>}{selectedMidi && <a className="download-line" href={selectedMidi.url || "#"}>↓ 下载选择版本 MIDI · R{job?.v2?.selection_revision || 0}</a>}</div>}{originalMidi && <a className="download-line muted-line" href={originalMidi.url || "#"}>↓ 完整识别 MIDI（原始时间） · 含全部轨道</a>}</section>}
+      {isInstrumental && isReady && <section className="instrument-workspace panel" aria-labelledby="workspace-heading" data-selection-policy="single-checkbox-controls-roll-synth-midi-score"><div className="panel-heading workspace-title"><div><p className="section-kicker">04 · SELECTION READY</p><h2 id="workspace-heading">全量识别完成，选出要留下的轨道</h2><p className="heading-note">{trackCountLabel} · 勾选变化不会重新运行 MuScriptor。</p></div><span className="selection-revision">R{job?.v2?.selection_revision || 0}</span></div><div className="listen-strip"><div className="listen-card original-listen"><span className="listen-icon">◉</span><div><strong>原曲试听</strong><small>音频文件的真实播放</small></div>{originalArtifact?.url ? <audio ref={audioRef} controls src={originalArtifact.url} onTimeUpdate={(event) => setOriginalTime(event.currentTarget.currentTime)} onEnded={() => setOriginalTime(0)} /> : <span className="listen-pending">识别后可用</span>}</div><div className="listen-card synth-listen"><span className="listen-icon">⌁</span><div><strong>本机合成试听</strong><small title={soundfontStatus?.sha256 || "官方 SF3 音色库"} aria-live="polite">{synthResource}</small></div>{soundfontCacheNotice && <small className="synth-cache-note" aria-live="polite">{soundfontCacheNotice}</small>}<button type="button" className={`listen-button ${synthPlaying ? "playing" : ""}`} onClick={() => void playSynth()} disabled={synthLoading}>{synthLoading ? "准备试听…" : synthPlaying ? "停止" : "播放选中轨"}</button>{synthLoading && soundfontDownloading && <button type="button" className="lightweight-action" onClick={useLightweightNow}>立即使用轻量试听</button>}<span className="synth-time">{formatDuration(synthTime)} / {formatDuration(duration)}</span>{synthError && <p className="synth-diagnostic" role="alert">{synthError}</p>}{lightweightActive && !synthLoading && <button type="button" className="lightweight-action" onClick={reloadHighQuality}>重新加载高质量音色</button>}</div></div><div className="workspace-grid"><div className="roll-column"><div className="subhead"><div><span className="section-kicker">PIANO ROLL</span><strong>时间同步试听轨</strong></div><div className="roll-tools"><label><input type="checkbox" checked={rollVisible} onChange={(event) => setRollVisible(event.target.checked)} />显示</label><label>缩放 <input aria-label="钢琴卷帘缩放" type="range" min="1" max="4" step="0.5" value={rollZoom} onChange={(event) => setRollZoom(Number(event.target.value))} /></label></div></div>{renderPianoRoll()}<p className="roll-caption">播放原曲或本机合成时，米白播放头沿原始秒数移动。颜色只表示轨道，音符时间不经过简谱量化。</p></div><aside className="track-roster"><div className="subhead"><div><span className="section-kicker">TRACK ROSTER</span><strong>乐器清单</strong></div><span className="roster-count">{selectedTrackIds.length}/{tracks.length}</span></div><div className="track-list">{tracks.map((track, index) => { const color = LANE_COLORS[index % LANE_COLORS.length]; const selected = selectedTrackIds.includes(track.track_id); return <div className={`track-row ${selected ? "selected" : ""}`} key={track.track_id}><span className="track-color" style={{ background: color }} /><label className="track-check"><input type="checkbox" checked={selected} onChange={() => toggleTrack(track.track_id)} /><span><strong>{track.label_zh}</strong><small>{track.instrument_group} · {track.note_count} notes · {track.is_drum ? "不生成简谱" : `program ${track.program}`}</small></span></label></div>; })}</div>{selectedTracks.some((track) => track.is_drum) && <p className="drum-note">鼓组保留在试听与选择 MIDI 中，但不会生成简谱。</p>}{!pitchedSelected && selectedTrackIds.length > 0 && <p className="drum-note">当前只选中鼓组：可以下载 MIDI，简谱按钮会保持禁用。</p>}</aside></div><div className="export-rail"><div className="analysis-advice" role="status"><div><strong>识别建议，可修改</strong><span>{analysisSuggestion ? `${analysisSuggestion.bpm} BPM · ${analysisSuggestion.key} · ${analysisSuggestion.time_signature}` : "等待原音分析"}</span></div>{analysisSuggestion?.candidates && <small>候选：BPM {analysisSuggestion.candidates.bpm?.join(" / ") || "—"} · 调性 {analysisSuggestion.candidates.key?.join(" / ") || "—"} · 拍号 {analysisSuggestion.candidates.time_signature?.join(" / ") || "—"}</small>}{analysisSuggestion?.warnings?.map((warning, index) => <small key={`analysis-warning-${index}`}>{warning}</small>)}</div><div className="override-fields"><div><label htmlFor="export-bpm">BPM</label><input id="export-bpm" inputMode="decimal" value={bpm} onChange={(event) => setBpm(event.target.value)} /></div><div><label htmlFor="export-key">调性</label><select id="export-key" value={key} onChange={(event) => setKey(event.target.value)}>{KEYS.map((item) => <option key={item}>{item}</option>)}</select></div><div><label htmlFor="export-meter">拍号</label><select id="export-meter" value={meter} onChange={(event) => setMeter(event.target.value)}>{METERS.map((item) => <option key={item}>{item}</option>)}</select></div></div><label className="merge-option"><input type="checkbox" checked={mergeMainMelody} onChange={(event) => setMergeMainMelody(event.target.checked)} />另外生成单声部主旋律 <small>会丢失和声</small></label><div className="export-actions"><button type="button" className="outline-action" onClick={() => void submitSelection("midi")} disabled={busy || selectedTrackIds.length === 0}>下载所选 MIDI</button><button type="button" className="primary-action compact" onClick={() => void submitSelection("score")} disabled={busy || !pitchedSelected}><span>生成分谱</span><strong>↗</strong></button></div></div>{scoreArtifacts.length > 0 && <div className="score-deck"><div className="subhead"><div><span className="section-kicker">SCORE PAGES</span><strong>已选有音高乐器分谱</strong></div><span className="score-warning">鼓组不在分谱中</span></div><div className="score-grid">{longScoreArtifacts.map((artifact) => <a className="score-card score-long-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>纵向长图 SVG · 默认预览</small></a>)}</div>{pagedScoreArtifacts.length > 0 && <details className="score-pages"><summary>分页 SVG（{pagedScoreArtifacts.length} 页）</summary><div className="score-grid">{pagedScoreArtifacts.map((artifact) => <a className="score-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>分页 SVG · 下载或新窗口查看</small></a>)}</div></details>}{longScoreArtifacts.map((artifact) => <a className="download-line" key={`${artifact.artifact_id}-download`} href={artifact.url || "#"}>↓ 下载长图 SVG · {artifact.label}</a>)}{selectedZip?.url && <a className="download-line" href={selectedZip.url}>↓ 下载全部分页 SVG ZIP</a>}{selectedMidi && <a className="download-line" href={selectedMidi.url || "#"}>↓ 下载选择版本 MIDI · R{job?.v2?.selection_revision || 0}</a>}</div>}{originalMidi && <a className="download-line muted-line" href={originalMidi.url || "#"}>↓ 完整识别 MIDI（原始时间） · 含全部轨道</a>}</section>}
 
       {source === "vocal" && job?.status === "vocal_ready" && <section className="vocal-result panel" aria-labelledby="vocal-ready-heading"><div className="panel-heading"><div><p className="section-kicker">04 · VOCALS READY</p><h2 id="vocal-ready-heading">人声已经分离，可以先试听</h2><p className="heading-note">这是 Demucs 模型分离结果，可能含伴奏残留；下一步才会交给 GAME。当前模型：{actualDemucsModel.label}（{actualDemucsModel.id}）。</p></div><span className="status-chip vocal_ready"><i />可生成</span></div><div className="vocal-listen"><div><strong>原曲试听</strong>{originalArtifact?.url && <audio controls src={originalArtifact.url} />}</div><div><strong>已分离人声</strong>{vocalArtifact?.url && <audio controls src={vocalArtifact.url} />}</div></div><button type="button" className="primary-action" onClick={() => void generateVocal()} disabled={busy}><span>{busy ? "正在排队…" : "下一步 · 生成人声简谱"}</span><strong>↗</strong></button></section>}
       {source === "vocal" && job?.status === "completed" && <section className="vocal-result panel" aria-labelledby="vocal-heading"><div className="panel-heading"><div><p className="section-kicker">04 · GAME RESULT</p><h2 id="vocal-heading">人声主旋律已经展开</h2><p className="heading-note">GAME 只处理已分离的人声，结果保留为单一主旋律谱面。分离模型：{actualDemucsModel.label}（{actualDemucsModel.id}）。</p></div><span className="status-chip completed"><i />完成</span></div><div className="vocal-listen"><div><strong>原曲试听</strong>{originalArtifact?.url && <audio controls src={originalArtifact.url} />}</div><div><strong>已分离人声</strong>{vocalArtifact?.url && <audio controls src={vocalArtifact.url} />}</div></div><div className="score-grid">{artifacts.filter((item) => item.kind === "score_svg_long").map((artifact) => <a className="score-card score-long-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>纵向长图 SVG · 默认预览</small></a>)}</div><details className="score-pages"><summary>分页 SVG（{artifacts.filter((item) => item.kind === "score_svg").length} 页）</summary><div className="score-grid">{artifacts.filter((item) => item.kind === "score_svg").map((artifact) => <a className="score-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>分页 SVG · 下载或新窗口查看</small></a>)}</div></details><div className="download-stack">{artifacts.filter((item) => item.kind === "score_svg_long").map((artifact) => <a className="download-line" key={`${artifact.artifact_id}-download`} href={artifact.url || "#"}>↓ 下载长图 SVG · {artifact.label}</a>)}{vocalMidi?.url && <a className="download-line" href={vocalMidi.url}>↓ 下载人声主旋律 MIDI</a>}{artifacts.filter((item) => ["jianpu_source", "lilypond_source"].includes(item.kind)).map((artifact) => <a className="download-line" key={artifact.artifact_id} href={artifact.url || "#"}>↓ {artifact.label}</a>)}</div></section>}

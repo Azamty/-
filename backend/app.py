@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .api_models import ArtifactsResponse, JobResponse, V2SelectionRequest
@@ -521,10 +521,25 @@ def create_app(
         )
 
     @app.get("/api/v2/soundfont/status")
-    async def get_v2_soundfont_status() -> dict[str, Any]:
-        return await asyncio.to_thread(soundfont_status)
+    async def get_v2_soundfont_status() -> JSONResponse:
+        return JSONResponse(
+            content=await asyncio.to_thread(soundfont_status),
+            headers={"Cache-Control": "no-store"},
+        )
 
-    @app.get("/api/v2/soundfont")
+    @app.head("/api/v2/soundfont/status")
+    async def head_v2_soundfont_status() -> Response:
+        # A few tunnel/proxy clients probe an endpoint with HEAD first. Keep
+        # this response bodyless and avoid exposing any machine-local fields.
+        return Response(
+            status_code=200,
+            headers={
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.api_route("/api/v2/soundfont", methods=["GET", "HEAD"])
     async def download_v2_soundfont() -> FileResponse:
         try:
             path = await asyncio.to_thread(ensure_soundfont)
@@ -536,7 +551,16 @@ def create_app(
         return FileResponse(
             path,
             media_type="audio/x-soundfont-sf3",
-            headers={"Content-Disposition": 'inline; filename="MuseScore_General.sf3"'},
+            headers={
+                "Content-Disposition": 'inline; filename="MuseScore_General.sf3"',
+                # The asset is content-addressed by its fixed SHA and is safe
+                # to reuse across visits/devices after the first successful
+                # download. FileResponse supplies Content-Length, ETag and
+                # byte-range responses; these headers make that behavior
+                # usable through a tunnel and by browser caches.
+                "Cache-Control": "public, max-age=604800, immutable",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.post("/api/jobs/{job_id}/retry", response_model=JobResponse, status_code=202)
@@ -577,6 +601,27 @@ def create_app(
             path,
             media_type=str(artifact.get("media_type", "application/octet-stream")),
             headers={"Content-Disposition": f'inline; filename="{name}"'},
+        )
+
+    @app.api_route("/vendor/{asset_path:path}", methods=["GET", "HEAD"])
+    async def download_frontend_vendor(asset_path: str) -> FileResponse:
+        """Serve the bundled SpessaSynth processor with stable cache headers.
+
+        It is intentionally same-origin and local. Keeping this route explicit
+        gives AudioWorklet and tunnel proxies a predictable JavaScript content
+        type while preventing a path outside the built vendor directory.
+        """
+
+        vendor_root = (FRONTEND_DIST / "vendor").resolve()
+        candidate = (vendor_root / asset_path).resolve()
+        if vendor_root not in candidate.parents or not candidate.is_file():
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(
+            candidate,
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.get("/{full_path:path}")

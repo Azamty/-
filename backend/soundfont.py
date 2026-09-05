@@ -50,7 +50,12 @@ def soundfont_status() -> dict[str, Any]:
         "source": SOUNDFONT_SOURCE,
         "mirror": SOUNDFONT_MIRROR,
         "license": SOUNDFONT_LICENSE,
-        "cache_path": os.fspath(SOUNDFONT_PATH),
+        # This payload is returned to remote browsers as well as local ones.
+        # Never disclose the machine's absolute cache path in a public API
+        # response; the browser only needs the download metadata below.
+        "media_type": "audio/x-soundfont-sf3",
+        "download_url": "/api/v2/soundfont",
+        "range_supported": True,
         "message": (
             "MuScriptor 官方音色库已缓存，可由浏览器 SpessaSynth 加载。"
             if valid
