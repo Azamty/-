@@ -71,10 +71,13 @@ def test_synth_pause_contract_destroys_worklet_queue_and_resumes_from_offset() -
     assert "try { synth.destroy(); }" in source
     assert "soundfontAbortRef.current?.abort()" in source
     assert '"synth_cancelled"' in source
+    assert "cloneSoundfontBuffer(soundfont)" in source
+    assert "const soundfontForSynth = cloneSoundfontBuffer(soundfont)" in source
     assert "const pauseSynth = useCallback" in source
     assert 'haltSynth("pause", elapsed)' in source
     assert "synthSessionRef.current !== session" in source
     assert "const startOffset = synthPaused" in source
-    assert "if (note.end_sec <= startOffset) return" in source
+    assert "slicePlaybackNotes(playable, startOffset)" in source
+    assert "playbackPosition(audioNow, synthOriginRef.current, synthDurationRef.current)" in source
     assert 'synthPaused ? "播放"' in source
     assert "synthPlaying || synthPaused ? synthTime : originalTime" in source

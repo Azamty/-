@@ -2,6 +2,7 @@ import { ChangeEvent, DragEvent, useCallback, useEffect, useRef, useState } from
 import { WorkletSynthesizer } from "spessasynth_lib";
 import { FIXTURE_JOB, FIXTURE_NOTES, FIXTURE_TRACKS } from "./fixtures/multitrack";
 import { FIXTURE_VOCAL_JOB } from "./fixtures/vocal";
+import { clampPlaybackOffset, cloneSoundfontBuffer, playbackPosition, slicePlaybackNotes } from "./synthPlayback";
 
 type SourceKind = "instrumental" | "vocal";
 type DemucsModel = "htdemucs" | "htdemucs_ft";
@@ -649,9 +650,10 @@ function App() {
 
   const pauseSynth = useCallback(() => {
     if (!synthPlaying) return;
-    const elapsed = synthOriginRef.current === null
+    const audioNow = audioContextRef.current?.currentTime;
+    const elapsed = synthOriginRef.current === null || audioNow === undefined
       ? synthPositionRef.current
-      : (performance.now() - synthOriginRef.current) / 1000;
+      : playbackPosition(audioNow, synthOriginRef.current, synthDurationRef.current);
     haltSynth("pause", elapsed);
   }, [haltSynth, synthPlaying]);
 
@@ -710,8 +712,12 @@ function App() {
         const percent = denominator ? ` · ${Math.min(100, Math.round((received / denominator) * 100))}%` : "";
         setSynthResource(`正在下载官方 MuseScore General SF3 · ${formatBytes(received)}${denominator ? ` / ${formatBytes(denominator)}` : ""}${percent}`);
       };
-      let soundfont = expectedVersion && synthBufferRef.current?.version === expectedVersion
+      const memoryCandidate = expectedVersion && synthBufferRef.current?.version === expectedVersion
         ? synthBufferRef.current.buffer
+        : null;
+      let soundfont = memoryCandidate && memoryCandidate.byteLength > 0
+        && (!expectedBytes || memoryCandidate.byteLength === expectedBytes)
+        ? memoryCandidate
         : null;
       const memoryHit = Boolean(soundfont);
       if (!soundfont) {
@@ -781,34 +787,38 @@ function App() {
         setSynthResource("已从本机浏览器缓存读取 MuseScore General SF3");
       }
       if (soundfont && expectedVersion) {
-        synthBufferRef.current = { version: expectedVersion, buffer: soundfont };
+        // SpessaSynth transfers the buffer to its AudioWorklet. Keep a private
+        // copy so pause/resume can initialize a fresh synth without re-fetching.
+        synthBufferRef.current = { version: expectedVersion, buffer: cloneSoundfontBuffer(soundfont) };
       }
       if (synthSessionRef.current !== lifecycle) {
         throw new SynthPlaybackError("synth_cancelled", "合成试听已停止，不再启动旧的音频实例。");
       }
+      const soundfontForSynth = cloneSoundfontBuffer(soundfont);
       setSynthResource("SF3 下载完成，正在初始化 SpessaSynth…");
-        let synth: WorkletSynthesizer | null = null;
-        try {
-          synth = new WorkletSynthesizer(context, { eventsEnabled: false });
-          synth.connect(context.destination);
-          await synth.soundBankManager.addSoundBank(soundfont, "MuseScore_General");
-          await synth.isReady;
-          if (synthSessionRef.current !== lifecycle) {
-            throw new SynthPlaybackError("synth_cancelled", "合成试听已停止，不再启动旧的音频实例。");
-          }
-        } catch {
-          if (synth) {
-            try { synth.disconnect(); } catch { /* processor may be incomplete */ }
-            try { synth.destroy(); } catch { /* processor may be incomplete */ }
-          }
-          throw new SynthPlaybackError("synth_init_failed", "SF3 已下载，但浏览器初始化 SpessaSynth 失败；请尝试最新版 Chrome/Edge 或释放设备内存后重试。");
+      let synth: WorkletSynthesizer | null = null;
+      try {
+        synth = new WorkletSynthesizer(context, { eventsEnabled: false });
+        synth.connect(context.destination);
+        await synth.soundBankManager.addSoundBank(soundfontForSynth, "MuseScore_General");
+        await synth.isReady;
+        if (synthSessionRef.current !== lifecycle) {
+          throw new SynthPlaybackError("synth_cancelled", "合成试听已停止，不再启动旧的音频实例。");
         }
-        if (!synth) throw new SynthPlaybackError("synth_init_failed", "SF3 合成器没有创建成功，请重试。");
-        synthRef.current = synth;
-        setLightweightActive(false);
-        setSoundfontStatus((current) => current ? { ...current, available: true, status: "ready" } : current);
-        setSynthResource("MuseScore General · SpessaSynth / SF3");
-        return synth;
+      } catch (caught) {
+        if (synth) {
+          try { synth.disconnect(); } catch { /* processor may be incomplete */ }
+          try { synth.destroy(); } catch { /* processor may be incomplete */ }
+        }
+        if (caught instanceof SynthPlaybackError && caught.code === "synth_cancelled") throw caught;
+        throw new SynthPlaybackError("synth_init_failed", "SF3 已下载，但浏览器初始化 SpessaSynth 失败；请尝试最新版 Chrome/Edge 或释放设备内存后重试。");
+      }
+      if (!synth) throw new SynthPlaybackError("synth_init_failed", "SF3 合成器没有创建成功，请重试。");
+      synthRef.current = synth;
+      setLightweightActive(false);
+      setSoundfontStatus((current) => current ? { ...current, available: true, status: "ready" } : current);
+      setSynthResource("MuseScore General · SpessaSynth / SF3");
+      return synth;
     })();
     synthLoadRef.current = load;
     try {
@@ -990,24 +1000,26 @@ function App() {
     setSelectedTrackIds((current) => current.includes(trackId) ? current.filter((id) => id !== trackId) : [...current, trackId]);
   };
 
-  const startSynthClock = (maxEnd: number, startOffset: number) => {
+  const startSynthClock = (maxEnd: number, startOffset: number, audioStartAt: number) => {
     const session = synthSessionRef.current + 1;
     synthSessionRef.current = session;
-    const boundedOffset = Math.max(0, Math.min(maxEnd, startOffset));
+    const boundedOffset = clampPlaybackOffset(startOffset, maxEnd);
     synthDurationRef.current = maxEnd;
     synthPositionRef.current = boundedOffset;
-    synthOriginRef.current = performance.now() - boundedOffset * 1000;
+    synthOriginRef.current = audioStartAt - boundedOffset;
     setSynthTime(boundedOffset);
     setSynthPlaying(true);
     setSynthPaused(false);
     const tick = () => {
       if (synthSessionRef.current !== session || synthOriginRef.current === null) return;
-      const elapsed = (performance.now() - synthOriginRef.current) / 1000;
-      if (elapsed >= maxEnd + 0.15) {
+      const audioNow = audioContextRef.current?.currentTime;
+      if (audioNow === undefined) return;
+      const rawElapsed = audioNow - synthOriginRef.current;
+      if (rawElapsed >= maxEnd + 0.15) {
         stopSynth();
         return;
       }
-      const position = Math.min(maxEnd, Math.max(0, elapsed));
+      const position = playbackPosition(audioNow, synthOriginRef.current, maxEnd);
       synthPositionRef.current = position;
       setSynthTime(position);
       synthTimerRef.current = window.requestAnimationFrame(tick);
@@ -1042,17 +1054,17 @@ function App() {
     if (context.state !== "running") throw new SynthPlaybackError("audio_context_blocked", "浏览器仍将音频上下文保持为暂停，请再次点击播放。");
     const trackById = new Map(tracks.map((track) => [track.track_id, track]));
     const maxEnd = Math.max(...playable.map((note) => note.end_sec), 0);
-    const resumeAt = Math.max(0, Math.min(startOffset, maxEnd));
+    const resumeAt = clampPlaybackOffset(startOffset, maxEnd);
+    const scheduledNotes = slicePlaybackNotes(playable, resumeAt);
     const start = context.currentTime + 0.08;
     const waveforms: OscillatorType[] = ["sine", "triangle", "square", "sawtooth"];
-    playable.forEach((note) => {
-      if (note.end_sec <= resumeAt) return;
+    scheduledNotes.forEach((note) => {
       const track = note.track_id ? trackById.get(note.track_id) : undefined;
       if (!track) return;
       const oscillator = context.createOscillator();
       const gain = context.createGain();
-      const noteStart = Math.max(0, note.start_sec - resumeAt);
-      const noteEnd = Math.max(noteStart + 0.06, note.end_sec - resumeAt);
+      const noteStart = note.start_sec;
+      const noteEnd = Math.max(noteStart + 0.06, note.end_sec);
       const when = start + noteStart;
       const until = start + noteEnd;
       const frequency = track.is_drum
@@ -1073,7 +1085,7 @@ function App() {
     setLightweightActive(true);
     setSynthError(`${fallbackReason} 已改用轻量试听；音高、节奏和所选轨道仍保持。${hasDrums ? "鼓组使用电子近似音色。" : ""}`);
     setSynthResource("轻量音色 · Web Audio 波形 · 选择轨道已应用");
-    startSynthClock(maxEnd, resumeAt);
+    startSynthClock(maxEnd, resumeAt, start);
   };
 
   const submitSelection = async (kind: "midi" | "score") => {
@@ -1097,7 +1109,7 @@ function App() {
     const maxEnd = Math.max(...playable.map((note) => note.end_sec), 0);
     const playbackRequest = synthSessionRef.current;
     const startOffset = synthPaused && synthPositionRef.current < maxEnd
-      ? Math.min(synthPositionRef.current, maxEnd)
+      ? clampPlaybackOffset(synthPositionRef.current, maxEnd)
       : 0;
     setError("");
     setSynthError("");
@@ -1127,19 +1139,19 @@ function App() {
         synth.programChange(channel, Math.max(0, Math.min(127, track.program)));
       });
       const start = context.currentTime + 0.08;
-      playable.forEach((note) => {
-        if (note.end_sec <= startOffset) return;
+      const scheduledNotes = slicePlaybackNotes(playable, startOffset);
+      scheduledNotes.forEach((note) => {
         const channel = note.track_id ? channels.get(note.track_id) : undefined;
         if (channel === undefined) return;
-        const noteStart = Math.max(0, note.start_sec - startOffset);
-        const noteEnd = Math.max(noteStart + 0.04, note.end_sec - startOffset);
+        const noteStart = note.start_sec;
+        const noteEnd = Math.max(noteStart + 0.04, note.end_sec);
         const when = start + noteStart;
         const until = start + noteEnd;
         synth.noteOn(channel, Math.max(0, Math.min(127, note.pitch)), 80, { time: when });
         synth.noteOff(channel, Math.max(0, Math.min(127, note.pitch)), { time: until });
       });
       setSynthResource("MuseScore General · SpessaSynth / SF3 · program/channel 已应用");
-      startSynthClock(maxEnd, startOffset);
+      startSynthClock(maxEnd, startOffset, start);
     } catch (caught) {
       if (synthSessionRef.current !== playbackRequest) return;
       let fallbackDiagnostic = "";
