@@ -107,3 +107,15 @@ API 入口为 `GET /api/capabilities`、`POST /api/jobs`、`GET /api/jobs/{job_i
 ## 模型来源与许可证
 
 GAME 源码随项目放在 `vendor\GAME-1.0.3`，其 `LICENSE` 为 MIT；使用的官方 small 权重及其 `config.yaml`、语言映射位于 `.cache\models\game\GAME-1.0-small`。tsumugi 源码随项目放在 `vendor\tsumugi-57b79ac4e1fa30c6f3eb95f14c77271fab637eeb`，其 `LICENSE` 为 MIT；三个 checkpoint 的来源 revision、SHA256 和文件名记录在 `.cache\models\tsumugi\provenance.json`。权重只保存在本机项目缓存中，不进入后端全局环境。
+
+## V2 阶段B（本机 MuScriptor smoke）
+
+V2 的伴奏路径直接把完整混音交给 MuScriptor，先完成一次全量识别，再按识别出的乐器选择分谱；鼓保留试听和 MIDI，跳过简谱渲染。人声路径直接调用 GAME，V2 不启用 Demucs。依赖安装在独立的 `.venv-model-muscriptor` 中，Windows GPU 默认选择 CUDA 12.8：
+
+```powershell
+.\scripts\install_muscriptor.ps1
+.\.venv-model-muscriptor\Scripts\python.exe .\scripts\muscriptor_smoke.py `
+  .\artifacts\review\scale_reference.wav --device cuda
+```
+
+smoke 会记录 CUDA 设备、模型加载和解码耗时、峰值显存、完整乐器清单、鼓事件以及选中乐器的分谱计数，并写出完整识别 MIDI 与 JSON manifest。MuScriptor 权重和 Hugging Face 缓存均留在本机忽略目录。
