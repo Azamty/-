@@ -1,0 +1,13 @@
+# Installed only in .venv-model-tsumugi by scripts/install_models.ps1.
+# Keep the CPU path free of tsumugi's optional triton-windows dependency.
+dlchordx
+einops
+mido
+numpy
+pretty-midi
+pyyaml
+scipy
+soundfile
+torch==2.13.0+cpu
+torchaudio==2.11.0+cpu
+tqdm

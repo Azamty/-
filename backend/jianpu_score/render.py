@@ -1,0 +1,137 @@
+"""Deterministic jianpu-ly and LilyPond renderer."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import mido
+from pydantic import BaseModel, ConfigDict
+
+from .domain import Score, TempoEvent
+from .quantize import score_to_jianpu
+
+
+ROOT = Path(__file__).resolve().parents[2]
+JIANPU = ROOT / "vendor" / "jianpu-ly" / "jianpu-ly.py"
+LILYPOND = ROOT / "tools" / "lilypond-2.24.4" / "bin" / "lilypond.exe"
+
+
+class RenderArtifacts(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    output_dir: str
+    jly_path: str
+    lilypond_path: str
+    svg_paths: list[str]
+    midi_path: str | None = None
+    log_path: str
+
+
+def _apply_score_tempos(midi_path: Path, score: Score) -> None:
+    """Make the generated MIDI tempo map match Score.tempo_events."""
+
+    midi = mido.MidiFile(os.fspath(midi_path))
+    tempo_events = score.tempo_events or [TempoEvent(start_tick=0, bpm=score.bpm)]
+    absolute_tempos = {
+        int(round(event.start_tick * midi.ticks_per_beat / score.quarter_ticks)): event
+        for event in tempo_events
+    }
+    if not midi.tracks:
+        midi.tracks.append(mido.MidiTrack())
+    tempo_track = midi.tracks[0]
+    absolute_messages: list[tuple[int, int, mido.MetaMessage | mido.Message]] = []
+    absolute = 0
+    for message in tempo_track:
+        absolute += message.time
+        if message.type != "set_tempo":
+            absolute_messages.append((absolute, 1, message.copy()))
+    for tick, tempo in absolute_tempos.items():
+        absolute_messages.append((tick, 0, mido.MetaMessage("set_tempo", tempo=int(round(60_000_000 / tempo.bpm)))) )
+    absolute_messages.sort(key=lambda item: (item[0], item[1]))
+    tempo_track[:] = []
+    previous = 0
+    for tick, _priority, message in absolute_messages:
+        message.time = max(0, tick - previous)
+        tempo_track.append(message)
+        previous = tick
+    midi.save(os.fspath(midi_path))
+
+
+def _safe_basename(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return name or "score"
+
+
+def render_score(score: Score, output_dir: str | Path, *, basename: str = "score") -> RenderArtifacts:
+    """Render a Score and return only artifacts beneath the requested directory."""
+
+    if not JIANPU.is_file():
+        raise FileNotFoundError(JIANPU)
+    if not LILYPOND.is_file():
+        raise FileNotFoundError(LILYPOND)
+    destination = Path(output_dir).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    safe_name = _safe_basename(basename)
+    jly_path = destination / f"{safe_name}.jly"
+    lilypond_path = destination / f"{safe_name}.ly"
+    prefix = destination / safe_name
+    log_path = destination / f"{safe_name}.lilypond.log"
+    for path in destination.glob(f"{safe_name}*"):
+        if path.is_file():
+            path.unlink()
+
+    jly_text = score_to_jianpu(score)
+    jly_path.write_text(jly_text, encoding="utf-8")
+    converter = subprocess.run(
+        [os.fspath(Path(sys.executable)), os.fspath(JIANPU), os.fspath(jly_path)],
+        cwd=ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+    if converter.returncode:
+        raise RuntimeError(f"jianpu-ly failed ({converter.returncode}): {converter.stderr[-4000:]}")
+    lilypond_path.write_text(converter.stdout, encoding="utf-8")
+    lilypond = subprocess.run(
+        [os.fspath(LILYPOND), "--svg", "-o", os.fspath(prefix), os.fspath(lilypond_path)],
+        cwd=ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+    log_path.write_text(lilypond.stdout + lilypond.stderr, encoding="utf-8")
+    if lilypond.returncode:
+        raise RuntimeError(f"LilyPond failed ({lilypond.returncode}): {lilypond.stderr[-4000:]}")
+
+    svg_paths = sorted(destination.glob(f"{safe_name}*.svg"))
+    midi_candidates = sorted(destination.glob(f"{safe_name}*.mid")) + sorted(destination.glob(f"{safe_name}*.midi"))
+    if not svg_paths:
+        raise RuntimeError("LilyPond completed without SVG artifacts")
+    if midi_candidates:
+        _apply_score_tempos(midi_candidates[0], score)
+    for path in [*svg_paths, *midi_candidates, jly_path, lilypond_path, log_path]:
+        if destination not in path.resolve().parents:
+            raise RuntimeError(f"renderer produced an artifact outside output directory: {path}")
+    return RenderArtifacts(
+        output_dir=os.fspath(destination),
+        jly_path=os.fspath(jly_path),
+        lilypond_path=os.fspath(lilypond_path),
+        svg_paths=[os.fspath(path) for path in svg_paths],
+        midi_path=os.fspath(midi_candidates[0]) if midi_candidates else None,
+        log_path=os.fspath(log_path),
+    )
+
+
+def write_score_json(score: Score, path: str | Path) -> None:
+    destination = Path(path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(score.model_dump(mode="json"), indent=2), encoding="utf-8")

@@ -1,0 +1,33 @@
+title=Stage 1 polyphony fixture
+composer= Jianpu Score
+% The 24-bar counter-line is long enough to exercise LilyPond's natural page breaking.
+LPH: \paper { #(set-paper-size "a5") }
+:LPH
+4/4
+
+% Part A: chord, triplet, dotted note, an in-bar tie and a tie across a barline.
+,135' 2 3 4 | 3[ q5 q5 q5 ] 6 7 1' |
+1 2 3 1 ~ | 1 2 3 4 | 4. q5 q6 7 q1 |
+1 ~ 1 2 3 | R*18
+NextPart
+
+% Part B: an independently timed lower line. Its triplet and held notes
+% are intentionally offset from Part A while keeping the same 24-bar duration.
+1 - 5 5 | 5 4 3 2 | 3[ q2 q2 q2 ] 1 2 3 |
+5 ~ 5 6 7 | 1' 7 6 5 | R*19
+NextPart
+
+% Part C: 24 bars of counter-line material, including a real chord and
+% multiple independent tuplets so paging is driven by actual content.
+,135' 4 5 6 | 3[ q3 q4 q5 ] 5 4 3 |
+2 1 7, q1 q2 | 3 4 5 6 |
+7 1' 2' 1' | 7 6 5 4 |
+3 2 1 q7 q6 | 3[ q1 q2 q3 ] 4 5 6 |
+7 1' 2' 3' | 4' 5' 4' 3' |
+2' 1' 7 6 | 5 4 3 2 |
+1 - - - | ,135' 2 3 4 |
+3[ q5 q5 q5 ] 6 7 1' | 1 2 3 4 |
+4. q5 q6 7 q1 | 5 6 7 1' |
+2' 1' 7 6 | 3[ q2 q2 q2 ] 1 2 3 |
+4 5 6 7 | 1' 2' 3' 4' |
+5' 4' 3' 2' | 1' - - - |
