@@ -100,13 +100,13 @@ select { appearance: auto; }
 .job-meta b { font-size: 13px; }
 .job-meta small { margin-top: 5px; color: #707974; font-family: var(--mono); font-size: 10px; }
 .job-id { color: #777f79; font-size: 10px; letter-spacing: .05em; }
-.phase-rail { height: 20px; margin: 27px 0 5px; display: grid; grid-template-columns: repeat(8, 1fr); align-items: center; position: relative; }
-.phase-rail::before { content: ""; position: absolute; left: 0; right: 0; top: 9px; height: 1px; background: #c8c5b8; }
+.phase-rail { height: 20px; margin: 27px 0 5px; display: grid; grid-template-columns: repeat(10, minmax(0, 1fr)); align-items: center; position: relative; }
+.phase-rail::before { content: ""; position: absolute; left: 5%; right: 5%; top: 9px; height: 1px; background: #c8c5b8; }
 .phase-rail span { position: relative; z-index: 1; display: flex; justify-content: center; }
 .phase-rail i { width: 9px; height: 9px; display: block; border: 2px solid #b4b4a9; border-radius: 50%; background: var(--paper-2); }
 .phase-rail span.done i { border-color: var(--sage); background: var(--sage); }
 .phase-rail span.active i { width: 13px; height: 13px; margin-top: -2px; border-color: var(--coral); background: var(--coral); box-shadow: 0 0 0 4px rgba(240, 120, 88, .16); }
-.phase-labels { display: flex; justify-content: space-between; color: #8a9189; font-size: 8px; }
+.phase-labels { display: grid; grid-template-columns: repeat(10, minmax(0, 1fr)); color: #8a9189; font-size: 8px; text-align: center; }
 .phase-labels .current { color: var(--coral-dark); font-weight: 700; }
 .progress-meter { height: 4px; margin-top: 25px; background: #d3cec0; }
 .progress-meter span { height: 100%; display: block; background: var(--coral); transition: width .4s ease; }
