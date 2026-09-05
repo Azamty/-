@@ -20,6 +20,7 @@ from .jianpu_score.analysis import MAX_AUDIO_BYTES, SUPPORTED_EXTENSIONS, probe_
 from .jianpu_score.capabilities import get_capabilities
 from .jianpu_score.domain import normalize_key, normalize_time_signature
 from .jianpu_score.pipeline import SUPPORTED_ENGINES
+from .soundfont import ensure_soundfont, soundfont_status
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -484,6 +485,25 @@ def create_app(
             path,
             media_type=str(artifact.get("media_type", "application/octet-stream")),
             headers={"Content-Disposition": f'inline; filename="{name}"'},
+        )
+
+    @app.get("/api/v2/soundfont/status")
+    async def get_v2_soundfont_status() -> dict[str, Any]:
+        return await asyncio.to_thread(soundfont_status)
+
+    @app.get("/api/v2/soundfont")
+    async def download_v2_soundfont() -> FileResponse:
+        try:
+            path = await asyncio.to_thread(ensure_soundfont)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "soundfont_unavailable", "message": str(exc)},
+            ) from exc
+        return FileResponse(
+            path,
+            media_type="audio/x-soundfont-sf3",
+            headers={"Content-Disposition": 'inline; filename="MuseScore_General.sf3"'},
         )
 
     @app.post("/api/jobs/{job_id}/retry", response_model=JobResponse, status_code=202)

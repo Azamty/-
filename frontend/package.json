@@ -15,7 +15,8 @@
     "react": "latest",
     "react-dom": "latest",
     "@types/react": "latest",
-    "@types/react-dom": "latest"
+    "@types/react-dom": "latest",
+    "spessasynth_lib": "4.3.14"
   },
   "devDependencies": {}
 }
