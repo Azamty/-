@@ -5,13 +5,14 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
 import uuid
 from typing import Any, Mapping, Sequence
 
-from .jianpu_score.domain import MusicAnalysis, NoteEvent
+from .jianpu_score.domain import MusicAnalysis, NoteEvent, normalize_key, normalize_time_signature
 from .jianpu_score.pipeline import run_pipeline
 from .jianpu_score.quantize import NoNotesError, quantize_events
 from .jianpu_score.render import render_score, write_score_json
@@ -118,7 +119,16 @@ class V2JobService:
     def is_v2(self, job_id: str) -> bool:
         return self.manager._read(job_id).get("kind") == "v2"
 
-    def select(self, job_id: str, selected_track_ids: Sequence[str], merge_main_melody: bool = False) -> dict[str, Any]:
+    def select(
+        self,
+        job_id: str,
+        selected_track_ids: Sequence[str],
+        merge_main_melody: bool = False,
+        *,
+        bpm_override: float | None = None,
+        key_override: str | None = None,
+        time_signature_override: str | None = None,
+    ) -> dict[str, Any]:
         with self.manager._lock:
             state = self.manager._read(job_id)
             if state.get("kind") != "v2":
@@ -137,11 +147,19 @@ class V2JobService:
             unknown = sorted(set(requested) - known)
             if unknown:
                 raise ValueError("selected_track_ids 未识别：" + ", ".join(unknown))
+            bpm = 120.0 if bpm_override is None else float(bpm_override)
+            if not math.isfinite(bpm) or bpm <= 0 or bpm > 400:
+                raise ValueError("bpm_override 必须在 0 到 400 之间")
+            key = normalize_key(key_override or "C")
+            time_signature = normalize_time_signature(time_signature_override or "4/4")
             revision = int(state.get("v2", {}).get("selection_revision", 0)) + 1
             selection = {
                 "revision": revision,
                 "selected_track_ids": requested,
                 "merge_main_melody": bool(merge_main_melody),
+                "bpm_override": bpm,
+                "key_override": key,
+                "time_signature_override": time_signature,
                 "created_at": _utc_now(),
             }
             v2 = dict(state.get("v2", {}))
@@ -407,10 +425,13 @@ class V2JobService:
         selected_set = set(selected_ids)
         track_by_id = {str(track.get("track_id")): track for track in tracks}
         selected_tracks = [track_by_id[track_id] for track_id in selected_ids if track_id in track_by_id]
+        bpm = float(selection.get("bpm_override") or 120.0)
+        key = normalize_key(str(selection.get("key_override") or "C"))
+        time_signature = normalize_time_signature(str(selection.get("time_signature_override") or "4/4"))
         notes_with_ids: list[dict[str, Any]] = []
         for note in notes:
-            key = (str(note.get("instrument_group")), int(note.get("program", 0)), bool(note.get("is_drum", False)))
-            track_id = stable_track_id(*key)
+            track_key = (str(note.get("instrument_group")), int(note.get("program", 0)), bool(note.get("is_drum", False)))
+            track_id = stable_track_id(*track_key)
             if track_id in selected_set:
                 notes_with_ids.append({**note, "track_id": track_id})
         selected_pitched = [track for track in selected_tracks if not bool(track.get("is_drum"))]
@@ -424,6 +445,7 @@ class V2JobService:
             notes_with_ids,
             output / "selected.mid",
             title=f"{title} selection r{revision}",
+            bpm=bpm,
         )
         job_dir = self.manager._safe_job_dir(job_id)
         artifacts: list[dict[str, Any]] = [
@@ -444,6 +466,7 @@ class V2JobService:
                 track_notes,
                 output / f"{track_id}.mid",
                 title=f"{title} {track.get('label_zh') or instrument_label_zh(str(track.get('instrument_group')))}",
+                bpm=bpm,
             )
             artifacts.append(
                 self.manager._register(
@@ -458,7 +481,16 @@ class V2JobService:
             )
             if bool(track.get("is_drum")):
                 continue
-            rendered = self._render_track_score(job_id, output, track, track_notes, title)
+            rendered = self._render_track_score(
+                job_id,
+                output,
+                track,
+                track_notes,
+                title,
+                bpm=bpm,
+                key=key,
+                time_signature=time_signature,
+            )
             score_artifact_ids.extend(item["artifact_id"] for item in rendered)
             artifacts.extend(rendered)
 
@@ -481,6 +513,9 @@ class V2JobService:
                 title,
                 basename="main-melody",
                 label_override="主旋律（合并）",
+                bpm=bpm,
+                key=key,
+                time_signature=time_signature,
             )
             artifacts.extend(merged_artifacts)
             score_artifact_ids.extend(item["artifact_id"] for item in merged_artifacts)
@@ -502,6 +537,11 @@ class V2JobService:
             "selected_track_ids": selected_ids,
             "selected_tracks": selected_tracks,
             "merge_main_melody": merge_requested,
+            "overrides": {
+                "bpm": bpm,
+                "key": key,
+                "time_signature": time_signature,
+            },
             "score_refusal": score_refusal,
             "score_artifact_ids": score_artifact_ids,
             "midi_artifact_id": f"v2-selection-r{revision}-midi",
@@ -547,6 +587,11 @@ class V2JobService:
                         "drum_track_ids": [str(track["track_id"]) for track in selected_tracks if bool(track.get("is_drum"))],
                         "score_refusal": score_refusal,
                         "merge_main_melody": merge_requested,
+                        "overrides": {
+                            "bpm": bpm,
+                            "key": key,
+                            "time_signature": time_signature,
+                        },
                     },
                     "v2": {**current_v2, "stage": "export"},
                     "updated_at": _utc_now(),
@@ -565,6 +610,9 @@ class V2JobService:
         *,
         basename: str | None = None,
         label_override: str | None = None,
+        bpm: float = 120.0,
+        key: str = "C",
+        time_signature: str = "4/4",
     ) -> list[dict[str, Any]]:
         track_id = str(track.get("track_id"))
         label = label_override or str(track.get("label_zh") or instrument_label_zh(str(track.get("instrument_group"))))
@@ -592,9 +640,9 @@ class V2JobService:
         analysis = MusicAnalysis(
             sample_rate=16000,
             duration_sec=max(duration, 0.1),
-            bpm=120.0,
-            key="C",
-            time_signature="4/4",
+            bpm=bpm,
+            key=key,
+            time_signature=time_signature,
             note_events=events,
             metadata={
                 "engine": "muscriptor",

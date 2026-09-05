@@ -414,7 +414,14 @@ def create_app(
     @app.post("/api/v2/jobs/{job_id}/selection/export", response_model=JobResponse, status_code=202)
     async def select_v2_tracks(job_id: str, payload: V2SelectionRequest = Body(...)) -> JobResponse:
         try:
-            manager.select_v2(job_id, payload.selected_track_ids, payload.merge_main_melody)
+            manager.select_v2(
+                job_id,
+                payload.selected_track_ids,
+                payload.merge_main_melody,
+                bpm_override=payload.bpm_override,
+                key_override=payload.key_override,
+                time_signature_override=payload.time_signature_override,
+            )
         except KeyError:
             raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
         except ValueError as exc:

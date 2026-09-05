@@ -377,8 +377,23 @@ class JobManager:
 
         return self.v2.create_job(original_name=original_name, source_kind=source_kind, title=title)
 
-    def select_v2(self, job_id: str, selected_track_ids: list[str], merge_main_melody: bool = False) -> dict[str, Any]:
-        return self.v2.select(job_id, selected_track_ids, merge_main_melody)
+    def select_v2(
+        self,
+        job_id: str,
+        selected_track_ids: list[str],
+        merge_main_melody: bool = False,
+        bpm_override: float | None = None,
+        key_override: str | None = None,
+        time_signature_override: str | None = None,
+    ) -> dict[str, Any]:
+        return self.v2.select(
+            job_id,
+            selected_track_ids,
+            merge_main_melody,
+            bpm_override=bpm_override,
+            key_override=key_override,
+            time_signature_override=time_signature_override,
+        )
 
     def v2_tracks(self, job_id: str) -> dict[str, Any]:
         return self.v2.tracks(job_id)

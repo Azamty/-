@@ -90,9 +90,15 @@ Pop-Location
 .\scripts\start_server.ps1
 ```
 
-浏览器打开 `http://127.0.0.1:8000`。网页支持拖入 MP3、WAV、FLAC、M4A，选择基础 Basic Pitch 或专用路由、来源、主旋律/多声部、语言以及生成前的 BPM、调性和拍号覆盖；任务按单 worker 串行执行，刷新后会按本机保存的 job UUID 恢复。完成任务会登记总谱和各声部分谱的全部 SVG 页面、MIDI、Score JSON、LilyPond/jianpu-ly 源文本、SVG ZIP 与任务日志。服务只监听 `127.0.0.1`，原文件最大 100 MB、时长最大 15 分钟，结束任务保留 24 小时。
+浏览器打开 `http://127.0.0.1:8000`。当前 V2 页面支持拖入 MP3、WAV、FLAC、M4A，选择伴奏 / 纯音乐或人声来源，并在选择导出前覆盖 BPM、调性和拍号；任务按单 worker 串行执行，刷新后会按本机保存的 V2 job UUID 恢复。完成任务会登记识别 MIDI、选择版本 MIDI、分谱 SVG、Score JSON、LilyPond/jianpu-ly 源文本与任务日志。服务只监听 `127.0.0.1`，原文件最大 100 MB、时长最大 15 分钟，结束任务保留 24 小时。
 
 API 入口为 `GET /api/capabilities`、`POST /api/jobs`、`GET /api/jobs/{job_id}`、`GET /api/jobs/{job_id}/score` 和 `GET /api/jobs/{job_id}/artifacts`；产物下载只接受持久化登记的 artifact ID。服务启动会把上次运行中的任务标记为“中断待重试”，不会删除模型缓存；`-Background` 可启动隐藏后台进程。
+
+### V2 MuScriptor 工作台
+
+`v2/muscriptor` 的页面只使用 `/api/v2/...` 任务入口，来源固定为“伴奏 / 纯音乐（MuScriptor）”或“人声（GAME）”。纯音乐任务会先做一次 MuScriptor medium 全量识别，进入“识别完成，等待选择”，页面按中文乐器名、模型分类名和 note count 展示轨道，并用颜色对应时间同步钢琴卷帘。轨道勾选只改变选择快照；鼓组可以试听并保留在选择 MIDI 中，但不会生成简谱。页面的本机合成试听使用浏览器 Web Audio，识别 NoteEvent 的 `velocity` 保持 `None`，试听只使用固定 playback default。
+
+选择导出前的 BPM、调性和拍号会写入 selection revision，并实际作用于选择 MIDI 与每轨分谱渲染。原曲 `<audio>` 与合成试听分开。刷新会从 `localStorage` 恢复 V2 job、选择、静音与钢琴卷帘状态；`?fixture=multitrack` 可载入不调用模型的受控三轨（钢琴、小提琴、鼓组）页面，用于验证多选、鼓组规则和本机试听交互。
 
 ## 最终本地验收与使用边界
 

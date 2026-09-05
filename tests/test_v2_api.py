@@ -60,13 +60,23 @@ def test_v2_selection_is_a_persistent_revision_snapshot(tmp_path: Path) -> None:
     ]
     _instrumental_state(manager, job_id, notes, tracks)
 
-    manager.select_v2(job_id, [guitar_id, drum_id], merge_main_melody=True)
+    manager.select_v2(
+        job_id,
+        [guitar_id, drum_id],
+        merge_main_melody=True,
+        bpm_override=96,
+        key_override="Am",
+        time_signature_override="6/8",
+    )
 
     persisted = json.loads((tmp_path / "jobs" / job_id / "job.json").read_text(encoding="utf-8"))
     assert persisted["status"] == "queued"
     assert persisted["v2"]["selection"]["revision"] == 1
     assert persisted["v2"]["selection"]["selected_track_ids"] == [guitar_id, drum_id]
     assert persisted["v2"]["selection"]["merge_main_melody"] is True
+    assert persisted["v2"]["selection"]["bpm_override"] == 96
+    assert persisted["v2"]["selection"]["key_override"] == "Am"
+    assert persisted["v2"]["selection"]["time_signature_override"] == "6/8"
 
 
 def test_v2_drum_only_export_keeps_midi_and_refuses_jianpu(tmp_path: Path) -> None:

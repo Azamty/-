@@ -64,3 +64,6 @@ class V2SelectionRequest(BaseModel):
 
     selected_track_ids: list[str] = Field(default_factory=list)
     merge_main_melody: bool = False
+    bpm_override: float | None = Field(default=None, gt=0)
+    key_override: str | None = None
+    time_signature_override: str | None = None
