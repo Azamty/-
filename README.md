@@ -2,6 +2,10 @@
 
 本项目把本机音频转换为可编辑的简谱数据，并通过 jianpu-ly 与 LilyPond 生成真实 SVG。首版运行在 `127.0.0.1`，不需要登录，不提供歌词编辑或云端 PDF 服务。
 
+## 版本与运行分支
+
+`main` 固定 V1 首版，标签 `v1.0.0` 对应已验收的八度修复与完整 V1 pipeline。当前第二版开发在 `v2/muscriptor`；切换到该分支后执行 `.\scripts\start_server.ps1 -Background`，启动脚本会按当前 checkout 启动 V2 页面。不要把 V2 的识别任务目录、模型权重、用户音频或 Hugging Face 凭证提交进 git。
+
 ## 阶段1基础
 
 - Python 后端环境使用项目内 `.venv`，创建它的解释器优先为本机 `E:\develop\anaconda3\envs\py310\python.exe`（Python 3.10）。
@@ -96,9 +100,9 @@ API 入口为 `GET /api/capabilities`、`POST /api/jobs`、`GET /api/jobs/{job_i
 
 ### V2 MuScriptor 工作台
 
-`v2/muscriptor` 的页面只使用 `/api/v2/...` 任务入口，来源固定为“伴奏 / 纯音乐（MuScriptor）”或“人声（GAME）”。纯音乐任务会先做一次 MuScriptor medium 全量识别，进入“识别完成，等待选择”，页面按中文乐器名、模型分类名和 note count 展示轨道，并用颜色对应时间同步钢琴卷帘。轨道勾选只改变选择快照；鼓组可以试听并保留在选择 MIDI 中，但不会生成简谱。页面的本机合成试听使用浏览器 Web Audio，识别 NoteEvent 的 `velocity` 保持 `None`，试听只使用固定 playback default。
+`v2/muscriptor` 的页面只使用 `/api/v2/...` 任务入口，来源固定为“伴奏 / 纯音乐（MuScriptor）”或“人声（GAME）”。纯音乐任务会先做一次 MuScriptor medium 全量识别，进入“识别完成，等待选择”，页面按中文乐器名、模型分类名和 note count 展示轨道，并用颜色对应时间同步钢琴卷帘。每条轨道只有一个 checkbox，它同时控制卷帘显示、SpessaSynth 试听、选择 MIDI 和分谱；鼓组可以试听并保留在选择 MIDI 中，但不会生成简谱。页面的本机合成试听使用浏览器 SpessaSynth + 官方 MuseScore General SF3，识别 NoteEvent 的 `velocity` 保持 `None`，试听只使用固定 playback default。
 
-选择导出前的 BPM、调性和拍号会写入 selection revision，并实际作用于选择 MIDI 与每轨分谱渲染。原曲 `<audio>` 与合成试听分开。刷新会从 `localStorage` 恢复 V2 job、选择、静音与钢琴卷帘状态；`?fixture=multitrack` 可载入不调用模型的受控三轨（钢琴、小提琴、鼓组）页面，用于验证多选、鼓组规则和本机试听交互。
+识别阶段会复用 `MusicAnalysis` 返回 BPM、调性、拍号建议、候选值和警告；拍号自动分析未启用时会按 `4/4` 回退并要求生成前确认。选择导出前的覆盖值会写入 selection revision，并实际作用于选择 MIDI 与每轨分谱渲染。原曲 `<audio>` 与合成试听分开。刷新会按 job UUID 恢复 V2 job、选择、覆盖值和钢琴卷帘状态；创建新任务会清空旧任务的覆盖值。`?fixture=multitrack` 可载入不调用模型的受控三轨（钢琴、小提琴、鼓组）页面，用于验证单一 checkbox、多选、鼓组规则和本机试听交互。
 
 ## 最终本地验收与使用边界
 
@@ -106,9 +110,10 @@ API 入口为 `GET /api/capabilities`、`POST /api/jobs`、`GET /api/jobs/{job_i
 - 基础档调用独立环境中的 Basic Pitch，适合先快速试谱；专用档按来源调用 GAME 或 tsumugi。所有模型优先 CPU，耗时取决于时长和机器性能。阶段验收中 6 秒样本约 51 秒，180 秒合成曲的完整 API 任务约 214 秒；这些是本机参考值，不是性能保证。
 - BPM、调性和拍号可以在生成前覆盖。自动拍号当前只给出 `2/4`、`3/4`、`4/4`、`6/8` 候选并回退到 `4/4`，结果会提示确认；音符先经过共享拍点时间线和 Score，再生成 SVG 与 MIDI。
 - 简谱级数、主旋律连续性和分轨结果会受到混音、噪声、复音和模型能力影响。现有真实模型验收使用短参考音阶和 180 秒合成规模样本；没有把中日文或混合语言真实歌曲准确度宣称为已验证，生成结果需要人工复核。
+- MuScriptor 负责全量识别但不提供原始音轨分离；乐器误分类、漏检、复音重叠和鼓音高映射都可能影响轨道与分谱，V2 不调用 Demucs。自动拍号当前只提供 `2/4`、`3/4`、`4/4`、`6/8` 候选，无法可靠判断时回退到 `4/4` 并显示警告。
 - 180 秒规模验收记录在 `artifacts\review\stage5-final\run-20260904T120124Z\summary.json`：输入 180.0 秒，真实 Demucs + Basic Pitch 用时约 213.8 秒，分析首个事件约 0.012 秒、末个事件约 178.792 秒，Score 为 2 页，总谱和器乐分谱 MIDI 都是 180.0 秒。该目录中的 JSON、SVG、MIDI 和 ZIP 是可复查证据。
 
-后台启动可双击 `scripts\start_server.cmd`，或执行 `.\scripts\start_server.ps1 -Background`；服务 PID 保存在 `artifacts\server.pid`。停止后台服务可双击 `scripts\stop_server.cmd`，或执行 `.\scripts\stop_server.ps1`，脚本会结束已核验的服务进程树，避免模型子进程残留和下一次启动重复 worker。前台运行 `.\scripts\start_server.ps1` 时，在该窗口按 Ctrl+C 退出。
+后台启动可双击 `scripts\start_server.cmd`，或执行 `.\scripts\start_server.ps1 -Background`；当前 `v2/muscriptor` checkout 启动的是 V2 页面。服务 PID 保存在 `artifacts\server.pid`。停止后台服务可双击 `scripts\stop_server.cmd`，或执行 `.\scripts\stop_server.ps1`，脚本会结束已核验的服务进程树，避免模型子进程残留和下一次启动重复 worker。前台运行 `.\scripts\start_server.ps1` 时，在该窗口按 Ctrl+C 退出。
 
 ## 模型来源与许可证
 
@@ -126,12 +131,14 @@ V2 的伴奏路径直接把完整混音交给 MuScriptor，先完成一次全量
 
 smoke 会记录 CUDA 设备、模型加载和解码耗时、峰值显存、完整乐器清单、鼓事件以及选中乐器的分谱计数，并写出完整识别 MIDI 与 `artifacts\review\stageB-muscriptor\smoke.json`。MuScriptor 权重和 Hugging Face 缓存均留在本机忽略目录。
 
+MuScriptor medium 权重按其非商业许可使用；首次准备模型前由用户在本机完成 Hugging Face 登录并接受对应许可，脚本只读取本机缓存，不把 token 写入任务、日志或 API 响应。浏览器试听需要官方 MIT MuseScore General SF3，后端按需缓存到 `.cache\muscriptor`，来源、SHA-256、许可和预取脚本记录在 `docs\muscriptor-soundfont.md`。
+
 ## V2 阶段C（持久两阶段 API）
 
 V2 API 与 V1 共用一个持久单 worker。`POST /api/v2/jobs` 的来源只接受
 `instrumental`（界面名称：伴奏/纯音乐）或 `vocal`（人声）。伴奏由隔离的
 MuScriptor medium CUDA worker 全量识别一次，任务进入 `selection_ready`；
-`GET /api/v2/jobs/{id}/tracks` 返回稳定 `track_id`、中文乐器名、GM program、鼓标记、音符数量和试听可用状态。
+`GET /api/v2/jobs/{id}/tracks` 返回稳定 `track_id`、中文乐器名、GM program、鼓标记、音符数量和试听可用状态，并返回原音 `MusicAnalysis` 的 BPM、调性、拍号建议、候选值和警告。
 
 选择通过 `POST /api/v2/jobs/{id}/selection` 或
 `POST /api/v2/jobs/{id}/selection/export` 提交 `selected_track_ids`，并可选

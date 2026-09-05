@@ -7,7 +7,20 @@ export const FIXTURE_JOB = {
   attempt: 1,
   input: { original_name: "controlled-mix.wav", duration_sec: 6 },
   warnings: ["受控 UI fixture：不调用模型。"],
-  v2: { source_kind: "instrumental", source_label: "伴奏/纯音乐", selection_revision: 0, selection: null },
+  v2: {
+    source_kind: "instrumental",
+    source_label: "伴奏/纯音乐",
+    analysis: {
+      bpm: 96,
+      key: "Dm",
+      time_signature: "4/4",
+      candidates: { bpm: [96, 48, 192], key: ["Dm", "F"], time_signature: ["4/4", "2/4", "3/4", "6/8"] },
+      warnings: ["自动拍号识别尚未启用，暂按 4/4；生成后请确认"],
+      sources: { bpm: "fixture", key: "fixture", time_signature: "fallback" },
+    },
+    selection_revision: 0,
+    selection: null,
+  },
 } as const;
 
 export const FIXTURE_TRACKS = [

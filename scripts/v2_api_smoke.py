@@ -44,6 +44,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", type=Path, default=ROOT / "artifacts" / "review" / "scale_reference.wav")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts" / "review" / "stageC-api" / "smoke.json")
+    parser.add_argument("--source-kind", choices=("instrumental", "vocal"), default="instrumental")
     args = parser.parse_args()
     if not args.audio.is_file():
         raise SystemExit(f"audio fixture not found: {args.audio}")
@@ -54,12 +55,43 @@ def main() -> int:
         with args.audio.open("rb") as handle:
             response = client.post(
                 "/api/v2/jobs",
-                data={"source_kind": "instrumental", "title": "V2 API fixture"},
+                data={"source_kind": args.source_kind, "title": f"V2 {args.source_kind} API fixture"},
                 files={"file": (args.audio.name, handle, "audio/wav")},
             )
         response.raise_for_status()
         uploaded = response.json()
         job_id = str(uploaded["id"])
+        if args.source_kind == "vocal":
+            completed = _wait(client, job_id, {"completed"})
+            artifacts = client.get(f"/api/v2/jobs/{job_id}/artifacts")
+            artifacts.raise_for_status()
+            items = artifacts.json()["artifacts"]
+            artifact_ids = [str(item["artifact_id"]) for item in items]
+            downloads: dict[str, int] = {}
+            for item in items:
+                if item["kind"] not in {"score_svg", "midi"}:
+                    continue
+                artifact_id = str(item["artifact_id"])
+                download = client.get(f"/api/v2/jobs/{job_id}/artifacts/{artifact_id}")
+                download.raise_for_status()
+                downloads[artifact_id] = len(download.content)
+            if not any(item["kind"] == "score_svg" for item in items) or not any(item["kind"] == "midi" for item in items):
+                raise RuntimeError("V2 vocal API smoke found no score SVG and MIDI")
+            evidence = {
+                "status": "passed",
+                "route": {"source_kind": "vocal", "engine": "game", "use_demucs": False},
+                "job_id": job_id,
+                "phase": completed["phase"],
+                "artifact_count": len(items),
+                "artifact_ids": artifact_ids,
+                "download_bytes": downloads,
+                "input_duration_sec": uploaded["input"]["duration_sec"],
+                "tracks_selection_stage": False,
+            }
+            args.output.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps(evidence, ensure_ascii=False, indent=2))
+            return 0
+
         ready = _wait(client, job_id, {"selection_ready"})
         tracks = client.get(f"/api/v2/jobs/{job_id}/tracks")
         tracks.raise_for_status()

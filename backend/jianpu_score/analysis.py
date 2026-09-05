@@ -155,9 +155,9 @@ def load_audio(path: str | Path, sample_rate: int = 22050) -> tuple[np.ndarray, 
     return np.asarray(samples, dtype=np.float32), int(actual_rate)
 
 
-def _estimate_key(samples: np.ndarray, sample_rate: int) -> str:
+def _estimate_key_candidates(samples: np.ndarray, sample_rate: int) -> list[str]:
     if samples.size < sample_rate // 4:
-        return "C"
+        return ["C"]
     chroma = librosa.feature.chroma_cqt(y=samples, sr=sample_rate)
     profile = np.mean(chroma, axis=1)
     profile = profile / (np.linalg.norm(profile) + 1e-9)
@@ -166,7 +166,11 @@ def _estimate_key(samples: np.ndarray, sample_rate: int) -> str:
         rotated = np.roll(profile, -root)
         scores.append((float(np.dot(rotated, MAJOR_PROFILE / np.linalg.norm(MAJOR_PROFILE))), KEY_NAMES[root]))
         scores.append((float(np.dot(rotated, MINOR_PROFILE / np.linalg.norm(MINOR_PROFILE))), f"{KEY_NAMES[root]}m"))
-    return max(scores, key=lambda item: item[0])[1]
+    return [key for _score, key in sorted(scores, reverse=True)[:4]]
+
+
+def _estimate_key(samples: np.ndarray, sample_rate: int) -> str:
+    return _estimate_key_candidates(samples, sample_rate)[0]
 
 
 def _regular_beat_grid(duration_sec: float, bpm: float) -> list[float]:
@@ -199,6 +203,15 @@ def _estimate_beats(samples: np.ndarray, sample_rate: int, bpm_override: float |
     return bpm, beat_times, warnings, beat_source
 
 
+def _bpm_candidates(bpm: float, source: str) -> list[float]:
+    """Return the measured tempo plus useful half/double-time alternatives."""
+
+    values = [float(bpm)]
+    if source not in {"manual_bpm", "fallback_bpm"}:
+        values.extend((float(bpm) / 2.0, float(bpm) * 2.0))
+    return list(dict.fromkeys(round(value, 2) for value in values if 30.0 <= value <= 300.0))
+
+
 def analyze_audio(
     path: str | Path,
     *,
@@ -212,7 +225,12 @@ def analyze_audio(
     probe = probe_audio(path)
     samples, actual_rate = load_audio(path, sample_rate=sample_rate)
     bpm, beat_times, warnings, beat_source = _estimate_beats(samples, actual_rate, bpm_override)
-    key = normalize_key(key_override) if key_override is not None else normalize_key(_estimate_key(samples, actual_rate))
+    if key_override is not None:
+        key = normalize_key(key_override)
+        key_candidates = [key]
+    else:
+        key_candidates = _estimate_key_candidates(samples, actual_rate)
+        key = normalize_key(key_candidates[0])
     if time_signature_override is not None:
         time_signature = normalize_time_signature(time_signature_override)
         time_signature_source = "manual"
@@ -234,6 +252,8 @@ def analyze_audio(
             "ffprobe": os.fspath(resolve_ffprobe()) if resolve_ffprobe() else None,
             "probe": probe,
             "beat_source": beat_source,
+            "bpm_candidates": _bpm_candidates(bpm, beat_source),
+            "key_candidates": key_candidates,
             "time_signature_source": time_signature_source,
             "time_signature_candidates": list(TIME_SIGNATURE_CANDIDATES),
         },

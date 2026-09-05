@@ -12,6 +12,7 @@ import re
 import uuid
 from typing import Any, Mapping, Sequence
 
+from .jianpu_score.analysis import analyze_audio
 from .jianpu_score.domain import MusicAnalysis, NoteEvent, normalize_key, normalize_time_signature
 from .jianpu_score.pipeline import run_pipeline
 from .jianpu_score.quantize import NoNotesError, quantize_events
@@ -27,6 +28,28 @@ ROOT = Path(__file__).resolve().parents[1]
 MODEL_PYTHON = ROOT / ".venv-model-muscriptor" / "Scripts" / "python.exe"
 V2_SOURCE_KINDS = frozenset({"instrumental", "vocal"})
 V2_SOURCE_LABELS = {"instrumental": "伴奏/纯音乐", "vocal": "人声"}
+
+
+def _analysis_suggestion(analysis: MusicAnalysis) -> dict[str, Any]:
+    """Expose MusicAnalysis values and ranked candidates to the V2 client."""
+
+    metadata = dict(analysis.metadata)
+    return {
+        "bpm": float(analysis.bpm),
+        "key": analysis.key,
+        "time_signature": analysis.time_signature,
+        "candidates": {
+            "bpm": list(metadata.get("bpm_candidates") or [float(analysis.bpm)]),
+            "key": list(metadata.get("key_candidates") or [analysis.key]),
+            "time_signature": list(metadata.get("time_signature_candidates") or [analysis.time_signature]),
+        },
+        "warnings": list(analysis.warnings),
+        "sources": {
+            "bpm": metadata.get("beat_source"),
+            "key": "librosa_chroma" if metadata.get("key_candidates") else "analysis",
+            "time_signature": metadata.get("time_signature_source"),
+        },
+    }
 
 
 def _utc_now() -> str:
@@ -100,6 +123,7 @@ class V2JobService:
                 "route": {"engine": engine, "use_demucs": False},
                 "tracks": [],
                 "notes": [],
+                "analysis": None,
                 "selection_revision": 0,
                 "selection": None,
                 "selection_history": [],
@@ -147,11 +171,12 @@ class V2JobService:
             unknown = sorted(set(requested) - known)
             if unknown:
                 raise ValueError("selected_track_ids 未识别：" + ", ".join(unknown))
-            bpm = 120.0 if bpm_override is None else float(bpm_override)
+            analysis = dict(state.get("v2", {}).get("analysis") or {})
+            bpm = float(analysis.get("bpm", 120.0)) if bpm_override is None else float(bpm_override)
             if not math.isfinite(bpm) or bpm <= 0 or bpm > 400:
                 raise ValueError("bpm_override 必须在 0 到 400 之间")
-            key = normalize_key(key_override or "C")
-            time_signature = normalize_time_signature(time_signature_override or "4/4")
+            key = normalize_key(key_override or str(analysis.get("key") or "C"))
+            time_signature = normalize_time_signature(time_signature_override or str(analysis.get("time_signature") or "4/4"))
             revision = int(state.get("v2", {}).get("selection_revision", 0)) + 1
             selection = {
                 "revision": revision,
@@ -201,6 +226,7 @@ class V2JobService:
             },
             "count": len(v2.get("tracks", [])),
             "tracks": deepcopy(v2.get("tracks", [])),
+            "analysis": deepcopy(v2.get("analysis")),
             "selection_revision": v2.get("selection_revision", 0),
             "selection": deepcopy(v2.get("selection")),
             "score_refusal": deepcopy(v2.get("score_refusal")),
@@ -260,6 +286,10 @@ class V2JobService:
         notes = list(recognition.get("notes", []))
         if not tracks and not notes:
             raise NoNotesError("NoNotes: MuScriptor returned no note events")
+        _samples, analysis = analyze_audio(self.manager.input_path(job_id))
+        analysis_suggestion = _analysis_suggestion(analysis)
+        analysis_path = output / "analysis-suggestion.json"
+        _safe_json(analysis_path, analysis_suggestion)
         job_dir = self.manager._safe_job_dir(job_id)
         artifacts = [
             self.manager._register(
@@ -284,6 +314,14 @@ class V2JobService:
                 artifact_id="v2-recognition-json",
                 kind="recognition_json",
                 label="乐器识别数据",
+                media_type="application/json",
+            ),
+            self.manager._register(
+                job_dir,
+                analysis_path,
+                artifact_id="v2-analysis-suggestion",
+                kind="analysis_json",
+                label="原音分析建议",
                 media_type="application/json",
             ),
         ]
@@ -313,6 +351,7 @@ class V2JobService:
                         "device": recognition.get("device"),
                         "metadata": recognition.get("metadata", {}),
                     },
+                    "analysis": analysis_suggestion,
                     "progress_detail": recognition.get("progress", {}),
                     "score_refusal": None,
                 }
@@ -336,6 +375,7 @@ class V2JobService:
                         "note_count": len(notes),
                         "track_count": len(tracks),
                         "instrument_counts": recognition.get("instrument_counts", {}),
+                        "analysis": analysis_suggestion,
                         "selection_ready": True,
                     },
                     "updated_at": _utc_now(),
@@ -406,6 +446,7 @@ class V2JobService:
                     "v2": {
                         **state.get("v2", {}),
                         "stage": "vocal_complete",
+                        "analysis": _analysis_suggestion(analysis),
                         "progress_detail": {"status": "completed"},
                     },
                     "updated_at": _utc_now(),

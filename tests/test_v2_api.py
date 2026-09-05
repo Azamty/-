@@ -10,7 +10,14 @@ from backend.job_manager import JobManager
 from backend.muscriptor_v2 import stable_track_id
 
 
-def _instrumental_state(manager: JobManager, job_id: str, notes: list[dict[str, object]], tracks: list[dict[str, object]]) -> None:
+def _instrumental_state(
+    manager: JobManager,
+    job_id: str,
+    notes: list[dict[str, object]],
+    tracks: list[dict[str, object]],
+    *,
+    analysis: dict[str, object] | None = None,
+) -> None:
     manager._update(
         job_id,
         status="selection_ready",
@@ -22,6 +29,7 @@ def _instrumental_state(manager: JobManager, job_id: str, notes: list[dict[str, 
             "route": {"engine": "muscriptor", "use_demucs": False},
             "tracks": tracks,
             "notes": notes,
+            "analysis": analysis,
             "selection_revision": 0,
             "selection": None,
             "selection_history": [],
@@ -77,6 +85,36 @@ def test_v2_selection_is_a_persistent_revision_snapshot(tmp_path: Path) -> None:
     assert persisted["v2"]["selection"]["bpm_override"] == 96
     assert persisted["v2"]["selection"]["key_override"] == "Am"
     assert persisted["v2"]["selection"]["time_signature_override"] == "6/8"
+
+
+def test_v2_selection_uses_music_analysis_suggestion_when_unmodified(tmp_path: Path) -> None:
+    manager = JobManager(tmp_path / "jobs")
+    job_id, input_path = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture")
+    input_path.write_bytes(b"fixture")
+    guitar_id = stable_track_id("acoustic_guitar", 24, False)
+    tracks = [{
+        "track_id": guitar_id,
+        "instrument_group": "acoustic_guitar",
+        "program": 24,
+        "is_drum": False,
+        "label_zh": "原声吉他",
+        "preview_available": True,
+    }]
+    notes = [{"instrument_group": "acoustic_guitar", "program": 24, "is_drum": False, "pitch": 60, "start_sec": 0.13, "end_sec": 0.61, "velocity": None}]
+    _instrumental_state(
+        manager,
+        job_id,
+        notes,
+        tracks,
+        analysis={"bpm": 96, "key": "Am", "time_signature": "6/8"},
+    )
+
+    manager.select_v2(job_id, [guitar_id])
+
+    selection = manager._read(job_id)["v2"]["selection"]
+    assert selection["bpm_override"] == 96
+    assert selection["key_override"] == "Am"
+    assert selection["time_signature_override"] == "6/8"
 
 
 def test_v2_drum_only_export_keeps_midi_and_refuses_jianpu(tmp_path: Path) -> None:

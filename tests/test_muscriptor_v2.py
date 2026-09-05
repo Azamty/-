@@ -5,6 +5,8 @@ from backend.muscriptor_v2 import (
     partition_notes,
     route_for_source,
 )
+from backend.jianpu_score.domain import MusicAnalysis
+from backend.v2_job_manager import _analysis_suggestion
 
 
 def test_v2_routes_without_demucs() -> None:
@@ -39,3 +41,28 @@ def test_selection_is_post_decode_and_drums_are_not_score_stems() -> None:
     assert tuple(partitions) == ("violin", DRUMS)
     assert [note.pitch for note in partitions["violin"]] == [67]
     assert [note.pitch for note in partitions[DRUMS]] == [36]
+
+
+def test_music_analysis_suggestion_keeps_candidates_and_warnings() -> None:
+    analysis = MusicAnalysis(
+        sample_rate=22050,
+        duration_sec=2.0,
+        bpm=96,
+        key="Am",
+        time_signature="4/4",
+        warnings=["自动拍号识别尚未启用，暂按 4/4；生成后请确认"],
+        metadata={
+            "beat_source": "librosa",
+            "key_candidates": ["Am", "C"],
+            "bpm_candidates": [96.0, 48.0, 192.0],
+            "time_signature_source": "fallback",
+            "time_signature_candidates": ["2/4", "3/4", "4/4", "6/8"],
+        },
+    )
+
+    suggestion = _analysis_suggestion(analysis)
+    assert suggestion["bpm"] == 96.0
+    assert suggestion["candidates"]["key"] == ["Am", "C"]
+    assert suggestion["candidates"]["time_signature"] == ["2/4", "3/4", "4/4", "6/8"]
+    assert suggestion["warnings"]
+    assert suggestion["sources"]["time_signature"] == "fallback"
