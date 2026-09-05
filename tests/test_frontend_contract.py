@@ -56,3 +56,25 @@ def test_remote_synth_contract_reports_secure_context_and_download_progress() ->
     assert "高质量音色已缓存" in source
     assert "浏览器未能保存缓存，下次可能重新下载" in source
     assert "不会写入缓存" in source
+
+
+def test_synth_pause_contract_destroys_worklet_queue_and_resumes_from_offset() -> None:
+    source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+
+    # stopAll() alone leaves SpessaSynth's future event queue alive. The
+    # browser contract must destroy that instance, preserve an offset, and
+    # reject stale animation/timer callbacks before rebuilding on resume.
+    assert "const [synthPaused, setSynthPaused]" in source
+    assert "const synthPositionRef = useRef(0)" in source
+    assert "const synthSessionRef = useRef(0)" in source
+    assert "try { synth.disconnect(); }" in source
+    assert "try { synth.destroy(); }" in source
+    assert "soundfontAbortRef.current?.abort()" in source
+    assert '"synth_cancelled"' in source
+    assert "const pauseSynth = useCallback" in source
+    assert 'haltSynth("pause", elapsed)' in source
+    assert "synthSessionRef.current !== session" in source
+    assert "const startOffset = synthPaused" in source
+    assert "if (note.end_sec <= startOffset) return" in source
+    assert 'synthPaused ? "播放"' in source
+    assert "synthPlaying || synthPaused ? synthTime : originalTime" in source
