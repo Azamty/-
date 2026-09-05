@@ -1,8 +1,9 @@
-"""Exercise the real V2 API with the short checked-in audio fixture.
+"""Exercise the real V2 API with a short local fixture.
 
-This smoke intentionally uses the isolated MuScriptor medium CUDA worker.  It
-records only routing, phases and artifact ids; no credentials or environment
-variables are written to the evidence file.
+Instrumental mode uses the isolated MuScriptor medium worker. Vocal mode
+verifies the staged Demucs ``vocal_ready`` handoff, safe stem download and the
+explicit GAME generation request. The evidence records no credentials or
+environment variables.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.app import create_app
+from backend.jianpu_score.analysis import probe_audio
 
 
 def _wait(client: TestClient, job_id: str, expected: set[str], timeout: float = 300.0) -> dict[str, object]:
@@ -62,6 +64,24 @@ def main() -> int:
         uploaded = response.json()
         job_id = str(uploaded["id"])
         if args.source_kind == "vocal":
+            vocal_ready = _wait(client, job_id, {"vocal_ready"})
+            ready_artifacts_response = client.get(f"/api/v2/jobs/{job_id}/artifacts")
+            ready_artifacts_response.raise_for_status()
+            ready_items = ready_artifacts_response.json()["artifacts"]
+            vocal_item = next((item for item in ready_items if item["artifact_id"] == "v2-vocals-audio"), None)
+            if vocal_item is None:
+                raise RuntimeError("V2 vocal API smoke found no persisted vocals artifact")
+            vocal_download = client.get(f"/api/v2/jobs/{job_id}/artifacts/v2-vocals-audio")
+            vocal_download.raise_for_status()
+            stem_path = Path(jobs_root) / "downloaded-vocals.wav"
+            stem_path.write_bytes(vocal_download.content)
+            try:
+                vocal_probe = probe_audio(stem_path, enforce_upload_size=False)
+            finally:
+                stem_path.unlink(missing_ok=True)
+            generate = client.post(f"/api/v2/jobs/{job_id}/vocal/generate")
+            generate.raise_for_status()
+            queued = generate.json()
             completed = _wait(client, job_id, {"completed"})
             artifacts = client.get(f"/api/v2/jobs/{job_id}/artifacts")
             artifacts.raise_for_status()
@@ -69,19 +89,24 @@ def main() -> int:
             artifact_ids = [str(item["artifact_id"]) for item in items]
             downloads: dict[str, int] = {}
             for item in items:
-                if item["kind"] not in {"score_svg", "midi"}:
+                if item["kind"] not in {"score_svg", "score_svg_long", "midi"}:
                     continue
                 artifact_id = str(item["artifact_id"])
                 download = client.get(f"/api/v2/jobs/{job_id}/artifacts/{artifact_id}")
                 download.raise_for_status()
                 downloads[artifact_id] = len(download.content)
-            if not any(item["kind"] == "score_svg" for item in items) or not any(item["kind"] == "midi" for item in items):
+            if not any(item["kind"] == "score_svg" for item in items) or not any(item["kind"] == "score_svg_long" for item in items) or not any(item["kind"] == "midi" for item in items):
                 raise RuntimeError("V2 vocal API smoke found no score SVG and MIDI")
             evidence = {
                 "status": "passed",
-                "route": {"source_kind": "vocal", "engine": "game", "use_demucs": False},
+                "route": {"source_kind": "vocal", "engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
                 "job_id": job_id,
-                "phase": completed["phase"],
+                "phases": {"vocal_ready": vocal_ready["phase"], "generate_queued": queued["phase"], "completed": completed["phase"]},
+                "vocal_audio_duration_sec": float(vocal_probe["duration_sec"]),
+                "vocal_audio_bytes": len(vocal_download.content),
+                "vocal_artifact": {"artifact_id": vocal_item["artifact_id"], "kind": vocal_item["kind"], "relative_path": vocal_item["relative_path"]},
+                "summary": completed.get("summary"),
+                "generation": (completed.get("v2") or {}).get("generation"),
                 "artifact_count": len(items),
                 "artifact_ids": artifact_ids,
                 "download_bytes": downloads,

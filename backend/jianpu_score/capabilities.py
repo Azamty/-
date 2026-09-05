@@ -365,7 +365,12 @@ def _compute_capabilities() -> dict[str, Any]:
                 "license": muscriptor_details["license"],
                 "use_demucs": False,
             },
-            "vocal": {"engine": "game", "use_demucs": False},
+            "vocal": {
+                "engine": "game",
+                "use_demucs": True,
+                "separation_engine": "demucs",
+                "separation_model": "htdemucs",
+            },
         },
     }
 

@@ -22,6 +22,7 @@ from .jianpu_score.models.adapter import EngineUnavailableError
 from .jianpu_score.pipeline import run_pipeline
 from .jianpu_score.quantize import NoNotesError
 from .jianpu_score.render import RenderArtifacts, render_score
+from .jianpu_score.svg_long import merge_svg_pages
 from .v2_job_manager import V2JobService
 
 
@@ -29,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS_ROOT = ROOT / "artifacts" / "jobs"
 JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 CLEANUP_INTERVAL_SECONDS = 180.0
-TERMINAL_STATUSES = frozenset({"completed", "selection_ready", "failed", "interrupted"})
+TERMINAL_STATUSES = frozenset({"completed", "selection_ready", "vocal_ready", "failed", "interrupted"})
 PHASE_LABELS = {
     "uploading": "上传中",
     "queued": "排队中",
@@ -41,6 +42,7 @@ PHASE_LABELS = {
     "packaging": "整理下载文件",
     "completed": "已完成",
     "selection_ready": "识别完成，等待选择",
+    "vocal_ready": "人声已分离，等待试听",
     "exporting": "导出选择结果",
     "failed": "处理失败",
     "interrupted": "服务重启，中断待重试",
@@ -50,6 +52,7 @@ PHASE_ORDER = (
     "queued",
     "probing",
     "separating",
+    "vocal_ready",
     "recognizing",
     "quantizing",
     "rendering",
@@ -398,6 +401,9 @@ class JobManager:
     def v2_tracks(self, job_id: str) -> dict[str, Any]:
         return self.v2.tracks(job_id)
 
+    def generate_vocal_v2(self, job_id: str) -> dict[str, Any]:
+        return self.v2.generate_vocal(job_id)
+
     def input_path(self, job_id: str) -> Path:
         state = self._read(job_id)
         stored_name = str(state.get("input", {}).get("stored_name", ""))
@@ -455,7 +461,8 @@ class JobManager:
             if output.exists():
                 if output.resolve().parent != directory:
                     raise ValueError("invalid job output path")
-                if state.get("kind") == "v2" and state.get("v2", {}).get("stage") == "export":
+                v2_state = state.get("v2", {}) if state.get("kind") == "v2" else {}
+                if state.get("kind") == "v2" and v2_state.get("stage") == "export":
                     selections = output / "selections"
                     if selections.is_symlink() or (selections.exists() and selections.resolve().parent != output):
                         raise ValueError("invalid V2 selection output path")
@@ -465,6 +472,25 @@ class JobManager:
                         item for item in state.get("artifacts", [])
                         if not str(item.get("artifact_id", "")).startswith("v2-selection-")
                     ]
+                    retained_artifacts = list(state["artifacts"])
+                elif state.get("kind") == "v2" and v2_state.get("source_kind") == "vocal" and v2_state.get("stage") == "vocal_generate":
+                    # GAME retries reuse the durable Demucs vocals stem.  Keep
+                    # only source, stem and original-analysis artifacts and
+                    # remove stale score files from the failed attempt.
+                    preparation = output / "vocal-prep"
+                    if preparation.is_symlink() or (preparation.exists() and preparation.resolve().parent != output):
+                        raise ValueError("invalid V2 vocal preparation path")
+                    for child in list(output.iterdir()):
+                        if child == preparation:
+                            continue
+                        if child.is_symlink() or (child.is_dir() and child.resolve().parent != output):
+                            raise ValueError("invalid V2 vocal generation output path")
+                        if child.is_dir():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink(missing_ok=True)
+                    retained_ids = {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis"}
+                    state["artifacts"] = [item for item in state.get("artifacts", []) if str(item.get("artifact_id")) in retained_ids]
                     retained_artifacts = list(state["artifacts"])
                 else:
                     shutil.rmtree(output)
@@ -504,7 +530,7 @@ class JobManager:
         public["score_available"] = public.get("status") == "completed" and not bool(
             (public.get("v2") or {}).get("score_refusal")
         )
-        public["artifacts_available"] = public.get("status") in {"selection_ready", "completed"} and bool(public.get("artifacts"))
+        public["artifacts_available"] = public.get("status") in {"selection_ready", "vocal_ready", "completed"} and bool(public.get("artifacts"))
         return public
 
     def list_artifacts(self, job_id: str) -> list[dict[str, Any]]:
@@ -567,7 +593,14 @@ class JobManager:
                 now = utc_now()
                 is_v2 = state.get("kind") == "v2"
                 v2_stage = str(state.get("v2", {}).get("stage", "")) if is_v2 else ""
-                initial_phase = "rendering" if is_v2 and v2_stage == "export" else "probing"
+                if is_v2 and v2_stage == "export":
+                    initial_phase = "rendering"
+                elif is_v2 and v2_stage == "vocal_separation":
+                    initial_phase = "separating"
+                elif is_v2 and v2_stage == "vocal_generate":
+                    initial_phase = "recognizing"
+                else:
+                    initial_phase = "probing"
                 state.update({"status": "running", "phase": initial_phase, "started_at": now, "finished_at": None, "error": None})
                 self._write(state)
             self._log(job_id, "worker started")
@@ -682,6 +715,17 @@ class JobManager:
         output = job_dir / "output"
         artifacts: list[dict[str, Any]] = []
         svg_paths: list[Path] = [Path(path).resolve() for path in render_artifacts.svg_paths]
+        long_path = merge_svg_pages(svg_paths, output / "score-long.svg")
+        artifacts.append(
+            self._register(
+                job_dir,
+                long_path,
+                artifact_id="score-svg-long",
+                kind="score_svg_long",
+                label="下载长图 SVG · 总谱",
+                media_type="image/svg+xml",
+            )
+        )
         for index, path in enumerate(svg_paths, start=1):
             artifacts.append(
                 self._register(
@@ -727,6 +771,18 @@ class JobManager:
             stem_dir.mkdir(parents=True, exist_ok=True)
             stem_score = score.model_copy(update={"voices": stem_voices, "source": str(stem_id)})
             stem_artifacts = render_score(stem_score, stem_dir, basename="score")
+            stem_long_path = merge_svg_pages(stem_artifacts.svg_paths, stem_dir / "score-long.svg")
+            artifacts.append(
+                self._register(
+                    job_dir,
+                    stem_long_path,
+                    artifact_id=f"stem-{stem_id}-svg-long",
+                    kind="stem_svg_long",
+                    label=f"下载长图 SVG · {stem_label} 分谱",
+                    media_type="image/svg+xml",
+                    stem_id=str(stem_id),
+                )
+            )
             for index, path_text in enumerate(stem_artifacts.svg_paths, start=1):
                 path = Path(path_text).resolve()
                 stem_svg_paths.append(path)

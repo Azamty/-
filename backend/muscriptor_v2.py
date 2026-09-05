@@ -167,14 +167,14 @@ class TranscriptionPlan:
 def route_for_source(source_kind: str) -> tuple[EngineName, bool]:
     """Return the V2 engine and separation choice for an input source.
 
-    V2 intentionally does not call Demucs.  MuScriptor receives an
-    instrumental mix directly, while GAME handles a vocal source directly.
+    Instrumental mixes go directly to MuScriptor.  Vocal sources first use
+    Demucs to prepare a vocals stem, which GAME receives in a later stage.
     """
 
     if source_kind == "instrumental":
         return "muscriptor", False
     if source_kind == "vocal":
-        return "game", False
+        return "game", True
     raise ValueError("source_kind must be 'instrumental' or 'vocal'")
 
 

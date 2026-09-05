@@ -285,14 +285,17 @@ def create_app(
     async def capabilities() -> dict[str, Any]:
         value = get_capabilities()
         value["api"] = {
-            "statuses": ["uploading", "queued", "probing", "separating", "recognizing", "quantizing", "rendering", "exporting", "packaging", "selection_ready", "completed", "failed", "interrupted"],
+            "statuses": ["uploading", "queued", "probing", "separating", "vocal_ready", "recognizing", "quantizing", "rendering", "exporting", "packaging", "selection_ready", "completed", "failed", "interrupted"],
             "retention_hours": 24,
             "single_worker": True,
             "v2": {
                 "sources": {"instrumental": "伴奏/纯音乐", "vocal": "人声"},
                 "instrumental_engine": "MuScriptor medium CUDA",
                 "vocal_engine": "GAME",
-                "use_demucs": False,
+                "routes": {
+                    "instrumental": {"engine": "muscriptor", "model": "medium", "use_demucs": False},
+                    "vocal": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                },
             },
             "upload_extensions": sorted(SUPPORTED_EXTENSIONS),
             "max_upload_bytes": max_upload_bytes,
@@ -427,6 +430,16 @@ def create_app(
             raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail={"code": "selection_not_ready", "message": str(exc)}) from None
+        return _status_response(manager, job_id)
+
+    @app.post("/api/v2/jobs/{job_id}/vocal/generate", response_model=JobResponse, status_code=202)
+    async def generate_v2_vocal(job_id: str) -> JobResponse:
+        try:
+            manager.generate_vocal_v2(job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"code": "vocal_not_ready", "message": str(exc)}) from None
         return _status_response(manager, job_id)
 
     @app.post("/api/v2/jobs/{job_id}/retry", response_model=JobResponse, status_code=202)

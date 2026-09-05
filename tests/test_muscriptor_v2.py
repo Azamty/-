@@ -9,9 +9,9 @@ from backend.jianpu_score.domain import MusicAnalysis
 from backend.v2_job_manager import _analysis_suggestion
 
 
-def test_v2_routes_without_demucs() -> None:
+def test_v2_routes_demucs_only_for_vocal() -> None:
     assert route_for_source("instrumental") == ("muscriptor", False)
-    assert route_for_source("vocal") == ("game", False)
+    assert route_for_source("vocal") == ("game", True)
 
 
 def test_default_selection_keeps_pitched_stems_and_drum_preview() -> None:

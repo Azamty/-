@@ -56,6 +56,17 @@ def test_effective_options_route_source_choices_to_stems() -> None:
     assert _effective_options(**common, voice_mode="monophonic", source_kind="mixed")["separate"] is False
 
 
+def test_v2_capabilities_report_route_specific_demucs(tmp_path: Path) -> None:
+    app = create_app(jobs_root=tmp_path / "jobs")
+    with TestClient(app) as client:
+        value = client.get("/api/capabilities").json()
+    routes = value["api"]["v2"]["routes"]
+    assert "use_demucs" not in value["api"]["v2"]
+    assert routes["instrumental"]["use_demucs"] is False
+    assert routes["vocal"]["use_demucs"] is True
+    assert routes["vocal"]["separation_model"] == "htdemucs"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [("key", "H", "unsupported key"), ("time_signature", "5/4", "unsupported time signature")],

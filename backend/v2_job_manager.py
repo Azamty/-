@@ -11,12 +11,17 @@ from pathlib import Path
 import re
 import uuid
 from typing import Any, Mapping, Sequence
+import zipfile
 
-from .jianpu_score.analysis import analyze_audio
+import numpy as np
+
+from .jianpu_score.analysis import analyze_audio, load_audio, probe_audio
 from .jianpu_score.domain import MusicAnalysis, NoteEvent, normalize_key, normalize_time_signature
-from .jianpu_score.pipeline import run_pipeline
+from .jianpu_score.models.adapter import EngineResult, run_engine
+from .jianpu_score.models.demucs import separate_htdemucs
 from .jianpu_score.quantize import NoNotesError, quantize_events
 from .jianpu_score.render import render_score, write_score_json
+from .jianpu_score.svg_long import merge_svg_pages
 from .muscriptor_v2 import (
     instrument_label_zh,
     stable_track_id,
@@ -117,10 +122,14 @@ class V2JobService:
             "progress": None,
             "summary": None,
             "v2": {
-                "stage": "recognize",
+                "stage": "recognize" if source_kind == "instrumental" else "vocal_separation",
                 "source_kind": source_kind,
                 "source_label": V2_SOURCE_LABELS[source_kind],
-                "route": {"engine": engine, "use_demucs": False},
+                "route": {
+                    "engine": engine,
+                    "use_demucs": source_kind == "vocal",
+                    **({"separation_engine": "demucs", "separation_model": "htdemucs"} if source_kind == "vocal" else {}),
+                },
                 "tracks": [],
                 "notes": [],
                 "analysis": None,
@@ -142,6 +151,50 @@ class V2JobService:
 
     def is_v2(self, job_id: str) -> bool:
         return self.manager._read(job_id).get("kind") == "v2"
+
+    def generate_vocal(self, job_id: str) -> dict[str, Any]:
+        """Queue GAME for a previously separated vocal stem.
+
+        Separation is deliberately a separate durable state.  A repeated click
+        while the generation is queued/running is idempotent, and a failed GAME
+        attempt can be retried without invoking Demucs again.
+        """
+
+        with self.manager._lock:
+            state = self.manager._read(job_id)
+            if state.get("kind") != "v2" or state.get("v2", {}).get("source_kind") != "vocal":
+                raise ValueError("只有 V2 人声任务可以生成人声简谱")
+            status = str(state.get("status"))
+            stage = str(state.get("v2", {}).get("stage"))
+            if status == "completed" and stage == "vocal_complete":
+                return state
+            if status in {"queued", "running"} and stage == "vocal_generate":
+                return state
+            if status not in {"vocal_ready", "failed", "interrupted"}:
+                raise ValueError("请先等待 Demucs 分离完成并试听人声")
+            if status in {"failed", "interrupted"} and stage != "vocal_generate":
+                raise ValueError("当前任务尚未得到可复用的人声分离结果，请先重试分离")
+            prepared = self._prepared_vocal_path(job_id, state)
+            self._validate_internal_vocal_path(job_id, prepared)
+            v2 = dict(state.get("v2", {}))
+            v2["stage"] = "vocal_generate"
+            v2["progress_detail"] = {"status": "queued", "engine": "game", "input": "v2-vocals-audio"}
+            state.update(
+                {
+                    "v2": v2,
+                    "status": "queued",
+                    "phase": "queued",
+                    "started_at": None,
+                    "finished_at": None,
+                    "updated_at": _utc_now(),
+                    "error": None,
+                    "progress": 0.0,
+                }
+            )
+            self.manager._write(state)
+            self.manager._queue.put(job_id)
+        self.manager._log(job_id, "queued GAME generation from persisted vocals stem")
+        return state
 
     def select(
         self,
@@ -235,13 +288,17 @@ class V2JobService:
     def run(self, job_id: str) -> None:
         state = self.manager._read(job_id)
         v2 = state.get("v2", {})
-        if v2.get("stage") == "recognize":
-            if v2.get("source_kind") == "vocal":
-                self._run_vocal(job_id)
-            else:
-                self._run_instrumental_recognition(job_id)
+        stage = str(v2.get("stage"))
+        if stage == "recognize":
+            self._run_instrumental_recognition(job_id)
             return
-        if v2.get("stage") == "export":
+        if stage == "vocal_separation":
+            self._run_vocal_separation(job_id)
+            return
+        if stage == "vocal_generate":
+            self._run_vocal_generation(job_id)
+            return
+        if stage == "export":
             self._run_instrumental_export(job_id)
             return
         raise ValueError("V2 task stage is invalid")
@@ -384,76 +441,299 @@ class V2JobService:
             self.manager._write(state)
         self.manager._log(job_id, f"MuScriptor selection_ready: {len(tracks)} tracks, {len(notes)} notes")
 
-    def _run_vocal(self, job_id: str) -> None:
-        self.manager._set_phase(job_id, "recognizing")
-        output = self._output_dir(job_id) / "vocal"
-        options = dict(self.manager._read(job_id).get("options", {}))
+    def _safe_internal_path(self, job_id: str, path: Path | str) -> Path:
+        """Resolve a model-produced path while keeping every parent in the job."""
 
-        def progress(phase: str) -> None:
-            # Passing mixed here is deliberate: V2 vocal is routed directly to
-            # GAME and must never trigger the V1 Demucs stem preparation.
-            self.manager._set_phase(job_id, phase)
-
-        analysis, score, render_artifacts = run_pipeline(
-            self.manager.input_path(job_id),
-            output,
-            engine="game",
-            voice_mode="monophonic",
-            source_kind="mixed",
-            separate=False,
-            language="mixed",
-            title=options.get("title"),
-            progress_callback=progress,
-        )
-        self.manager._set_phase(job_id, "packaging")
-        artifacts = self.manager._package_artifacts(job_id, score, analysis, render_artifacts)
         job_dir = self.manager._safe_job_dir(job_id)
-        artifacts.insert(
-            0,
+        raw = Path(path)
+        if not raw.is_absolute():
+            raw = job_dir / raw
+        raw = raw.absolute()
+        current = raw
+        while current != job_dir:
+            if current.is_symlink():
+                raise ValueError("人声分离结果路径包含不安全的符号链接")
+            if current.parent == current:
+                raise ValueError("人声分离结果路径不在任务目录内")
+            current = current.parent
+        resolved = raw.resolve()
+        if resolved == job_dir or job_dir not in resolved.parents or not resolved.is_file():
+            raise ValueError("人声分离结果路径不在任务目录内")
+        return resolved
+
+    def _validate_internal_vocal_path(self, job_id: str, path: Path) -> dict[str, Any]:
+        """Apply the trusted internal-stem guard before GAME or browser serving."""
+
+        safe_path = self._safe_internal_path(job_id, path)
+        probe = probe_audio(safe_path, enforce_upload_size=False)
+        samples, sample_rate = load_audio(safe_path, sample_rate=16000)
+        if samples.size == 0 or not np.isfinite(samples).all():
+            raise ValueError("Demucs 分离后的人声为空或无效，无法进入 GAME，请更换音频。")
+        peak = float(np.max(np.abs(samples)))
+        rms = float(np.sqrt(np.mean(np.square(samples))))
+        if not math.isfinite(peak) or not math.isfinite(rms) or peak <= 1e-6 or rms <= 1e-7:
+            raise ValueError("Demucs 分离后的人声为空或接近静音，无法进入 GAME，请更换音频。")
+        return {
+            "duration_sec": float(probe["duration_sec"]),
+            "bytes": int(probe["bytes"]),
+            "sample_rate": int(sample_rate),
+            "peak": peak,
+            "rms": rms,
+        }
+
+    def _prepared_vocal_path(self, job_id: str, state: Mapping[str, Any] | None = None) -> Path:
+        current = state or self.manager._read(job_id)
+        separation = dict((current.get("v2") or {}).get("separation") or {})
+        relative = separation.get("prepared_vocals_relative")
+        if not relative:
+            artifact = next(
+                (item for item in current.get("artifacts", []) if item.get("artifact_id") == "v2-vocals-audio"),
+                None,
+            )
+            relative = artifact.get("relative_path") if artifact else None
+        if not relative:
+            raise ValueError("当前任务没有可复用的人声分离结果，请先完成 Demucs 分离")
+        return self._safe_internal_path(job_id, Path(str(relative)))
+
+    def _prepared_analysis(self, job_id: str, state: Mapping[str, Any]) -> MusicAnalysis:
+        separation = dict((state.get("v2") or {}).get("separation") or {})
+        relative = separation.get("analysis_relative")
+        if not relative:
+            raise ValueError("人声原音分析结果缺失，请重新分离")
+        path = self._safe_internal_path(job_id, Path(str(relative)))
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return MusicAnalysis.model_validate(value)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("人声原音分析结果无效，请重新分离") from exc
+
+    def _run_vocal_separation(self, job_id: str) -> None:
+        """Prepare and persist only the Demucs vocals stem."""
+
+        self.manager._set_phase(job_id, "separating")
+        output = self._output_dir(job_id) / "vocal-prep"
+        if output.is_symlink() or (output.exists() and output.resolve().parent != self.manager._safe_job_dir(job_id) / "output"):
+            raise ValueError("invalid V2 vocal preparation output path")
+        output.mkdir(parents=True, exist_ok=True)
+        input_path = self.manager.input_path(job_id)
+        _samples, analysis = analyze_audio(input_path)
+        stems = separate_htdemucs(input_path, output / "demucs", process_holder=self.manager)
+        vocal_path = stems.get("vocals") if isinstance(stems, Mapping) else None
+        if vocal_path is None:
+            raise ValueError("Demucs 未生成 vocals 人声结果，请更换音频后重试")
+        vocal_path = self._safe_internal_path(job_id, Path(vocal_path))
+        stats = self._validate_internal_vocal_path(job_id, vocal_path)
+        # Only the requested stem is retained.  This prevents an accompaniment
+        # stem from being accidentally routed into GAME or exposed as an audio
+        # artifact on a later retry.
+        for stem_id, stem_value in (stems.items() if isinstance(stems, Mapping) else []):
+            if stem_id == "vocals":
+                continue
+            try:
+                candidate = self._safe_internal_path(job_id, Path(stem_value))
+            except ValueError:
+                continue
+            candidate.unlink(missing_ok=True)
+        job_dir = self.manager._safe_job_dir(job_id)
+        analysis_path = output / "original-analysis.json"
+        analysis_path.write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
+        analysis_suggestion = _analysis_suggestion(analysis)
+        artifacts = [
             self.manager._register(
                 job_dir,
-                self.manager.input_path(job_id),
+                input_path,
                 artifact_id="v2-source-audio",
                 kind="source_audio",
                 label="原始人声音频",
-                media_type=self._audio_media_type(self.manager.input_path(job_id)),
+                media_type=self._audio_media_type(input_path),
             ),
-        )
-        for artifact in artifacts:
-            if artifact.get("kind") in {"score_svg", "score_json", "jianpu_source", "lilypond_source", "midi"}:
-                artifact["label"] = "人声主旋律" + (f"（{artifact['label']}）" if artifact.get("label") else "")
+            self.manager._register(
+                job_dir,
+                vocal_path,
+                artifact_id="v2-vocals-audio",
+                kind="vocal_audio",
+                label="Demucs 分离人声（试听）",
+                media_type="audio/wav",
+                stem_id="vocals",
+            ),
+            self.manager._register(
+                job_dir,
+                analysis_path,
+                artifact_id="v2-vocal-analysis",
+                kind="analysis_json",
+                label="原音分析建议",
+                media_type="application/json",
+            ),
+        ]
+        separation = {
+            "engine": "demucs",
+            "model": "htdemucs",
+            "source": "vocal",
+            "stem": "vocals",
+            "artifact_id": "v2-vocals-audio",
+            "prepared_vocals_relative": vocal_path.relative_to(job_dir).as_posix(),
+            "analysis_relative": analysis_path.relative_to(job_dir).as_posix(),
+            **stats,
+            "warnings": ["这是模型分离结果，可能含伴奏残留；GAME 只处理 vocals stem。"],
+        }
         with self.manager._lock:
             state = self.manager._read(job_id)
+            v2 = dict(state.get("v2", {}))
+            v2.update(
+                {
+                    "stage": "vocal_ready",
+                    "route": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                    "analysis": analysis_suggestion,
+                    "separation": separation,
+                    "progress_detail": {"status": "vocal_ready", "engine": "demucs", "model": "htdemucs"},
+                }
+            )
             state.update(
                 {
+                    "v2": v2,
+                    "status": "vocal_ready",
+                    "phase": "vocal_ready",
+                    "finished_at": _utc_now(),
+                    "error": None,
+                    "warnings": list(dict.fromkeys([*analysis.warnings, *separation["warnings"]])),
+                    "artifacts": artifacts,
+                    "progress": 1.0,
+                    "summary": {
+                        "source_kind": "vocal",
+                        "route": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                        "stage": "vocal_ready",
+                        "separation": separation,
+                        "analysis": analysis_suggestion,
+                    },
+                    "updated_at": _utc_now(),
+                }
+            )
+            self.manager._write(state)
+        self.manager._log(job_id, f"V2 vocal_ready: Demucs vocals {stats['duration_sec']:.3f}s")
+
+    def _run_vocal_generation(self, job_id: str) -> None:
+        """Run GAME on the persisted vocals stem and render the main melody."""
+
+        state = self.manager._read(job_id)
+        options = dict(state.get("options", {}))
+        vocal_path = self._prepared_vocal_path(job_id, state)
+        analysis = self._prepared_analysis(job_id, state)
+        self.manager._set_phase(job_id, "recognizing")
+        result: EngineResult = run_engine(
+            "game",
+            os.fspath(vocal_path),
+            analysis=analysis,
+            stem_id="vocals",
+            language="mixed",
+            trusted_internal=True,
+        )
+        if not result.events:
+            raise ValueError("GAME 未在人声分离结果中识别到有效音符，请重试或更换音频。")
+        events = [
+            event.model_copy(
+                update={
+                    "stem_id": "vocals",
+                    "metadata": {
+                        **event.metadata,
+                        "stem_id": "vocals",
+                        "engine": result.engine,
+                        **({"model": result.model} if result.model else {}),
+                    },
+                }
+            )
+            for event in result.events
+        ]
+        analysis = analysis.model_copy(
+            update={
+                "note_events": events,
+                "metadata": {
+                    **analysis.metadata,
+                    "engine": "game",
+                    "source_kind": "vocal",
+                    "source_stems": ["vocals"],
+                    "prepared_audio": {"vocals": os.fspath(vocal_path)},
+                    "analysis_reused_from_original": True,
+                    "engine_details": {"vocals": {**result.metadata, "adapter": "game"}},
+                },
+                "warnings": [*analysis.warnings, *result.warnings],
+            }
+        )
+        self.manager._set_phase(job_id, "quantizing")
+        score = quantize_events(events, analysis, mode="monophonic", title=options.get("title") or "人声主旋律")
+        score = score.model_copy(
+            update={
+                "source": "vocals",
+                "metadata": {
+                    **score.metadata,
+                    "source_audio": os.fspath(self.manager.input_path(job_id)),
+                    "prepared_audio": {"vocals": os.fspath(vocal_path)},
+                    "engine": "game",
+                    "analysis_reused_from_original": True,
+                    "velocity_policy": "preserve_none",
+                },
+            }
+        )
+        output = self._output_dir(job_id)
+        (output / "analysis.json").write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
+        write_score_json(score, output / "score.json")
+        self.manager._set_phase(job_id, "rendering")
+        render_artifacts = render_score(score, output, basename="score")
+        self.manager._set_phase(job_id, "packaging")
+        generation_artifacts = self.manager._package_artifacts(job_id, score, analysis, render_artifacts)
+        prior_artifacts = [
+            item for item in state.get("artifacts", [])
+            if str(item.get("artifact_id")) in {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis"}
+        ]
+        artifacts = [*prior_artifacts, *generation_artifacts]
+        for artifact in artifacts:
+            if artifact.get("kind") in {"score_svg", "score_json", "jianpu_source", "lilypond_source", "midi", "stem_svg", "stem_midi"}:
+                artifact["label"] = "人声主旋律" + (f"（{artifact['label']}）" if artifact.get("label") else "")
+        separation = dict((state.get("v2") or {}).get("separation") or {})
+        with self.manager._lock:
+            current = self.manager._read(job_id)
+            current_v2 = dict(current.get("v2", {}))
+            current_v2.update(
+                {
+                    "stage": "vocal_complete",
+                    "route": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                    "analysis": _analysis_suggestion(analysis),
+                    "generation": {
+                        "engine": "game",
+                        "input_artifact_id": "v2-vocals-audio",
+                        "input_relative": vocal_path.relative_to(self.manager._safe_job_dir(job_id)).as_posix(),
+                        "analysis_reused_from_original": True,
+                    },
+                    "separation": separation,
+                    "progress_detail": {"status": "completed", "engine": "game", "stem": "vocals"},
+                }
+            )
+            current.update(
+                {
+                    "v2": current_v2,
                     "status": "completed",
                     "phase": "completed",
                     "finished_at": _utc_now(),
                     "error": None,
                     "artifacts": artifacts,
                     "progress": 1.0,
-                    "warnings": list(dict.fromkeys([*analysis.warnings, *score.warnings])),
+                    "warnings": list(dict.fromkeys([*analysis.warnings, *score.warnings, *separation.get("warnings", [])])),
                     "summary": {
                         "source_kind": "vocal",
-                        "route": {"engine": "game", "use_demucs": False},
+                        "route": {"engine": "game", "use_demucs": True, "separation_engine": "demucs", "separation_model": "htdemucs"},
+                        "stage": "completed",
                         "note_count": len(analysis.note_events),
                         "voice_count": len(score.voices),
                         "total_ticks": score.total_ticks,
                         "bpm": score.bpm,
                         "key": score.key,
                         "time_signature": score.time_signature,
-                    },
-                    "v2": {
-                        **state.get("v2", {}),
-                        "stage": "vocal_complete",
-                        "analysis": _analysis_suggestion(analysis),
-                        "progress_detail": {"status": "completed"},
+                        "generation": current_v2["generation"],
                     },
                     "updated_at": _utc_now(),
                 }
             )
-            self.manager._write(state)
-        self.manager._log(job_id, f"V2 vocal completed: {len(analysis.note_events)} notes, {len(artifacts)} artifacts")
+            self.manager._write(current)
+        self.manager._log(job_id, f"V2 vocal completed from vocals stem: {len(analysis.note_events)} notes, {len(artifacts)} artifacts")
 
     def _run_instrumental_export(self, job_id: str) -> None:
         state = self.manager._read(job_id)
@@ -572,6 +852,31 @@ class V2JobService:
         if merge_requested and selected_pitched:
             warnings.append("主旋律合并为单声部，结果会丢失和声；该产物不称为总谱。")
 
+        page_artifacts = [
+            item for item in artifacts
+            if item.get("kind") in {"instrument_score_svg", "main_melody_svg"}
+        ]
+        selection_zip_id: str | None = None
+        if page_artifacts:
+            selection_zip_id = f"v2-selection-r{revision}-svg-zip"
+            zip_path = output / "selection-pages.zip"
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for item in page_artifacts:
+                    page_path = (job_dir / str(item["relative_path"])).resolve()
+                    if page_path == job_dir or job_dir not in page_path.parents or not page_path.is_file():
+                        raise ValueError("选择版本分页 SVG 路径无效")
+                    archive.write(page_path, arcname=page_path.relative_to(output).as_posix())
+            artifacts.append(
+                self.manager._register(
+                    job_dir,
+                    zip_path,
+                    artifact_id=selection_zip_id,
+                    kind="svg_zip",
+                    label=f"选择版本 {revision} 全部分页 SVG 压缩包",
+                    media_type="application/zip",
+                )
+            )
+
         selection_record = {
             "schema_version": "2.0",
             "revision": revision,
@@ -586,6 +891,7 @@ class V2JobService:
             "score_refusal": score_refusal,
             "score_artifact_ids": score_artifact_ids,
             "midi_artifact_id": f"v2-selection-r{revision}-midi",
+            "svg_zip_artifact_id": selection_zip_id,
             "metadata": {
                 "time_basis": "source_seconds",
                 "velocity_policy": "playback_default",
@@ -714,6 +1020,20 @@ class V2JobService:
         job_dir = self.manager._safe_job_dir(job_id)
         prefix = f"v2-selection-r{self._revision_from_path(output)}-{track_id}"
         artifacts: list[dict[str, Any]] = []
+        long_path = merge_svg_pages(render.svg_paths, track_dir / "score-long.svg")
+        long_kind = "instrument_score_svg_long" if track_id != "main-melody" else "main_melody_svg_long"
+        long_label = f"下载长图 SVG · {label}分谱" if track_id != "main-melody" else "下载长图 SVG · 主旋律（合并）"
+        artifacts.append(
+            self.manager._register(
+                job_dir,
+                long_path,
+                artifact_id=f"{prefix}-svg-long",
+                kind=long_kind,
+                label=long_label,
+                media_type="image/svg+xml",
+                stem_id=track_id,
+            )
+        )
         for index, path_text in enumerate(render.svg_paths, start=1):
             path = Path(path_text).resolve()
             artifacts.append(
