@@ -164,6 +164,60 @@ def _tsumugi_status() -> tuple[bool, str | None, dict[str, Any]]:
     return True, None, details
 
 
+def _muscriptor_status() -> tuple[bool, str | None, dict[str, Any]]:
+    """Probe the isolated MuScriptor runtime without importing it in the API."""
+
+    python = ROOT / ".venv-model-muscriptor" / "Scripts" / "python.exe"
+    details: dict[str, Any] = {
+        "environment": os.fspath(python),
+        "model": "medium",
+        "license": "CC BY-NC 4.0 (non-commercial use)",
+        "cuda": {"available": False, "version": None, "device": None},
+        "use_demucs": False,
+    }
+    runtime_available, runtime_reason = _module_probe(
+        python,
+        ("muscriptor", "torch", "safetensors"),
+        label="MuScriptor",
+    )
+    if not runtime_available:
+        return False, runtime_reason, details
+    probe = (
+        "import json, torch; "
+        "print(json.dumps({'cuda_available':bool(torch.cuda.is_available()),"
+        "'cuda_version':torch.version.cuda,"
+        "'device':torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))"
+    )
+    environment = os.environ.copy()
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment.pop("PYTHONPATH", None)
+    try:
+        result = subprocess.run(
+            [os.fspath(python), "-c", probe],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        if result.returncode:
+            return False, "MuScriptor CUDA probe failed", details
+        import json
+
+        value = json.loads(result.stdout.strip().splitlines()[-1])
+        details["cuda"] = {
+            "available": bool(value.get("cuda_available")),
+            "version": value.get("cuda_version"),
+            "device": value.get("device"),
+        }
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
+        return False, f"MuScriptor CUDA probe failed: {exc}", details
+    return True, None, details
+
+
 def _compute_capabilities() -> dict[str, Any]:
     """Return capabilities without importing heavyweight model packages."""
 
@@ -172,6 +226,7 @@ def _compute_capabilities() -> dict[str, Any]:
     base_python = ROOT / ".venv" / "Scripts" / "python.exe"
     game_available, game_reason, game_details = _game_status()
     tsumugi_available, tsumugi_reason, tsumugi_details = _tsumugi_status()
+    muscriptor_available, muscriptor_reason, muscriptor_details = _muscriptor_status()
     basic_available, basic_reason = _module_probe(
         basic_python,
         ("basic_pitch", "onnxruntime"),
@@ -229,6 +284,15 @@ def _compute_capabilities() -> dict[str, Any]:
             **tsumugi_details,
             "voice_modes": ["monophonic", "polyphonic"],
             "source_kinds": ["vocal", "instrumental", "mixed"],
+        },
+        "muscriptor": {
+            "available": muscriptor_available,
+            "reason": muscriptor_reason,
+            "kind": "instrumental-full-decode",
+            **muscriptor_details,
+            "voice_modes": ["polyphonic"],
+            "source_kinds": ["instrumental"],
+            "selection_stage": "after_full_decode",
         },
         "specialist": {
             "available": game_available and tsumugi_available,
@@ -291,6 +355,17 @@ def _compute_capabilities() -> dict[str, Any]:
                 "available": False,
                 "reason": "optional Windows compatibility is not validated; no silent fallback is reported as chordscope",
             }
+        },
+        "v2": {
+            "source_labels": {"instrumental": "伴奏/纯音乐", "vocal": "人声"},
+            "instrumental": {
+                "engine": "muscriptor",
+                "model": "medium",
+                "cuda": muscriptor_details["cuda"],
+                "license": muscriptor_details["license"],
+                "use_demucs": False,
+            },
+            "vocal": {"engine": "game", "use_demucs": False},
         },
     }
 

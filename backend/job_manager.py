@@ -10,6 +10,7 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import subprocess
 import threading
 import time
 import traceback
@@ -21,13 +22,14 @@ from .jianpu_score.models.adapter import EngineUnavailableError
 from .jianpu_score.pipeline import run_pipeline
 from .jianpu_score.quantize import NoNotesError
 from .jianpu_score.render import RenderArtifacts, render_score
+from .v2_job_manager import V2JobService
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS_ROOT = ROOT / "artifacts" / "jobs"
 JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 CLEANUP_INTERVAL_SECONDS = 180.0
-TERMINAL_STATUSES = frozenset({"completed", "failed", "interrupted"})
+TERMINAL_STATUSES = frozenset({"completed", "selection_ready", "failed", "interrupted"})
 PHASE_LABELS = {
     "uploading": "上传中",
     "queued": "排队中",
@@ -38,10 +40,24 @@ PHASE_LABELS = {
     "rendering": "生成谱面",
     "packaging": "整理下载文件",
     "completed": "已完成",
+    "selection_ready": "识别完成，等待选择",
+    "exporting": "导出选择结果",
     "failed": "处理失败",
     "interrupted": "服务重启，中断待重试",
 }
-PHASE_ORDER = ("uploading", "queued", "probing", "separating", "recognizing", "quantizing", "rendering", "packaging", "completed")
+PHASE_ORDER = (
+    "uploading",
+    "queued",
+    "probing",
+    "separating",
+    "recognizing",
+    "quantizing",
+    "rendering",
+    "exporting",
+    "packaging",
+    "selection_ready",
+    "completed",
+)
 STEM_LABELS = {"vocals": "人声", "bass": "低音", "other": "器乐", "mixed": "原音"}
 
 
@@ -86,7 +102,9 @@ class JobManager:
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._current_job_id: str | None = None
+        self._child_process: subprocess.Popen[bytes] | None = None
         self._pending_after_recovery: list[str] = []
+        self.v2 = V2JobService(self)
         self._recover_running_jobs()
         self._cleanup_safely()
 
@@ -240,9 +258,87 @@ class JobManager:
         if worker is None:
             return
         self._stop.set()
+        child = self._child_process
+        if child is not None and child.poll() is None:
+            self._terminate_child(child)
         self._queue.put(None)
         worker.join(timeout=5)
         self._worker = None
+
+    @staticmethod
+    def _terminate_child(process: subprocess.Popen[Any]) -> None:
+        """Terminate an isolated model process and its descendants."""
+
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+            else:
+                process.terminate()
+        except (OSError, subprocess.SubprocessError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def _run_isolated_child(self, command: list[str], job_id: str, progress_path: Path | None = None) -> int:
+        """Run one model child while allowing ``stop`` to terminate it."""
+
+        directory = self._safe_job_dir(job_id)
+        output = directory / "output"
+        output.mkdir(parents=True, exist_ok=True)
+        log_path = output / "v2-recognition" / "muscriptor-worker.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment.pop("PYTHONPATH", None)
+        handle = log_path.open("ab")
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                env=environment,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+            )
+            self._child_process = process
+            while True:
+                return_code = process.poll()
+                if return_code is not None:
+                    break
+                if progress_path is not None and progress_path.is_file():
+                    try:
+                        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+                        total = int(progress.get("total", 0))
+                        completed = int(progress.get("completed", 0))
+                        ratio = min(1.0, max(0.0, completed / total)) if total > 0 else 0.0
+                        with self._lock:
+                            state = self._read(job_id)
+                            state["progress"] = ratio
+                            state.setdefault("v2", {})["progress_detail"] = progress
+                            state["updated_at"] = utc_now()
+                            self._write(state)
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError):
+                        pass
+                try:
+                    process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    continue
+            return int(return_code)
+        finally:
+            handle.close()
+            if process is not None and process.poll() is None:
+                self._terminate_child(process)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+            self._child_process = None
 
     def create_job(self, *, original_name: str, options: dict[str, Any]) -> tuple[str, Path]:
         job_id = str(uuid.uuid4())
@@ -275,6 +371,17 @@ class JobManager:
         self._write(state)
         self._log(job_id, f"created: {state['input']['original_name']}")
         return job_id, input_path
+
+    def create_v2_job(self, *, original_name: str, source_kind: str, title: str) -> tuple[str, Path]:
+        """Create a V2 task while keeping its queue on this manager's worker."""
+
+        return self.v2.create_job(original_name=original_name, source_kind=source_kind, title=title)
+
+    def select_v2(self, job_id: str, selected_track_ids: list[str], merge_main_melody: bool = False) -> dict[str, Any]:
+        return self.v2.select(job_id, selected_track_ids, merge_main_melody)
+
+    def v2_tracks(self, job_id: str) -> dict[str, Any]:
+        return self.v2.tracks(job_id)
 
     def input_path(self, job_id: str) -> Path:
         state = self._read(job_id)
@@ -327,12 +434,25 @@ class JobManager:
                 raise ValueError("上传未完成且文件不完整，请重新上传")
             directory = self._safe_job_dir(job_id)
             output = directory / "output"
+            retained_artifacts: list[dict[str, Any]] = []
             if output.is_symlink():
                 raise ValueError("invalid job output path")
             if output.exists():
                 if output.resolve().parent != directory:
                     raise ValueError("invalid job output path")
-                shutil.rmtree(output)
+                if state.get("kind") == "v2" and state.get("v2", {}).get("stage") == "export":
+                    selections = output / "selections"
+                    if selections.is_symlink() or (selections.exists() and selections.resolve().parent != output):
+                        raise ValueError("invalid V2 selection output path")
+                    if selections.exists():
+                        shutil.rmtree(selections)
+                    state["artifacts"] = [
+                        item for item in state.get("artifacts", [])
+                        if not str(item.get("artifact_id", "")).startswith("v2-selection-")
+                    ]
+                    retained_artifacts = list(state["artifacts"])
+                else:
+                    shutil.rmtree(output)
             now = utc_now()
             state.update(
                 {
@@ -344,7 +464,7 @@ class JobManager:
                     "attempt": int(state.get("attempt", 1)) + 1,
                     "error": None,
                     "warnings": [],
-                    "artifacts": [],
+                    "artifacts": retained_artifacts,
                 }
             )
             self._write(state)
@@ -363,11 +483,13 @@ class JobManager:
         public["phase_index"] = PHASE_ORDER.index(phase) if phase in PHASE_ORDER else None
         # Internal relative paths never become part of the user-facing API.
         public.pop("internal", None)
-        public["progress"] = None
+        public["progress"] = public.get("progress")
         error = public.get("error") or {}
         public["retryable"] = public.get("status") in {"failed", "interrupted"} and error.get("code") != "upload_interrupted"
-        public["score_available"] = public.get("status") == "completed"
-        public["artifacts_available"] = public.get("status") == "completed" and bool(public.get("artifacts"))
+        public["score_available"] = public.get("status") == "completed" and not bool(
+            (public.get("v2") or {}).get("score_refusal")
+        )
+        public["artifacts_available"] = public.get("status") in {"selection_ready", "completed"} and bool(public.get("artifacts"))
         return public
 
     def list_artifacts(self, job_id: str) -> list[dict[str, Any]]:
@@ -428,9 +550,16 @@ class JobManager:
                 if state.get("status") != "queued":
                     return
                 now = utc_now()
-                state.update({"status": "running", "phase": "probing", "started_at": now, "finished_at": None, "error": None})
+                is_v2 = state.get("kind") == "v2"
+                v2_stage = str(state.get("v2", {}).get("stage", "")) if is_v2 else ""
+                initial_phase = "rendering" if is_v2 and v2_stage == "export" else "probing"
+                state.update({"status": "running", "phase": initial_phase, "started_at": now, "finished_at": None, "error": None})
                 self._write(state)
             self._log(job_id, "worker started")
+
+            if is_v2:
+                self.v2.run(job_id)
+                return
 
             state = self._read(job_id)
             options = dict(state.get("options", {}))
@@ -481,10 +610,17 @@ class JobManager:
             )
             self._log(job_id, f"completed: {len(analysis.note_events)} notes, {len(artifacts)} artifacts")
         except Exception as exc:  # Keep one bad job from stopping the queue.
-            error = _error_payload(exc)
+            if self._stop.is_set():
+                error = {"code": "interrupted", "message": "服务停止时任务被中断，请重启服务后重试。"}
+                failure_phase = "interrupted"
+                failure_status = "interrupted"
+            else:
+                error = _error_payload(exc)
+                failure_phase = "failed"
+                failure_status = "failed"
             self._log(job_id, traceback.format_exc())
             try:
-                self._update(job_id, status="failed", phase="failed", finished_at=utc_now(), error=error)
+                self._update(job_id, status=failure_status, phase=failure_phase, finished_at=utc_now(), error=error)
             except Exception:
                 return
 

@@ -118,4 +118,31 @@ V2 的伴奏路径直接把完整混音交给 MuScriptor，先完成一次全量
   .\artifacts\review\scale_reference.wav --device cuda
 ```
 
-smoke 会记录 CUDA 设备、模型加载和解码耗时、峰值显存、完整乐器清单、鼓事件以及选中乐器的分谱计数，并写出完整识别 MIDI 与 JSON manifest。MuScriptor 权重和 Hugging Face 缓存均留在本机忽略目录。
+smoke 会记录 CUDA 设备、模型加载和解码耗时、峰值显存、完整乐器清单、鼓事件以及选中乐器的分谱计数，并写出完整识别 MIDI 与 `artifacts\review\stageB-muscriptor\smoke.json`。MuScriptor 权重和 Hugging Face 缓存均留在本机忽略目录。
+
+## V2 阶段C（持久两阶段 API）
+
+V2 API 与 V1 共用一个持久单 worker。`POST /api/v2/jobs` 的来源只接受
+`instrumental`（界面名称：伴奏/纯音乐）或 `vocal`（人声）。伴奏由隔离的
+MuScriptor medium CUDA worker 全量识别一次，任务进入 `selection_ready`；
+`GET /api/v2/jobs/{id}/tracks` 返回稳定 `track_id`、中文乐器名、GM program、鼓标记、音符数量和试听可用状态。
+
+选择通过 `POST /api/v2/jobs/{id}/selection` 或
+`POST /api/v2/jobs/{id}/selection/export` 提交 `selected_track_ids`，并可选
+`merge_main_melody`。每个选中的有音高乐器都有独立分谱 artifact；鼓只保留在
+选中 MIDI 和试听中。没有有音高乐器时仍可导出 MIDI，但 API 会记录
+`no_pitched_tracks` 简谱拒绝。合并主旋律是单声部可选产物，会明确标记和声损失，
+不称为总谱。每次选择都会产生递增 revision，旧 artifact 保留并使用不同 ID。
+
+人声路径直接调用 GAME，完成后提供现有人声主旋律 Score/SVG/MIDI；两条 V2
+路径都不调用 Demucs。MuScriptor NoteEvent 的 `velocity` 保持 `null`，MIDI 试听
+才使用 metadata 标记的固定 `playback_default`。`GET /api/capabilities` 的 `v2`
+字段报告 CUDA、medium 模型和 MuScriptor 的非商业许可证限制。
+
+真实短 API 验收可运行：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\v2_api_smoke.py
+```
+
+验收 JSON 默认写入被忽略的 `artifacts\review\stageC-api\smoke.json`。

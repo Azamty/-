@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ApiError(BaseModel):
@@ -48,6 +48,7 @@ class JobResponse(BaseModel):
     warnings: list[str] = []
     artifacts: list[ArtifactItem] = []
     summary: dict[str, Any] | None = None
+    v2: dict[str, Any] | None = None
     retryable: bool = False
     score_available: bool = False
     artifacts_available: bool = False
@@ -56,3 +57,10 @@ class JobResponse(BaseModel):
 class ArtifactsResponse(BaseModel):
     job_id: str
     artifacts: list[ArtifactItem]
+
+
+class V2SelectionRequest(BaseModel):
+    """A durable selection snapshot for one instrumental recognition."""
+
+    selected_track_ids: list[str] = Field(default_factory=list)
+    merge_main_melody: bool = False

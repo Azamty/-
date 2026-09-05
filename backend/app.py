@@ -10,11 +10,11 @@ from pathlib import Path
 import re
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api_models import ArtifactsResponse, JobResponse
+from .api_models import ArtifactsResponse, JobResponse, V2SelectionRequest
 from .job_manager import JobManager, _error_payload, safe_filename
 from .jianpu_score.analysis import MAX_AUDIO_BYTES, SUPPORTED_EXTENSIONS, probe_audio
 from .jianpu_score.capabilities import get_capabilities
@@ -81,7 +81,11 @@ class UploadSizeLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") != "http" or scope.get("method", "").upper() != "POST" or scope.get("path") != "/api/jobs":
+        if (
+            scope.get("type") != "http"
+            or scope.get("method", "").upper() != "POST"
+            or scope.get("path") not in {"/api/jobs", "/api/v2/jobs"}
+        ):
             await self.app(scope, receive, send)
             return
 
@@ -228,13 +232,13 @@ async def _write_upload(
     return total, input_path
 
 
-def _artifact_response(manager: JobManager, job_id: str) -> ArtifactsResponse:
+def _artifact_response(manager: JobManager, job_id: str, *, prefix: str = "/api/jobs") -> ArtifactsResponse:
     try:
         items = manager.list_artifacts(job_id)
     except KeyError:
         raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "任务不存在"}) from None
     for item in items:
-        item["url"] = f"/api/jobs/{job_id}/artifacts/{item['artifact_id']}"
+        item["url"] = f"{prefix}/{job_id}/artifacts/{item['artifact_id']}"
     return ArtifactsResponse.model_validate({"job_id": job_id, "artifacts": items})
 
 
@@ -280,9 +284,15 @@ def create_app(
     async def capabilities() -> dict[str, Any]:
         value = get_capabilities()
         value["api"] = {
-            "statuses": ["uploading", "queued", "probing", "separating", "recognizing", "quantizing", "rendering", "packaging", "completed", "failed", "interrupted"],
+            "statuses": ["uploading", "queued", "probing", "separating", "recognizing", "quantizing", "rendering", "exporting", "packaging", "selection_ready", "completed", "failed", "interrupted"],
             "retention_hours": 24,
             "single_worker": True,
+            "v2": {
+                "sources": {"instrumental": "伴奏/纯音乐", "vocal": "人声"},
+                "instrumental_engine": "MuScriptor medium CUDA",
+                "vocal_engine": "GAME",
+                "use_demucs": False,
+            },
             "upload_extensions": sorted(SUPPORTED_EXTENSIONS),
             "max_upload_bytes": max_upload_bytes,
             "max_duration_sec": 15 * 60,
@@ -337,9 +347,137 @@ def create_app(
         finally:
             await file.close()
 
+    @app.post("/api/v2/jobs", response_model=JobResponse, status_code=202)
+    async def create_v2_job(
+        file: UploadFile = File(...),
+        source_kind: str = Form("instrumental"),
+        title: str | None = Form(None),
+    ) -> JobResponse:
+        suffix = _safe_upload_extension(file.filename)
+        if source_kind not in {"instrumental", "vocal"}:
+            raise _form_error("V2 来源只能是伴奏/纯音乐或人声")
+        original_name = safe_filename(file.filename)
+        clean_title = safe_filename(title) if title and title.strip() else Path(original_name).stem
+        job_id, input_path = manager.create_v2_job(
+            original_name=original_name,
+            source_kind=source_kind,
+            title=clean_title,
+        )
+        try:
+            bytes_count, input_path = await _write_upload(manager, job_id, file, max_bytes=max_upload_bytes)
+            probe = await asyncio.to_thread(probe_audio, input_path)
+            manager.set_input_info(job_id, bytes_count=bytes_count, duration_sec=float(probe["duration_sec"]))
+            manager.enqueue(job_id)
+            return _status_response(manager, job_id)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"code": "upload_rejected", "message": str(exc.detail)}
+            manager.fail_immediate(job_id, {"code": str(detail.get("code", "upload_rejected")), "message": str(detail.get("message", "上传被拒绝"))})
+            raise
+        except Exception as exc:
+            error = _error_payload(exc)
+            manager.fail_immediate(job_id, error)
+            try:
+                input_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            status = 413 if "exceeds" in str(exc).lower() else 422
+            raise HTTPException(status_code=status, detail=error) from exc
+        finally:
+            await file.close()
+
     @app.get("/api/jobs/{job_id}", response_model=JobResponse)
     async def get_job(job_id: str) -> JobResponse:
         return _status_response(manager, job_id)
+
+    @app.get("/api/v2/jobs/{job_id}", response_model=JobResponse)
+    async def get_v2_job(job_id: str) -> JobResponse:
+        try:
+            if not manager.v2.is_v2(job_id):
+                raise KeyError("not a V2 task")
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
+        return _status_response(manager, job_id)
+
+    @app.get("/api/v2/jobs/{job_id}/tracks")
+    async def get_v2_tracks(job_id: str) -> dict[str, Any]:
+        try:
+            value = manager.v2_tracks(job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
+        if value.get("source_kind") != "instrumental":
+            raise HTTPException(status_code=409, detail={"code": "tracks_not_applicable", "message": "人声任务没有乐器选择阶段"})
+        if value.get("status") not in {"selection_ready", "completed"}:
+            raise HTTPException(status_code=409, detail={"code": "tracks_not_ready", "message": "全量乐器识别尚未完成"})
+        return value
+
+    @app.post("/api/v2/jobs/{job_id}/selection", response_model=JobResponse, status_code=202)
+    @app.post("/api/v2/jobs/{job_id}/selection/export", response_model=JobResponse, status_code=202)
+    async def select_v2_tracks(job_id: str, payload: V2SelectionRequest = Body(...)) -> JobResponse:
+        try:
+            manager.select_v2(job_id, payload.selected_track_ids, payload.merge_main_melody)
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"code": "selection_not_ready", "message": str(exc)}) from None
+        return _status_response(manager, job_id)
+
+    @app.post("/api/v2/jobs/{job_id}/retry", response_model=JobResponse, status_code=202)
+    async def retry_v2_job(job_id: str) -> JobResponse:
+        try:
+            manager.retry(job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"code": "not_retryable", "message": str(exc)}) from None
+        return _status_response(manager, job_id)
+
+    @app.get("/api/v2/jobs/{job_id}/score")
+    async def get_v2_score(job_id: str) -> JSONResponse:
+        try:
+            if not manager.v2.is_v2(job_id):
+                raise KeyError("not a V2 task")
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
+        status = _status_response(manager, job_id)
+        if status.status != "completed":
+            raise HTTPException(status_code=409, detail={"code": "score_not_ready", "message": f"任务当前阶段：{status.phase_label}"})
+        artifacts = manager.list_artifacts(job_id)
+        score_artifact = next((item for item in reversed(artifacts) if item.get("artifact_id") == "score-json"), None)
+        if score_artifact is None:
+            score_artifact = next((item for item in reversed(artifacts) if item.get("kind") == "instrument_score_json"), None)
+        if score_artifact is None:
+            refusal = (manager.get(job_id).get("v2") or {}).get("score_refusal")
+            detail = refusal or {"code": "score_not_found", "message": "当前选择没有可下载的简谱"}
+            raise HTTPException(status_code=409, detail=detail)
+        try:
+            path, _artifact = manager.artifact_path(job_id, str(score_artifact["artifact_id"]))
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "score_not_found", "message": "谱面尚未生成"}) from None
+        return JSONResponse(content=json.loads(path.read_text(encoding="utf-8")))
+
+    @app.get("/api/v2/jobs/{job_id}/artifacts")
+    async def list_v2_artifacts(job_id: str) -> ArtifactsResponse:
+        try:
+            if not manager.v2.is_v2(job_id):
+                raise KeyError("not a V2 task")
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
+        return _artifact_response(manager, job_id, prefix="/api/v2/jobs")
+
+    @app.get("/api/v2/jobs/{job_id}/artifacts/{artifact_id}")
+    async def download_v2_artifact(job_id: str, artifact_id: str) -> FileResponse:
+        try:
+            if not manager.v2.is_v2(job_id):
+                raise KeyError("not a V2 task")
+            path, artifact = manager.artifact_path(job_id, artifact_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "artifact_not_found", "message": "产物不存在"}) from None
+        name = safe_filename(str(artifact.get("filename", path.name)), fallback="artifact")
+        return FileResponse(
+            path,
+            media_type=str(artifact.get("media_type", "application/octet-stream")),
+            headers={"Content-Disposition": f'inline; filename="{name}"'},
+        )
 
     @app.post("/api/jobs/{job_id}/retry", response_model=JobResponse, status_code=202)
     async def retry_job(job_id: str) -> JobResponse:
