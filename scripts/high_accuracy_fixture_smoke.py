@@ -102,6 +102,28 @@ def _musicxml_voice_keys(musicxml: Path) -> list[str]:
     return sorted(keys)
 
 
+def _musicxml_tie_count(musicxml: Path) -> int:
+    """Return the number of MusicXML note-level tie elements in the export."""
+
+    return len(ET.parse(musicxml).getroot().findall(".//tie"))
+
+
+def _write_restricted_profile(profile: Path, destination: Path) -> None:
+    """Copy the production profile with a deliberately lower voice limit.
+
+    The comparison must exercise the same MuseScore binary and the same MIDI
+    input.  Changing only this imported profile makes a different result a
+    causal check that ``-M`` was consumed, rather than an assumption based on
+    the XML produced by the default importer.
+    """
+
+    source = profile.read_text(encoding="utf-8")
+    marker = "<VoiceCount>3</VoiceCount>"
+    if source.count(marker) != 1:
+        raise RuntimeError(f"expected one production VoiceCount marker in {profile}")
+    destination.write_text(source.replace(marker, "<VoiceCount>0</VoiceCount>"), encoding="utf-8")
+
+
 def _convert(muse: Path, profile: Path, midi: Path, musicxml: Path, cwd: Path) -> None:
     result = subprocess.run(
         [
@@ -168,6 +190,9 @@ def main() -> int:
                 "MuseScore -M did not retain the short triplet timing: "
                 f"shortest quarterLength={parsed['shortest_quarter_length']}"
             )
+        tie_count = _musicxml_tie_count(musicxml)
+        if expected.get("requires_ties") and tie_count < 1:
+            raise RuntimeError("MuseScore -M did not emit the fixture's expected MusicXML ties")
         voice_keys = _musicxml_voice_keys(musicxml)
         if len(voice_keys) < 2:
             raise RuntimeError(f"MuseScore -M did not preserve multi-voice structure: voice_keys={voice_keys}")
@@ -177,15 +202,33 @@ def main() -> int:
         voice_musicxml = temp_dir / "voice-stress.musicxml"
         _write_fixture_midi(voice_midi, voice_payload, force_single_channel=True)
         _convert(muse, PROFILE, voice_midi, voice_musicxml, temp_dir)
-        voice_keys = _musicxml_voice_keys(voice_musicxml)
-        if len(voice_keys) != int(expected["voice_count"]):
+        formal_voice_keys = _musicxml_voice_keys(voice_musicxml)
+        if len(formal_voice_keys) != int(expected["voice_count"]):
             raise RuntimeError(
                 f"MuseScore VoiceCount=3 did not yield the expected four voices: "
-                f"voice_keys={voice_keys}"
+                f"voice_keys={formal_voice_keys}"
+            )
+
+        restricted_profile = temp_dir / "midi_import_options-restricted.xml"
+        restricted_musicxml = temp_dir / "voice-stress-restricted.musicxml"
+        _write_restricted_profile(PROFILE, restricted_profile)
+        _convert(muse, restricted_profile, voice_midi, restricted_musicxml, temp_dir)
+        restricted_voice_keys = _musicxml_voice_keys(restricted_musicxml)
+        if len(restricted_voice_keys) >= len(formal_voice_keys) or restricted_voice_keys == formal_voice_keys:
+            raise RuntimeError(
+                "MuseScore 4.7.4 -M VoiceCount comparison was not observable: "
+                f"formal={formal_voice_keys}, restricted={restricted_voice_keys}. "
+                "Treat the profile as unreliable and investigate the compatibility importer."
             )
     print(
         json.dumps(
-            {"status": "ok", "fixture": os.fspath(FIXTURE), "musicxml": parsed, "voice_keys": voice_keys},
+            {
+                "status": "ok",
+                "fixture": os.fspath(FIXTURE),
+                "musicxml": {**parsed, "tie_count": tie_count},
+                "voice_keys": formal_voice_keys,
+                "restricted_voice_keys": restricted_voice_keys,
+            },
             ensure_ascii=False,
         )
     )
