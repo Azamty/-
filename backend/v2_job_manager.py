@@ -16,6 +16,7 @@ import zipfile
 import numpy as np
 
 from .jianpu_score.analysis import analyze_audio, load_audio, probe_audio
+from .jianpu_score.beat_grid import beat_grid_onsets_from_notes
 from .jianpu_score.domain import MusicAnalysis, NoteEvent, normalize_key, normalize_time_signature
 from .jianpu_score.models.adapter import EngineResult, run_engine
 from .jianpu_score.models.demucs import (
@@ -44,6 +45,11 @@ def _analysis_suggestion(analysis: MusicAnalysis) -> dict[str, Any]:
     """Expose MusicAnalysis values and ranked candidates to the V2 client."""
 
     metadata = dict(analysis.metadata)
+    beat_grid = metadata.get("beat_grid") if isinstance(metadata.get("beat_grid"), Mapping) else {}
+    tempo_summary = deepcopy(dict(beat_grid.get("tempo") or {})) if isinstance(beat_grid, Mapping) else {}
+    for candidate in tempo_summary.get("candidates", []):
+        if isinstance(candidate, Mapping):
+            candidate.pop("beat_times", None)
     return {
         "bpm": float(analysis.bpm),
         "key": analysis.key,
@@ -54,6 +60,16 @@ def _analysis_suggestion(analysis: MusicAnalysis) -> dict[str, Any]:
             "time_signature": list(metadata.get("time_signature_candidates") or [analysis.time_signature]),
         },
         "warnings": list(analysis.warnings),
+        "beat_grid": {
+            "engine": beat_grid.get("engine", metadata.get("beat_source")),
+            "mode": beat_grid.get("mode", "offline"),
+            "inference": beat_grid.get("inference", "DBN"),
+            "beat_count": len(beat_grid.get("beats", [])) if isinstance(beat_grid, Mapping) else 0,
+            "bar_count": len(beat_grid.get("bars", [])) if isinstance(beat_grid, Mapping) else 0,
+            "time_signature": beat_grid.get("time_signature"),
+            "tempo": tempo_summary,
+            "warnings": list(beat_grid.get("warnings", [])) if isinstance(beat_grid, Mapping) else [],
+        },
         "sources": {
             "bpm": metadata.get("beat_source"),
             "key": "librosa_chroma" if metadata.get("key_candidates") else "analysis",
@@ -399,10 +415,19 @@ class V2JobService:
         notes = list(recognition.get("notes", []))
         if not tracks and not notes:
             raise NoNotesError("NoNotes: MuScriptor returned no note events")
-        _samples, analysis = analyze_audio(self.manager.input_path(job_id))
+        _samples, analysis = analyze_audio(
+            self.manager.input_path(job_id),
+            source_onsets=beat_grid_onsets_from_notes(notes),
+        )
         analysis_suggestion = _analysis_suggestion(analysis)
         analysis_path = output / "analysis-suggestion.json"
         _safe_json(analysis_path, analysis_suggestion)
+        full_analysis_path = output / "analysis.json"
+        full_analysis_path.write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
+        beat_grid = analysis.metadata.get("beat_grid")
+        beat_grid_path = output / "beat_grid.json"
+        if isinstance(beat_grid, Mapping):
+            _safe_json(beat_grid_path, beat_grid)
         job_dir = self.manager._safe_job_dir(job_id)
         artifacts = [
             self.manager._register(
@@ -437,7 +462,26 @@ class V2JobService:
                 label="原音分析建议",
                 media_type="application/json",
             ),
+            self.manager._register(
+                job_dir,
+                full_analysis_path,
+                artifact_id="v2-analysis-full",
+                kind="analysis_full_json",
+                label="BeatNet 完整分析数据",
+                media_type="application/json",
+            ),
         ]
+        if beat_grid_path.is_file():
+            artifacts.append(
+                self.manager._register(
+                    job_dir,
+                    beat_grid_path,
+                    artifact_id="v2-beat-grid",
+                    kind="beat_grid_json",
+                    label="BeatNet 拍点网格",
+                    media_type="application/json",
+                )
+            )
         worker_log = output / "muscriptor-worker.log"
         if worker_log.is_file():
             artifacts.append(
@@ -465,6 +509,8 @@ class V2JobService:
                         "metadata": recognition.get("metadata", {}),
                     },
                     "analysis": analysis_suggestion,
+                    "analysis_relative": full_analysis_path.relative_to(job_dir).as_posix(),
+                    "beat_grid_relative": beat_grid_path.relative_to(job_dir).as_posix() if beat_grid_path.is_file() else None,
                     "progress_detail": recognition.get("progress", {}),
                     "score_refusal": None,
                 }
@@ -563,6 +609,48 @@ class V2JobService:
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError("人声原音分析结果无效，请重新分离") from exc
 
+    def _persisted_instrumental_analysis(self, job_id: str, state: Mapping[str, Any]) -> MusicAnalysis | None:
+        """Load the full BeatNet analysis retained during MuScriptor decode.
+
+        V2 selections are rendered later than recognition.  Reconstructing a
+        new MusicAnalysis from only BPM/key suggestions here used to discard
+        BeatNet's real beat_times and silently returned the old fixed grid.
+        Legacy hand-authored states without the full artifact remain usable,
+        but are explicitly represented as an analysis without a beat map.
+        """
+
+        v2 = state.get("v2") or {}
+        relative = v2.get("analysis_relative")
+        if not relative:
+            artifact = next(
+                (item for item in state.get("artifacts", []) if item.get("artifact_id") == "v2-analysis-full"),
+                None,
+            )
+            relative = artifact.get("relative_path") if artifact else None
+        if relative:
+            path = self._safe_internal_path(job_id, Path(str(relative)))
+            try:
+                return MusicAnalysis.model_validate(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                raise ValueError("MuScriptor 的 BeatNet 完整分析数据无效，请重新识别") from exc
+        suggestion = v2.get("analysis") or {}
+        if not isinstance(suggestion, Mapping) or not suggestion:
+            return None
+        notes = list(v2.get("notes") or [])
+        duration = max((float(note.get("end_sec", 0.0)) for note in notes), default=0.1)
+        try:
+            return MusicAnalysis(
+                sample_rate=22050,
+                duration_sec=max(duration, 0.1),
+                bpm=float(suggestion.get("bpm", 120.0)),
+                key=normalize_key(str(suggestion.get("key", "C"))),
+                time_signature=normalize_time_signature(str(suggestion.get("time_signature", "4/4"))),
+                warnings=list(suggestion.get("warnings") or []),
+                metadata={"beat_source": "legacy_v2_suggestion"},
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("V2 分析建议无效，请重新识别") from exc
+
     def _run_vocal_separation(self, job_id: str) -> None:
         """Prepare and persist only the Demucs vocals stem."""
 
@@ -596,6 +684,10 @@ class V2JobService:
         job_dir = self.manager._safe_job_dir(job_id)
         analysis_path = output / "original-analysis.json"
         analysis_path.write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
+        beat_grid = analysis.metadata.get("beat_grid")
+        beat_grid_path = output / "beat_grid.json"
+        if isinstance(beat_grid, Mapping):
+            _safe_json(beat_grid_path, beat_grid)
         analysis_suggestion = _analysis_suggestion(analysis)
         artifacts = [
             self.manager._register(
@@ -624,6 +716,17 @@ class V2JobService:
                 media_type="application/json",
             ),
         ]
+        if beat_grid_path.is_file():
+            artifacts.append(
+                self.manager._register(
+                    job_dir,
+                    beat_grid_path,
+                    artifact_id="v2-beat-grid",
+                    kind="beat_grid_json",
+                    label="BeatNet 拍点网格",
+                    media_type="application/json",
+                )
+            )
         separation = {
             "engine": "demucs",
             "model": model,
@@ -633,6 +736,7 @@ class V2JobService:
             "artifact_id": "v2-vocals-audio",
             "prepared_vocals_relative": vocal_path.relative_to(job_dir).as_posix(),
             "analysis_relative": analysis_path.relative_to(job_dir).as_posix(),
+            "beat_grid_relative": beat_grid_path.relative_to(job_dir).as_posix() if beat_grid_path.is_file() else None,
             **stats,
             "warnings": ["这是模型分离结果，可能含伴奏残留；GAME 只处理 vocals stem。"],
         }
@@ -743,7 +847,7 @@ class V2JobService:
         generation_artifacts = self.manager._package_artifacts(job_id, score, analysis, render_artifacts)
         prior_artifacts = [
             item for item in state.get("artifacts", [])
-            if str(item.get("artifact_id")) in {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis"}
+            if str(item.get("artifact_id")) in {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis", "v2-beat-grid"}
         ]
         artifacts = [*prior_artifacts, *generation_artifacts]
         for artifact in artifacts:
@@ -809,9 +913,12 @@ class V2JobService:
         selected_set = set(selected_ids)
         track_by_id = {str(track.get("track_id")): track for track in tracks}
         selected_tracks = [track_by_id[track_id] for track_id in selected_ids if track_id in track_by_id]
-        bpm = float(selection.get("bpm_override") or 120.0)
-        key = normalize_key(str(selection.get("key_override") or "C"))
-        time_signature = normalize_time_signature(str(selection.get("time_signature_override") or "4/4"))
+        base_analysis = self._persisted_instrumental_analysis(job_id, state)
+        bpm = float(selection.get("bpm_override") or (base_analysis.bpm if base_analysis else 120.0))
+        key = normalize_key(str(selection.get("key_override") or (base_analysis.key if base_analysis else "C")))
+        time_signature = normalize_time_signature(
+            str(selection.get("time_signature_override") or (base_analysis.time_signature if base_analysis else "4/4"))
+        )
         notes_with_ids: list[dict[str, Any]] = []
         for note in notes:
             track_key = (str(note.get("instrument_group")), int(note.get("program", 0)), bool(note.get("is_drum", False)))
@@ -874,6 +981,7 @@ class V2JobService:
                 bpm=bpm,
                 key=key,
                 time_signature=time_signature,
+                base_analysis=base_analysis,
             )
             score_artifact_ids.extend(item["artifact_id"] for item in rendered)
             artifacts.extend(rendered)
@@ -900,6 +1008,7 @@ class V2JobService:
                 bpm=bpm,
                 key=key,
                 time_signature=time_signature,
+                base_analysis=base_analysis,
             )
             artifacts.extend(merged_artifacts)
             score_artifact_ids.extend(item["artifact_id"] for item in merged_artifacts)
@@ -1023,6 +1132,7 @@ class V2JobService:
         bpm: float = 120.0,
         key: str = "C",
         time_signature: str = "4/4",
+        base_analysis: MusicAnalysis | None = None,
     ) -> list[dict[str, Any]]:
         track_id = str(track.get("track_id"))
         label = label_override or str(track.get("label_zh") or instrument_label_zh(str(track.get("instrument_group"))))
@@ -1047,20 +1157,32 @@ class V2JobService:
             )
             for note in notes
         ]
-        analysis = MusicAnalysis(
-            sample_rate=16000,
-            duration_sec=max(duration, 0.1),
-            bpm=bpm,
-            key=key,
-            time_signature=time_signature,
-            note_events=events,
-            metadata={
-                "engine": "muscriptor",
-                "source_kind": "instrumental",
-                "time_basis": "source_seconds",
-                "velocity_policy": "playback_default",
-            },
-        )
+        if base_analysis is None:
+            analysis = MusicAnalysis(
+                sample_rate=16000,
+                duration_sec=max(duration, 0.1),
+                bpm=bpm,
+                key=key,
+                time_signature=time_signature,
+                note_events=events,
+                metadata={
+                    "engine": "muscriptor",
+                    "source_kind": "instrumental",
+                    "time_basis": "source_seconds",
+                    "velocity_policy": "playback_default",
+                },
+            )
+        else:
+            analysis = base_analysis.model_copy(
+                update={
+                    "duration_sec": max(float(base_analysis.duration_sec), duration, 0.1),
+                    "bpm": bpm,
+                    "key": key,
+                    "time_signature": time_signature,
+                    "note_events": events,
+                    "metadata": self._selection_analysis_metadata(base_analysis, bpm=bpm, time_signature=time_signature),
+                }
+            )
         score_title = f"{title} {label}分谱"
         score = quantize_events(events, analysis, mode="monophonic" if track_id == "main-melody" else "polyphonic", title=score_title)
         score = score.model_copy(
@@ -1129,6 +1251,40 @@ class V2JobService:
                     )
                 )
         return artifacts
+
+    @staticmethod
+    def _selection_analysis_metadata(base_analysis: MusicAnalysis, *, bpm: float, time_signature: str) -> dict[str, Any]:
+        metadata = dict(base_analysis.metadata)
+        beat_grid = metadata.get("beat_grid")
+        if isinstance(beat_grid, Mapping):
+            # Keep the detected beat phase/local shape, but make the selected
+            # BPM authoritative by scaling fractional beat positions.  This is
+            # the durable equivalent of the UI's manual BPM override.
+            updated_grid = deepcopy(dict(beat_grid))
+            tempo = deepcopy(dict(updated_grid.get("tempo") or {}))
+            detected = float(base_analysis.bpm)
+            tempo["selected_bpm"] = float(bpm)
+            tempo["manual_bpm"] = float(bpm)
+            tempo["manual_scale"] = float(bpm) / detected if detected > 0 else 1.0
+            tempo["selection_reason"] = "用户选择 BPM 优先；导出保留 BeatNet 首拍与局部拍点"
+            updated_grid["tempo"] = tempo
+            mapping = deepcopy(dict(updated_grid.get("mapping") or {}))
+            mapping["manual_bpm_scale"] = tempo["manual_scale"]
+            updated_grid["mapping"] = mapping
+            meter = deepcopy(dict(updated_grid.get("time_signature") or {}))
+            meter["selected"] = time_signature
+            meter["source"] = "manual"
+            updated_grid["time_signature"] = meter
+            metadata["beat_grid"] = updated_grid
+        metadata.update(
+            {
+                "manual_bpm_override": True,
+                "manual_time_signature_override": True,
+                "selected_bpm": float(bpm),
+                "selected_time_signature": time_signature,
+            }
+        )
+        return metadata
 
     @staticmethod
     def _revision_from_path(path: Path) -> int:

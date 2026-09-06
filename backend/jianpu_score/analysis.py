@@ -8,11 +8,13 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Mapping, Sequence
 
 import librosa
 import numpy as np
 import soundfile as sf
 
+from .beatnet import analyze_with_beatnet
 from .domain import MusicAnalysis, NoteEvent, normalize_key, normalize_time_signature
 
 
@@ -218,26 +220,38 @@ def analyze_audio(
     bpm_override: float | None = None,
     key_override: str | None = None,
     time_signature_override: str | None = None,
+    source_onsets: Mapping[str, Sequence[float]] | Sequence[float] | None = None,
     sample_rate: int = 22050,
 ) -> tuple[np.ndarray, MusicAnalysis]:
     if sample_rate <= 0:
         raise ValueError("sample_rate must be greater than zero")
     probe = probe_audio(path)
     samples, actual_rate = load_audio(path, sample_rate=sample_rate)
-    bpm, beat_times, warnings, beat_source = _estimate_beats(samples, actual_rate, bpm_override)
+    # The high-accuracy chain always analyzes the original audio through the
+    # isolated BeatNet offline/DBN runtime.  A worker error is intentionally
+    # propagated to the task; falling back to the legacy uniform grid here
+    # would make the resulting Score impossible to audit.
+    beat_grid = analyze_with_beatnet(
+        path,
+        duration_sec=max(len(samples) / actual_rate, 1e-6),
+        bpm_override=bpm_override,
+        time_signature_override=time_signature_override,
+        source_onsets=source_onsets,
+    )
+    bpm = float(beat_grid["tempo"]["selected_bpm"])
+    beat_times = [float(value) for value in beat_grid["mapping"]["beat_times"]]
+    warnings = list(beat_grid.get("warnings", []))
+    beat_source = "beatnet"
     if key_override is not None:
         key = normalize_key(key_override)
         key_candidates = [key]
     else:
         key_candidates = _estimate_key_candidates(samples, actual_rate)
         key = normalize_key(key_candidates[0])
-    if time_signature_override is not None:
-        time_signature = normalize_time_signature(time_signature_override)
-        time_signature_source = "manual"
-    else:
-        time_signature = "4/4"
-        time_signature_source = "fallback"
-        warnings.append("自动拍号识别尚未启用，暂按 4/4；生成后请确认")
+    time_signature = normalize_time_signature(str(beat_grid["time_signature"]["selected"]))
+    time_signature_source = "manual" if time_signature_override is not None else "beatnet_derived"
+    tempo_candidates = [float(item["bpm"]) for item in beat_grid["tempo"]["candidates"]]
+    meter_candidates = [str(item["value"]) for item in beat_grid["time_signature"]["candidates"]]
     analysis = MusicAnalysis(
         sample_rate=actual_rate,
         duration_sec=max(len(samples) / actual_rate, 1e-6),
@@ -252,10 +266,16 @@ def analyze_audio(
             "ffprobe": os.fspath(resolve_ffprobe()) if resolve_ffprobe() else None,
             "probe": probe,
             "beat_source": beat_source,
-            "bpm_candidates": _bpm_candidates(bpm, beat_source),
+            "beatnet_version": beat_grid.get("beatnet", {}).get("version", "1.1.3"),
+            "beatnet_mode": beat_grid.get("mode", "offline"),
+            "beatnet_inference": beat_grid.get("inference", "DBN"),
+            "beat_grid": beat_grid,
+            "bpm_candidates": tempo_candidates,
             "key_candidates": key_candidates,
             "time_signature_source": time_signature_source,
-            "time_signature_candidates": list(TIME_SIGNATURE_CANDIDATES),
+            "time_signature_candidates": meter_candidates,
+            "manual_bpm_override": bpm_override is not None,
+            "manual_time_signature_override": time_signature_override is not None,
         },
     )
     return samples, analysis

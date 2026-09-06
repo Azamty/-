@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 from typing import Callable
 
@@ -290,6 +291,12 @@ def run_pipeline(
     # engine output and score available for diagnosis or a renderer-only
     # retry; the renderer is not allowed to be the first durable write.
     (destination / "analysis.json").write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
+    beat_grid = analysis.metadata.get("beat_grid")
+    if isinstance(beat_grid, dict):
+        (destination / "beat_grid.json").write_text(
+            json.dumps(beat_grid, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     write_score_json(score, destination / "score.json")
     report("rendering")
     artifacts = render_score(score, destination, basename="score")

@@ -117,6 +117,7 @@ class _BeatMapper:
     beat_times: tuple[float, ...]
     fixed: bool
     shift_beats: float = 0.0
+    beat_scale: float = 1.0
 
     def seconds_to_beat(self, seconds: float) -> float:
         if self.fixed or len(self.beat_times) < 2:
@@ -132,20 +133,27 @@ class _BeatMapper:
             left = right - 1
             fraction = (seconds - self.beat_times[left]) / (self.beat_times[right] - self.beat_times[left])
             position = left + fraction
-        return position + self.shift_beats
+        return position * self.beat_scale + self.shift_beats
 
 
 def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _BeatMapper:
     beat_times = tuple(analysis.beat_times)
-    fixed = analysis.metadata.get("beat_source") == "manual_bpm" or len(beat_times) < 2
+    beat_grid = analysis.metadata.get("beat_grid")
+    mapping = beat_grid.get("mapping", {}) if isinstance(beat_grid, dict) else {}
+    beat_scale = float(mapping.get("manual_bpm_scale", 1.0) or 1.0)
+    # A legacy hand-built MusicAnalysis marked manual_bpm has no BeatNet phase
+    # map and must retain its historical fixed-grid behavior.  New BeatNet
+    # analyses carry a beat_grid and keep the detected phase/local timing even
+    # when the user overrides BPM.
+    fixed = (analysis.metadata.get("beat_source") == "manual_bpm" and not beat_grid) or len(beat_times) < 2
     if fixed:
         return _BeatMapper(analysis.bpm, beat_times, True)
-    unshifted = _BeatMapper(analysis.bpm, beat_times, False)
+    unshifted = _BeatMapper(analysis.bpm, beat_times, False, beat_scale=beat_scale)
     # Preserve the original audio zero on the non-negative Score timeline.
     # Beat detectors commonly return their first beat after the audio starts;
     # translating that map keeps an onset at t=0 instead of clamping it away.
     shift_beats = -unshifted.seconds_to_beat(0.0)
-    return _BeatMapper(analysis.bpm, beat_times, False, shift_beats=shift_beats)
+    return _BeatMapper(analysis.bpm, beat_times, False, shift_beats=shift_beats, beat_scale=beat_scale)
 
 
 def _straight_tick(value: float, quarter_ticks: int) -> int:
@@ -199,14 +207,21 @@ def _quantize_voice_boundaries(
 def _tempo_events(analysis: MusicAnalysis, mapper: _BeatMapper, quarter_ticks: int) -> list[TempoEvent]:
     if mapper.fixed or len(mapper.beat_times) < 2:
         return [TempoEvent(start_tick=0, bpm=analysis.bpm)]
-    first_interval = mapper.beat_times[1] - mapper.beat_times[0]
-    values: list[TempoEvent] = [TempoEvent(start_tick=0, bpm=60.0 / first_interval)]
+    median_interval = sorted(
+        right - left for left, right in zip(mapper.beat_times, mapper.beat_times[1:])
+    )[len(mapper.beat_times[1:]) // 2]
+    values: list[TempoEvent] = [TempoEvent(start_tick=0, bpm=60.0 * mapper.beat_scale / median_interval)]
     for index, (left, right) in enumerate(zip(mapper.beat_times, mapper.beat_times[1:])):
         interval = right - left
         if interval <= 0:
             continue
-        bpm = 60.0 / interval
-        tick = max(0, int(round((index + mapper.shift_beats) * quarter_ticks)))
+        bpm = 60.0 * mapper.beat_scale / interval
+        tick = max(0, int(round((index * mapper.beat_scale + mapper.shift_beats) * quarter_ticks)))
+        # The first detected beat can be a pickup after audio zero.  Its
+        # partial interval must not overwrite the median tempo at score tick
+        # zero; later intervals still contribute their local tempo changes.
+        if index == 0 and tick == values[0].start_tick:
+            continue
         if tick == values[-1].start_tick:
             values[-1] = TempoEvent(start_tick=tick, bpm=bpm)
         elif abs(bpm - values[-1].bpm) > 0.01:
@@ -317,6 +332,8 @@ def quantize_events(
         "beat_source": analysis.metadata.get("beat_source", "beat_times" if len(analysis.beat_times) >= 2 else "fixed_bpm"),
         "beat_times": list(analysis.beat_times),
         "beat_shift_beats": mapper.shift_beats,
+        "beat_scale": mapper.beat_scale,
+        "beat_grid": analysis.metadata.get("beat_grid"),
         "beat_offset_sec": analysis.beat_times[0] if analysis.beat_times else 0.0,
         "pickup_beats": max(0.0, -mapper.seconds_to_beat(0.0)),
         "downbeat_status": "undetermined",

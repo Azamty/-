@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import MethodType
 
 import mido
 import pytest
@@ -117,6 +118,67 @@ def test_v2_selection_uses_music_analysis_suggestion_when_unmodified(tmp_path: P
     assert selection["bpm_override"] == 96
     assert selection["key_override"] == "Am"
     assert selection["time_signature_override"] == "6/8"
+
+
+def test_v2_export_reuses_persisted_beatnet_times_after_selection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    manager = JobManager(tmp_path / "jobs")
+    job_id, input_path = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture")
+    input_path.write_bytes(b"fixture")
+    guitar_id = stable_track_id("acoustic_guitar", 24, False)
+    tracks = [{
+        "track_id": guitar_id,
+        "instrument_group": "acoustic_guitar",
+        "program": 24,
+        "is_drum": False,
+        "label_zh": "原声吉他",
+        "preview_available": True,
+    }]
+    notes = [{"instrument_group": "acoustic_guitar", "program": 24, "is_drum": False, "pitch": 60, "start_sec": 0.13, "end_sec": 0.61, "velocity": None}]
+    _instrumental_state(
+        manager,
+        job_id,
+        notes,
+        tracks,
+        analysis={"bpm": 120, "key": "C", "time_signature": "4/4"},
+    )
+    job_dir = (tmp_path / "jobs" / job_id).resolve()
+    full_analysis = MusicAnalysis(
+        sample_rate=22050,
+        duration_sec=2.0,
+        bpm=120,
+        key="C",
+        time_signature="4/4",
+        beat_times=[0.25, 0.75, 1.25, 1.75],
+        metadata={
+            "beat_source": "beatnet",
+            "beat_grid": {
+                "mapping": {"beat_times": [0.25, 0.75, 1.25, 1.75], "manual_bpm_scale": 1.0},
+                "tempo": {"detected_bpm": 120},
+            },
+        },
+    )
+    persisted = job_dir / "output" / "analysis.json"
+    persisted.parent.mkdir(parents=True, exist_ok=True)
+    persisted.write_text(full_analysis.model_dump_json(), encoding="utf-8")
+    state = manager._read(job_id)
+    state["v2"]["analysis_relative"] = "output/analysis.json"
+    manager._write(state)
+    manager.select_v2(job_id, [guitar_id], bpm_override=96, key_override="C", time_signature_override="4/4")
+    running = manager._read(job_id)
+    running.update({"status": "running", "phase": "rendering"})
+    manager._write(running)
+    captured: dict[str, MusicAnalysis | None] = {}
+
+    def fake_render(self: object, *args: object, **kwargs: object) -> list[dict[str, object]]:
+        captured["analysis"] = kwargs.get("base_analysis")  # type: ignore[assignment]
+        return []
+
+    monkeypatch.setattr(manager.v2, "_render_track_score", MethodType(fake_render, manager.v2))
+    manager.v2._run_instrumental_export(job_id)
+
+    assert captured["analysis"] is not None
+    assert captured["analysis"].beat_times == [0.25, 0.75, 1.25, 1.75]  # type: ignore[union-attr]
+    assert captured["analysis"].metadata["beat_source"] == "beatnet"  # type: ignore[union-attr]
 
 
 def test_v2_drum_only_export_keeps_midi_and_refuses_jianpu(tmp_path: Path) -> None:

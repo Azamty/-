@@ -501,7 +501,7 @@ class JobManager:
                             shutil.rmtree(child)
                         else:
                             child.unlink(missing_ok=True)
-                    retained_ids = {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis"}
+                    retained_ids = {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis", "v2-beat-grid"}
                     state["artifacts"] = [item for item in state.get("artifacts", []) if str(item.get("artifact_id")) in retained_ids]
                     retained_artifacts = list(state["artifacts"])
                 else:
@@ -764,6 +764,7 @@ class JobManager:
         for path, artifact_id, kind, label, media_type in (
             (output / "score.json", "score-json", "score_json", "Score 数据", "application/json"),
             (output / "analysis.json", "analysis-json", "analysis_json", "分析数据", "application/json"),
+            (output / "beat_grid.json", "beat-grid-json", "beat_grid_json", "BeatNet 拍点网格", "application/json"),
             (output / "score.jly", "score-jly", "jianpu_source", "简谱源文本", "text/plain; charset=utf-8"),
             (output / "score.ly", "score-lilypond", "lilypond_source", "LilyPond 源文本", "text/plain; charset=utf-8"),
         ):
