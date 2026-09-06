@@ -42,6 +42,16 @@ def test_demucs_model_cards_hide_native_dot_but_keep_keyboard_radio_semantics() 
     assert ".model-choice:focus-within" in styles
 
 
+def test_selection_state_hydrates_before_persisting_ready_job_values() -> None:
+    source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+    selection_state = (ROOT / "frontend" / "src" / "selectionState.ts").read_text(encoding="utf-8")
+
+    assert "canPersistSelection(job.status, loadedJobRef.current === job.id)" in source
+    assert "resolveSelectionValues(" in source
+    assert "selectionStorageKey(jobId)" in source
+    assert "server overrides first" in selection_state
+
+
 def test_remote_synth_contract_reports_secure_context_and_download_progress() -> None:
     source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
 

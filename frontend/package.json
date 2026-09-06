@@ -7,7 +7,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit -p tsconfig.app.json && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test:frontend": "node --experimental-strip-types --test tests/synthPlayback.test.ts tests/modelChoice.test.ts",
+    "test:frontend": "node --experimental-strip-types --test tests/synthPlayback.test.ts tests/modelChoice.test.ts tests/selectionState.test.ts",
     "test:synth": "node --experimental-strip-types --test tests/synthPlayback.test.ts"
   },
   "dependencies": {

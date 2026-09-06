@@ -3,6 +3,7 @@ import { WorkletSynthesizer } from "spessasynth_lib";
 import { FIXTURE_JOB, FIXTURE_NOTES, FIXTURE_TRACKS } from "./fixtures/multitrack";
 import { FIXTURE_VOCAL_JOB } from "./fixtures/vocal";
 import { modelChoiceDisabled, modelChoiceHint } from "./modelChoice";
+import { canPersistSelection, resolveSelectionValues, selectionStorageKey } from "./selectionState";
 import { clampPlaybackOffset, cloneSoundfontBuffer, playbackPosition, slicePlaybackNotes } from "./synthPlayback";
 
 type SourceKind = "instrumental" | "vocal";
@@ -850,20 +851,29 @@ function App() {
         setTracks(trackResult.tracks || []);
         const suggestion = (trackResult.analysis || next.v2?.analysis || null) as AnalysisSuggestion | null;
         setAnalysisSuggestion(suggestion);
-        const stored = window.localStorage.getItem(`jianpu-v2-selection:${jobId}`);
+        const stored = window.localStorage.getItem(selectionStorageKey(jobId));
         const saved = stored ? JSON.parse(stored) : null;
         const selection = trackResult.selection || next.v2?.selection || null;
         const selectionOverrides = selection?.overrides || {};
         const suggestionBpm = suggestion?.bpm ?? 120;
         const suggestionKey = suggestion?.key ?? "C";
         const suggestionMeter = suggestion?.time_signature ?? "4/4";
+        const resolvedValues = resolveSelectionValues(
+          { bpm: suggestionBpm, key: suggestionKey, time_signature: suggestionMeter },
+          saved,
+          {
+            bpm: selectionOverrides.bpm ?? selection?.bpm_override,
+            key: selectionOverrides.key ?? selection?.key_override,
+            time_signature: selectionOverrides.time_signature ?? selection?.time_signature_override,
+          },
+        );
         const selected = selection?.selected_track_ids || saved?.selectedTrackIds || (trackResult.tracks || []).map((item: Track) => item.track_id);
         setSelectedTrackIds(selected);
         if (saved?.rollVisible !== undefined) setRollVisible(Boolean(saved.rollVisible));
         if (selection?.merge_main_melody !== undefined) setMergeMainMelody(Boolean(selection.merge_main_melody));
-        setBpm(String(selectionOverrides.bpm ?? selection?.bpm_override ?? saved?.bpm ?? suggestionBpm));
-        setKey(String(selectionOverrides.key ?? selection?.key_override ?? saved?.key ?? suggestionKey));
-        setMeter(String(selectionOverrides.time_signature ?? selection?.time_signature_override ?? saved?.meter ?? suggestionMeter));
+        setBpm(resolvedValues.bpm);
+        setKey(resolvedValues.key);
+        setMeter(resolvedValues.meter);
         const recognition = (artifactResult.artifacts || []).find((item: Artifact) => item.artifact_id === "v2-recognition-json");
         if (recognition?.url) {
           const recognitionPayload = await readResponse(await fetch(recognition.url));
@@ -930,10 +940,10 @@ function App() {
   }, [fixtureMode, job?.id, job?.status, loadJob]);
 
   useEffect(() => {
-    if (!job || !isInstrumental) return;
+    if (!job || fixtureMode || !isInstrumental || !canPersistSelection(job.status, loadedJobRef.current === job.id)) return;
     const value = { selectedTrackIds, rollVisible, bpm, key, meter, mergeMainMelody };
-    window.localStorage.setItem(`jianpu-v2-selection:${job.id}`, JSON.stringify(value));
-  }, [bpm, isInstrumental, job?.id, key, mergeMainMelody, meter, rollVisible, selectedTrackIds]);
+    window.localStorage.setItem(selectionStorageKey(job.id), JSON.stringify(value));
+  }, [bpm, fixtureMode, isInstrumental, job?.id, job?.status, key, mergeMainMelody, meter, rollVisible, selectedTrackIds]);
 
   useEffect(() => () => {
     stopSynth();
