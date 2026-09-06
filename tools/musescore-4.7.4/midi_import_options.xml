@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<MidiOptions>
+  <!-- Quantization: 0=1/4, 1=1/8, 2=1/16, 3=1/32, 4=1/64. -->
+  <QuantValue>3</QuantValue>
+  <!-- value + 1; 3 means four independent voices. -->
+  <VoiceCount>3</VoiceCount>
+  <Duplets>true</Duplets>
+  <Triplets>true</Triplets>
+  <Quadruplets>true</Quadruplets>
+  <Quintuplets>true</Quintuplets>
+  <Septuplets>true</Septuplets>
+  <Nonuplets>true</Nonuplets>
+  <!-- Keep performance timing for the importer's adaptive decisions. -->
+  <HumanPerformance>true</HumanPerformance>
+  <MeasureCount2xLess>false</MeasureCount2xLess>
+  <SplitStaff>true</SplitStaff>
+  <ClefChanges>true</ClefChanges>
+  <SimplifyDurations>false</SimplifyDurations>
+  <ShowStaccato>true</ShowStaccato>
+  <DottedNotes>true</DottedNotes>
+  <RecognizePickupBar>true</RecognizePickupBar>
+  <Swing>0</Swing>
+</MidiOptions>

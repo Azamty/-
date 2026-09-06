@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0",
+  "fixture": "stage-a-midi-notation-boundary",
+  "description": "Deterministic, offline fixture for the future BeatNet/MuseScore bridge.",
+  "source": {
+    "kind": "synthetic-midi",
+    "title": "Stage A boundary fixture",
+    "ticks_per_quarter": 480,
+    "tempo_bpm": 96.0,
+    "time_signature": "6/8",
+    "key": "D",
+    "duration_ticks": 2880
+  },
+  "beat_grid": {
+    "engine": "fixture",
+    "beats": [
+      {"index": 0, "time_sec": 0.0, "beat": 0.0, "downbeat": true},
+      {"index": 1, "time_sec": 0.625, "beat": 1.0, "downbeat": false},
+      {"index": 2, "time_sec": 1.25, "beat": 2.0, "downbeat": false},
+      {"index": 3, "time_sec": 1.875, "beat": 3.0, "downbeat": true},
+      {"index": 4, "time_sec": 2.5, "beat": 4.0, "downbeat": false},
+      {"index": 5, "time_sec": 3.125, "beat": 5.0, "downbeat": false}
+    ],
+    "bpm_candidates": [48.0, 96.0, 192.0],
+    "selected_bpm": 96.0,
+    "time_signature_candidates": ["2/4", "3/4", "4/4", "6/8"],
+    "selected_time_signature": "6/8"
+  },
+  "notes": [
+    {"start_tick": 0, "duration_tick": 240, "midi": 62, "voice": 1},
+    {"start_tick": 0, "duration_tick": 1440, "midi": 50, "voice": 2},
+    {"start_tick": 240, "duration_tick": 240, "midi": 64, "voice": 1},
+    {"start_tick": 480, "duration_tick": 480, "midi": 66, "voice": 1},
+    {"start_tick": 960, "duration_tick": 240, "midi": 69, "voice": 1},
+    {"start_tick": 1200, "duration_tick": 240, "midi": 71, "voice": 1},
+    {"start_tick": 1440, "duration_tick": 1440, "midi": 57, "voice": 2},
+    {"start_tick": 1440, "duration_tick": 480, "midi": 66, "voice": 1},
+    {"start_tick": 1920, "duration_tick": 960, "midi": 69, "voice": 1}
+  ],
+  "expected": {
+    "requires_polyphony": true,
+    "requires_ties": true,
+    "requires_meter": "6/8",
+    "requires_adaptive_quantization": true,
+    "minimum_score_ticks_per_quarter": 48
+  }
+}

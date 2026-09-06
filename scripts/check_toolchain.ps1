@@ -83,3 +83,6 @@ if (Test-Path -LiteralPath $tsumugiPython) {
     }
 } else { Write-Output "tsumugi_env=MISSING"; Write-Output "tsumugi=MISSING_ENV" }
 Write-Output "chordscope=NOT_INSTALLED_PYPI"
+Write-Output "high_accuracy="
+& $venvPython (Join-Path $projectRoot "scripts\check_high_accuracy.py")
+if ($LASTEXITCODE -ne 0) { Write-Output "high_accuracy_probe=ERROR:$LASTEXITCODE" }

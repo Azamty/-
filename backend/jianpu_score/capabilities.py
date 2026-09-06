@@ -12,6 +12,7 @@ from .analysis import resolve_ffmpeg, resolve_ffprobe
 from .models.game import DEFAULT_GAME_MODEL, GAME_ROOT, game_config_path, game_model_path, game_python, load_game_language_map
 from .models.demucs import DEFAULT_DEMUCS_MODEL, demucs_model_catalog
 from .models.tsumugi import STEM_MODEL_TYPES, TSUMUGI_CHECKPOINTS, TSUMUGI_ROOT, tsumugi_python
+from .high_accuracy import get_high_accuracy_capabilities
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -318,6 +319,7 @@ def _compute_capabilities() -> dict[str, Any]:
     return {
         "schema_version": "1.0",
         "default_engine": "basic-pitch",
+        "high_accuracy": get_high_accuracy_capabilities(),
         "engines": engines,
         "separation": {
             "demucs-htdemucs": {
