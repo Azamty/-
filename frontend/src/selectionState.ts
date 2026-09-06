@@ -5,9 +5,22 @@ export type SelectionSuggestion = {
 };
 
 export type SavedSelection = {
+  schema?: string;
+  version?: number;
+  job_id?: string;
+  hydrated?: boolean;
   bpm?: number | string | null;
   key?: string | null;
   meter?: string | null;
+  manual?: ManualSelectionFields;
+  selectedTrackIds?: string[];
+  rollVisible?: boolean;
+};
+
+export type ManualSelectionFields = {
+  bpm?: boolean;
+  key?: boolean;
+  meter?: boolean;
 };
 
 export type SelectionOverrides = {
@@ -22,6 +35,9 @@ export type ResolvedSelectionValues = {
   meter: string;
 };
 
+export const SELECTION_DRAFT_SCHEMA = "jianpu-v2-selection";
+export const SELECTION_DRAFT_VERSION = 1;
+
 const firstValue = <T>(...values: Array<T | null | undefined>): T | undefined => {
   const found = values.find((value) => value !== undefined && value !== null && String(value).trim() !== "");
   return found === null || found === undefined ? undefined : found;
@@ -29,6 +45,22 @@ const firstValue = <T>(...values: Array<T | null | undefined>): T | undefined =>
 
 export function selectionStorageKey(jobId: string): string {
   return `jianpu-v2-selection:${jobId}`;
+}
+
+export function parseSelectionDraft(raw: string | null, jobId: string): SavedSelection | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as SavedSelection;
+    if (
+      value?.schema !== SELECTION_DRAFT_SCHEMA
+      || value.version !== SELECTION_DRAFT_VERSION
+      || value.job_id !== jobId
+      || value.hydrated !== true
+    ) return null;
+    return value;
+  } catch {
+    return null;
+  }
 }
 
 export function canPersistSelection(status: string | null | undefined, hydrated: boolean): boolean {
@@ -41,9 +73,12 @@ export function resolveSelectionValues(
   saved: SavedSelection | null | undefined,
   overrides: SelectionOverrides | null | undefined,
 ): ResolvedSelectionValues {
+  const savedBpm = saved?.manual?.bpm ? saved.bpm : undefined;
+  const savedKey = saved?.manual?.key ? saved.key : undefined;
+  const savedMeter = saved?.manual?.meter ? saved.meter : undefined;
   return {
-    bpm: String(firstValue(overrides?.bpm, saved?.bpm, suggestion?.bpm, 120)),
-    key: String(firstValue(overrides?.key, saved?.key, suggestion?.key, "C")),
-    meter: String(firstValue(overrides?.time_signature, saved?.meter, suggestion?.time_signature, "4/4")),
+    bpm: String(firstValue(overrides?.bpm, savedBpm, suggestion?.bpm, 120)),
+    key: String(firstValue(overrides?.key, savedKey, suggestion?.key, "C")),
+    meter: String(firstValue(overrides?.time_signature, savedMeter, suggestion?.time_signature, "4/4")),
   };
 }
