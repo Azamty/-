@@ -4,6 +4,7 @@ import { FIXTURE_JOB, FIXTURE_NOTES, FIXTURE_TRACKS } from "./fixtures/multitrac
 import { FIXTURE_VOCAL_JOB } from "./fixtures/vocal";
 import { modelChoiceDisabled, modelChoiceHint } from "./modelChoice";
 import { canPersistSelection, parseSelectionDraft, resolveSelectionValues, SELECTION_DRAFT_SCHEMA, SELECTION_DRAFT_VERSION, selectionStorageKey, type ManualSelectionFields } from "./selectionState";
+import { scoreToPlaybackData, type ScorePlaybackData, type ScorePlaybackNote } from "./scorePlayback";
 import { clampPlaybackOffset, cloneSoundfontBuffer, playbackPosition, slicePlaybackNotes } from "./synthPlayback";
 
 type SourceKind = "instrumental" | "vocal";
@@ -106,6 +107,8 @@ type AnalysisSuggestion = {
   warnings?: readonly string[];
   sources?: { bpm?: string | null; key?: string | null; time_signature?: string | null };
 };
+
+type ScorePlaybackState = "idle" | "loading" | "playing" | "paused";
 
 const DEMUCS_MODEL_OPTIONS: Array<{
   id: DemucsModel;
@@ -570,6 +573,10 @@ function App() {
   const [synthError, setSynthError] = useState("");
   const [soundfontCacheNotice, setSoundfontCacheNotice] = useState("");
   const [soundfontStatus, setSoundfontStatus] = useState<SoundfontStatus | null>(null);
+  const [scorePlaybackState, setScorePlaybackState] = useState<ScorePlaybackState>("idle");
+  const [scorePlaybackArtifactId, setScorePlaybackArtifactId] = useState<string | null>(null);
+  const [scorePlaybackTime, setScorePlaybackTime] = useState(0);
+  const [scorePlaybackError, setScorePlaybackError] = useState("");
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -589,6 +596,14 @@ function App() {
   const synthBufferRef = useRef<{ version: string | null; buffer: ArrayBuffer } | null>(null);
   const synthTimerRef = useRef<number | null>(null);
   const synthStopTimerRef = useRef<number | null>(null);
+  const scoreCacheRef = useRef<Map<string, ScorePlaybackData>>(new Map());
+  const scorePlaybackRef = useRef<{ artifactId: string; notes: ScorePlaybackNote[]; duration: number; program: number } | null>(null);
+  const scoreOriginRef = useRef<number | null>(null);
+  const scorePositionRef = useRef(0);
+  const scoreDurationRef = useRef(0);
+  const scoreSessionRef = useRef(0);
+  const scoreTimerRef = useRef<number | null>(null);
+  const scoreStopTimerRef = useRef<number | null>(null);
   const fixtureValue = new URLSearchParams(window.location.search).get("fixture");
   const fixtureMode = fixtureValue === "multitrack" || fixtureValue === "vocal-ready";
   const vocalFixtureMode = fixtureValue === "vocal-ready";
@@ -659,6 +674,71 @@ function App() {
       : playbackPosition(audioNow, synthOriginRef.current, synthDurationRef.current);
     haltSynth("pause", elapsed);
   }, [haltSynth, synthPlaying]);
+
+  const clearScoreClock = useCallback(() => {
+    if (scoreTimerRef.current !== null) window.cancelAnimationFrame(scoreTimerRef.current);
+    if (scoreStopTimerRef.current !== null) window.clearTimeout(scoreStopTimerRef.current);
+    scoreTimerRef.current = null;
+    scoreStopTimerRef.current = null;
+    scoreOriginRef.current = null;
+  }, []);
+
+  const stopScorePlayback = useCallback(() => {
+    scoreSessionRef.current += 1;
+    clearScoreClock();
+    haltSynth("stop");
+    scorePlaybackRef.current = null;
+    scorePositionRef.current = 0;
+    scoreDurationRef.current = 0;
+    setScorePlaybackState("idle");
+    setScorePlaybackArtifactId(null);
+    setScorePlaybackTime(0);
+  }, [clearScoreClock, haltSynth]);
+
+  const pauseScorePlayback = useCallback(() => {
+    if (scorePlaybackState !== "playing" || !scorePlaybackArtifactId) return;
+    const audioNow = audioContextRef.current?.currentTime;
+    const elapsed = scoreOriginRef.current === null || audioNow === undefined
+      ? scorePositionRef.current
+      : playbackPosition(audioNow, scoreOriginRef.current, scoreDurationRef.current);
+    scoreSessionRef.current += 1;
+    clearScoreClock();
+    haltSynth("stop");
+    const bounded = clampPlaybackOffset(elapsed, scoreDurationRef.current);
+    scorePositionRef.current = bounded;
+    setScorePlaybackTime(bounded);
+    setScorePlaybackState("paused");
+  }, [clearScoreClock, haltSynth, scorePlaybackArtifactId, scorePlaybackState]);
+
+  const startScoreClock = useCallback((artifactId: string, duration: number, startOffset: number, audioStartAt: number) => {
+    const session = scoreSessionRef.current + 1;
+    scoreSessionRef.current = session;
+    const boundedOffset = clampPlaybackOffset(startOffset, duration);
+    scoreDurationRef.current = duration;
+    scorePositionRef.current = boundedOffset;
+    scoreOriginRef.current = audioStartAt - boundedOffset;
+    setScorePlaybackArtifactId(artifactId);
+    setScorePlaybackTime(boundedOffset);
+    setScorePlaybackState("playing");
+    const tick = () => {
+      if (scoreSessionRef.current !== session || scoreOriginRef.current === null) return;
+      const audioNow = audioContextRef.current?.currentTime;
+      if (audioNow === undefined) return;
+      const rawElapsed = audioNow - scoreOriginRef.current;
+      if (rawElapsed >= duration + 0.15) {
+        stopScorePlayback();
+        return;
+      }
+      const position = playbackPosition(audioNow, scoreOriginRef.current, duration);
+      scorePositionRef.current = position;
+      setScorePlaybackTime(position);
+      scoreTimerRef.current = window.requestAnimationFrame(tick);
+    };
+    scoreTimerRef.current = window.requestAnimationFrame(tick);
+    scoreStopTimerRef.current = window.setTimeout(() => {
+      if (scoreSessionRef.current === session) stopScorePlayback();
+    }, Math.max(0, duration - boundedOffset + 0.35) * 1000);
+  }, [stopScorePlayback]);
 
   const loadSoundfontSynth = useCallback(async (): Promise<WorkletSynthesizer> => {
     if (synthRef.current) return synthRef.current;
@@ -836,6 +916,10 @@ function App() {
   }, [soundfontStatus]);
 
   const loadJob = useCallback(async (jobId: string) => {
+    if (loadedJobRef.current && loadedJobRef.current !== jobId) {
+      stopScorePlayback();
+      scoreCacheRef.current.clear();
+    }
     const next = await readResponse(await fetch(`/api/v2/jobs/${jobId}`)) as Job;
     setJob(next);
     setSource(next.v2?.source_kind || "instrumental");
@@ -895,7 +979,7 @@ function App() {
       }
     }
     return next;
-  }, []);
+  }, [stopScorePlayback]);
 
   useEffect(() => {
     fetch("/api/capabilities").then(readResponse).then(setCapabilities).catch(() => setCapabilities(null));
@@ -962,13 +1046,17 @@ function App() {
   }, [bpm, fixtureMode, isInstrumental, job?.id, job?.status, key, manualSelectionFields, mergeMainMelody, meter, rollVisible, selectedTrackIds]);
 
   useEffect(() => () => {
-    stopSynth();
-  }, [stopSynth]);
+    stopScorePlayback();
+  }, [stopScorePlayback]);
 
   const chooseFile = (candidate?: File) => {
     if (!candidate) return;
     setError(""); setNotice(""); setFile(candidate);
     if (!title) setTitle(candidate.name.replace(/\.[^/.]+$/, ""));
+  };
+  const chooseSource = (nextSource: SourceKind) => {
+    if (nextSource !== source) stopScorePlayback();
+    setSource(nextSource);
   };
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => chooseFile(event.target.files?.[0]);
   const onDrop = (event: DragEvent<HTMLDivElement>) => { event.preventDefault(); chooseFile(event.dataTransfer.files?.[0]); };
@@ -981,7 +1069,7 @@ function App() {
 
   const submit = async () => {
     if (!file) { setError("先放入一段音频，再开始识别。"); return; }
-    setBusy(true); setError(""); setNotice(""); stopSynth();
+    setBusy(true); setError(""); setNotice(""); stopScorePlayback(); scoreCacheRef.current.clear();
     setAnalysisSuggestion(null); setBpm("120"); setKey("C"); setMeter("4/4"); setRollVisible(true); setMergeMainMelody(false); setManualSelectionFields({});
     try {
       const form = new FormData(); form.append("file", file); form.append("source_kind", source); if (title.trim()) form.append("title", title.trim()); if (source === "vocal") form.append("separation_model", separationModel);
@@ -999,7 +1087,7 @@ function App() {
 
   const retry = async () => {
     if (!job || fixtureMode) return;
-    setBusy(true); setError("");
+    setBusy(true); setError(""); stopScorePlayback(); scoreCacheRef.current.clear();
     try {
       const next = await readResponse(await fetch(`/api/v2/jobs/${job.id}/retry`, { method: "POST" })) as Job;
       setJob(next); setArtifacts([]); setTracks([]); setNotes([]); loadedJobRef.current = "";
@@ -1020,7 +1108,7 @@ function App() {
       setError("请先等待人声分离完成，再生成简谱。");
       return;
     }
-    setBusy(true); setError(""); setNotice("正在把已分离人声送入 GAME；不会重新运行 Demucs。");
+    setBusy(true); setError(""); setNotice("正在把已分离人声送入 GAME；不会重新运行 Demucs。"); stopScorePlayback(); scoreCacheRef.current.clear();
     try {
       const next = await readResponse(await fetch(`/api/v2/jobs/${job.id}/vocal/generate`, { method: "POST" })) as Job;
       setJob(next); setNotice("GAME 已排队；将只处理已分离的人声 stem。");
@@ -1029,7 +1117,7 @@ function App() {
     finally { setBusy(false); }
   };
   const toggleTrack = (trackId: string) => {
-    if (synthPlaying || synthPaused) stopSynth();
+    if (synthPlaying || synthPaused || scorePlaybackState !== "idle") stopScorePlayback();
     setSelectedTrackIds((current) => current.includes(trackId) ? current.filter((id) => id !== trackId) : [...current, trackId]);
   };
 
@@ -1121,10 +1209,153 @@ function App() {
     startSynthClock(maxEnd, resumeAt, start);
   };
 
+  const playLightweightScore = async (
+    artifactId: string,
+    data: ScorePlaybackData,
+    fallbackReason: string,
+    startOffset: number,
+  ) => {
+    const AudioContextConstructor = getAudioContextConstructor();
+    if (!AudioContextConstructor) throw new SynthPlaybackError("lightweight_unsupported", "当前浏览器没有 Web Audio，无法启动简谱试听。");
+    let context = audioContextRef.current;
+    if (!context) {
+      try {
+        context = new AudioContextConstructor();
+        audioContextRef.current = context;
+      } catch {
+        throw new SynthPlaybackError("lightweight_unsupported", "浏览器无法创建简谱试听的音频上下文，请检查设备声音权限。");
+      }
+    }
+    try {
+      await context.resume();
+    } catch {
+      throw new SynthPlaybackError("audio_context_blocked", "浏览器没有启用简谱试听，请再次点击播放并允许声音。");
+    }
+    if (context.state !== "running") throw new SynthPlaybackError("audio_context_blocked", "浏览器仍将音频上下文保持为暂停，请再次点击播放。");
+    const resumeAt = clampPlaybackOffset(startOffset, data.duration_sec);
+    const scheduledNotes = slicePlaybackNotes(data.notes, resumeAt);
+    const start = context.currentTime + 0.08;
+    const waveforms: OscillatorType[] = ["sine", "triangle", "square", "sawtooth"];
+    scheduledNotes.forEach((note) => {
+      const oscillator = context!.createOscillator();
+      const gain = context!.createGain();
+      const when = start + note.start_sec;
+      const until = start + Math.max(note.start_sec + 0.06, note.end_sec);
+      const frequency = Math.max(55, Math.min(1800, 440 * Math.pow(2, (note.midi - 69) / 12)));
+      oscillator.type = waveforms[Math.abs(data.program) % waveforms.length];
+      oscillator.frequency.setValueAtTime(frequency, when);
+      gain.gain.setValueAtTime(0.0001, when);
+      gain.gain.exponentialRampToValueAtTime(Math.max(0.04, Math.min(0.16, note.velocity / 900)), when + 0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001, Math.max(when + 0.035, until));
+      oscillator.connect(gain).connect(context!.destination);
+      oscillator.start(when);
+      oscillator.stop(Math.max(when + 0.05, until + 0.04));
+      lightweightNodesRef.current.push(oscillator);
+    });
+    if (!lightweightNodesRef.current.length) throw new SynthPlaybackError("lightweight_empty", "当前简谱在暂停位置后没有可播放的音符。");
+    setScorePlaybackError(`${fallbackReason} 已改用轻量试听；播放依据是最终量化简谱。`);
+    setSynthResource("轻量音色 · Web Audio 波形 · 最终简谱");
+    startScoreClock(artifactId, data.duration_sec, resumeAt, start);
+  };
+
+  const playScore = async (artifact: Artifact, forceRestart = false) => {
+    const artifactId = artifact.artifact_id;
+    const scoreArtifact = artifacts.find((item) => {
+      if (artifact.stem_id && item.stem_id === artifact.stem_id) {
+        return item.kind === "instrument_score_json" || item.kind === "main_melody_json";
+      }
+      return !artifact.stem_id && item.kind === "score_json";
+    });
+    if (!scoreArtifact?.url) {
+      setScorePlaybackError("没有找到这张分谱对应的 score.json，暂时无法播放。 ");
+      return;
+    }
+    if (scorePlaybackArtifactId === artifactId && scorePlaybackState === "playing" && !forceRestart) {
+      pauseScorePlayback();
+      return;
+    }
+    if (scorePlaybackState === "loading") return;
+    const isResume = !forceRestart && scorePlaybackArtifactId === artifactId && scorePlaybackState === "paused";
+    const startOffset = isResume
+      ? clampPlaybackOffset(scorePositionRef.current, scoreDurationRef.current)
+      : 0;
+    if (!isResume) stopScorePlayback();
+    if (synthPlaying || synthPaused) stopScorePlayback();
+    setScorePlaybackError("");
+    setError("");
+    setScorePlaybackArtifactId(artifactId);
+    setScorePlaybackState("loading");
+    const request = scoreSessionRef.current + 1;
+    scoreSessionRef.current = request;
+    let started = false;
+    try {
+      let data = scoreCacheRef.current.get(artifactId);
+      if (!data) {
+        const payload = await readResponse(await fetch(scoreArtifact.url));
+        data = scoreToPlaybackData(payload);
+        scoreCacheRef.current.set(artifactId, data);
+      }
+      if (scoreSessionRef.current !== request) return;
+      scorePlaybackRef.current = { artifactId, notes: data.notes, duration: data.duration_sec, program: data.program };
+      const synth = await loadSoundfontSynth();
+      if (scoreSessionRef.current !== request) return;
+      const context = audioContextRef.current;
+      if (!context) throw new SynthPlaybackError("audio_context_missing", "音频上下文不可用，请重新点击播放。 ");
+      await context.resume();
+      if (context.state !== "running") throw new SynthPlaybackError("audio_context_blocked", "浏览器仍将音频上下文保持为暂停，请再次点击播放并检查设备声音权限。 ");
+      synth.stopAll(true);
+      const channel = 0;
+      synth.midiChannels[channel]?.setDrums(false);
+      synth.programChange(channel, data.program);
+      const start = context.currentTime + 0.08;
+      slicePlaybackNotes(data.notes, startOffset).forEach((note) => {
+        const when = start + note.start_sec;
+        const until = start + Math.max(note.start_sec + 0.04, note.end_sec);
+        synth.noteOn(channel, note.midi, note.velocity, { time: when });
+        synth.noteOff(channel, note.midi, { time: until });
+      });
+      setSynthResource("MuseScore General · SpessaSynth / SF3 · 最终简谱");
+      startScoreClock(artifactId, data.duration_sec, startOffset, start);
+      started = true;
+    } catch (caught) {
+      if (scoreSessionRef.current !== request) return;
+      const fallbackCodes = new Set([
+        "secure_context_required", "audio_worklet_unsupported", "processor_load_failed",
+        "soundfont_range_unsupported", "soundfont_range_invalid", "soundfont_chunk_failed",
+        "soundfont_user_fallback", "soundfont_timeout", "soundfont_network", "soundfont_http",
+        "soundfont_content_type", "soundfont_incomplete", "soundfont_invalid_body",
+        "soundfont_size_mismatch", "synth_init_failed",
+      ]);
+      if (caught instanceof SynthPlaybackError && fallbackCodes.has(caught.code)) {
+        try {
+          const data = scorePlaybackRef.current?.artifactId === artifactId
+            ? { notes: scorePlaybackRef.current.notes, duration_sec: scorePlaybackRef.current.duration, program: scorePlaybackRef.current.program }
+            : scoreCacheRef.current.get(artifactId);
+          if (!data) throw new Error("简谱数据不可用。");
+          await playLightweightScore(artifactId, data, caught.message, startOffset);
+          setError("");
+          started = true;
+          return;
+        } catch (lightweightCaught) {
+          const reason = lightweightCaught instanceof Error ? lightweightCaught.message : "未知原因";
+          setScorePlaybackError(`${caught.message} 轻量试听也未能启动：${reason}`);
+        }
+      } else {
+        setScorePlaybackError(caught instanceof Error ? caught.message : "简谱试听启动失败。 ");
+      }
+      setScorePlaybackState("idle");
+      setScorePlaybackArtifactId(null);
+      setScorePlaybackTime(0);
+      setError(caught instanceof Error ? caught.message : "简谱试听启动失败。 ");
+    } finally {
+      if (scoreSessionRef.current === request && !started) setScorePlaybackState("idle");
+    }
+  };
+
   const submitSelection = async (kind: "midi" | "score") => {
     if (!job || fixtureMode) { setNotice(kind === "midi" ? "受控预览只演示选择逻辑；真实任务会在这里生成选择版本 MIDI。" : "受控预览只演示选择逻辑；真实任务会在这里生成分谱。"); return; }
     if (!selectedTrackIds.length) { setError("至少选择一条轨道；全不选时不会生成 MIDI 或简谱。"); return; }
-    setBusy(true); setError(""); setNotice(kind === "midi" ? "正在登记选择版本并生成 MIDI…" : "正在登记选择版本并生成分谱…");
+    setBusy(true); setError(""); setNotice(kind === "midi" ? "正在登记选择版本并生成 MIDI…" : "正在登记选择版本并生成分谱…"); stopScorePlayback();
     try {
       const payload = { selected_track_ids: selectedTrackIds, merge_main_melody: mergeMainMelody, bpm_override: Number(bpm) || 120, key_override: key, time_signature_override: meter };
       const next = await readResponse(await fetch(`/api/v2/jobs/${job.id}/selection/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })) as Job;
@@ -1136,6 +1367,7 @@ function App() {
 
   const playSynth = async () => {
     if (synthPlaying) { pauseSynth(); return; }
+    if (scorePlaybackState !== "idle") stopScorePlayback();
     const playable = notes.filter((note) => note.track_id && selectedTrackIds.includes(note.track_id));
     if (!playable.length) { setError("当前没有可试听的已选轨道；鼓组也可以试听，但需先勾选。"); return; }
     if (synthLoading) return;
@@ -1252,6 +1484,39 @@ function App() {
     return <div className="roll-scroll" aria-label="时间同步钢琴卷帘"><svg className="piano-roll" width={rollWidth} height={rollHeight + 28} role="img" aria-label="按乐器颜色显示的钢琴卷帘"><rect width={rollWidth} height={rollHeight + 28} fill="#172b31" />{Array.from({ length: Math.ceil(duration) + 1 }, (_, second) => <g key={`grid-${second}`}><line x1={(second / duration) * rollWidth} y1="0" x2={(second / duration) * rollWidth} y2={rollHeight} stroke="#36535a" strokeWidth="1" /><text x={(second / duration) * rollWidth + 5} y="18" fill="#a9c1b7" fontSize="11">{second}s</text></g>)}{visibleTracks.map((track, lane) => { const color = LANE_COLORS[tracks.findIndex((item) => item.track_id === track.track_id) % LANE_COLORS.length]; return <g key={track.track_id}><rect x="0" y={lane * laneHeight} width={rollWidth} height={laneHeight} fill={lane % 2 ? "#1b3339" : "#172b31"} /><text x="10" y={lane * laneHeight + 34} fill={color} fontSize="12" fontWeight="700">{track.label_zh}</text>{notes.filter((note) => note.track_id === track.track_id).map((note, index) => { const x = (note.start_sec / duration) * rollWidth; const width = Math.max(3, ((note.end_sec - note.start_sec) / duration) * rollWidth); const y = lane * laneHeight + laneHeight - 14 - ((note.pitch - minPitch) / Math.max(1, maxPitch - minPitch)) * (laneHeight - 31); return <rect key={`${track.track_id}-${index}`} x={x} y={y} width={width} height="9" rx="3" fill={color} opacity="0.9" />; })}</g>; })}<line className="playhead" x1={(activeTime / duration) * rollWidth} y1="0" x2={(activeTime / duration) * rollWidth} y2={rollHeight} stroke="#fff5d6" strokeWidth="2" /></svg></div>;
   };
 
+  const scoreJsonFor = (artifact: Artifact) => artifacts.find((item) => {
+    if (artifact.stem_id && item.stem_id === artifact.stem_id) {
+      return item.kind === "instrument_score_json" || item.kind === "main_melody_json";
+    }
+    return !artifact.stem_id && item.kind === "score_json";
+  });
+
+  const renderScoreCard = (artifact: Artifact, long = false) => {
+    const active = scorePlaybackArtifactId === artifact.artifact_id;
+    const jsonArtifact = scoreJsonFor(artifact);
+    const actionLabel = scorePlaybackState === "loading" && active
+      ? "准备中…"
+      : scorePlaybackState === "playing" && active
+        ? "暂停"
+        : scorePlaybackState === "paused" && active
+          ? "继续"
+          : "播放简谱";
+    return <div className={`score-card-wrap ${long ? "score-card-wrap-long" : ""}`} key={artifact.artifact_id}>
+      <a className={`score-card ${long ? "score-long-card" : ""}`} href={artifact.url || "#"} target="_blank" rel="noreferrer">
+        <span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span>
+        <strong>{artifact.label}</strong>
+        <small>{long ? "纵向长图 SVG · 默认预览" : "分页 SVG · 下载或新窗口查看"}</small>
+      </a>
+      {jsonArtifact?.url && <div className="score-playback-actions">
+        <button type="button" className={`score-play-button ${active && scorePlaybackState === "playing" ? "playing" : ""}`} onClick={() => void playScore(artifact)} disabled={scorePlaybackState === "loading"} aria-label={`${actionLabel}：${artifact.label}`}>{actionLabel}</button>
+        {active && scorePlaybackState !== "loading" && <button type="button" className="score-stop-button" onClick={stopScorePlayback}>停止</button>}
+        {active && <span className="score-playback-time" aria-live="polite">{formatDuration(scorePlaybackTime)} / {formatDuration(scoreDurationRef.current)}</span>}
+        {active && scorePlaybackState === "paused" && <button type="button" className="score-replay-button" onClick={() => void playScore(artifact, true)}>从头播放</button>}
+        {active && scorePlaybackError && <span className="score-playback-error" role="status">{scorePlaybackError}</span>}
+      </div>}
+    </div>;
+  };
+
   const trackCountLabel = tracks.length ? `${tracks.length} 条轨道 · ${notes.length} 个事件` : "等待完整识别";
   const statusIndex = Math.max(0, PHASES.findIndex(([phase]) => phase === job?.status || phase === job?.phase));
 
@@ -1259,14 +1524,61 @@ function App() {
     <header className="topbar"><a className="brand" href="/" aria-label="谱面工作台首页"><span className="brand-glyph">∿</span><span><strong>谱面</strong><small>LOCAL SCORE DESK · V2</small></span></a><div className="topbar-meta"><span className="local-dot"><i />仅限本机</span><span className="version-mark">MuScriptor / GAME</span></div></header>
     <main className="workspace">
       <section className="intro-block"><div className="intro-copy"><p className="eyebrow"><span className="eyebrow-rule" /> SIGNAL → SCORE</p><h1>把每条声部<br /><em>留在可读的轨道里。</em></h1><p className="intro-text">本机识别、逐轨试听、选择后生成分谱。原音与合成试听始终分开。</p></div><div className="notation-stamp" aria-hidden="true"><span className="stamp-label">LOCAL<br />TRANSCRIPTION</span><span className="stamp-note">♩</span><span className="stamp-tick" /><span className="stamp-caption">127.0.0.1 / NO CLOUD</span></div></section>
-      <section className="source-panel panel" aria-labelledby="source-heading"><div className="panel-heading"><div><p className="section-kicker">01 · SOURCE</p><h2 id="source-heading">先告诉我音频来自哪里</h2></div><span className="step-badge">V2</span></div><div className="source-cards" role="group" aria-label="音频来源"><button type="button" className={`source-card ${source === "instrumental" ? "selected" : ""}`} onClick={() => setSource("instrumental")}><span className="source-mark">M</span><span><strong>伴奏 / 纯音乐</strong><small>MuScriptor · 全量识别后再选乐器</small></span><b>{source === "instrumental" ? "已选" : ""}</b></button><button type="button" className={`source-card ${source === "vocal" ? "selected" : ""}`} onClick={() => setSource("vocal")}><span className="source-mark vocal-mark">G</span><span><strong>人声</strong><small>Demucs 分离人声 → GAME · 先试听再生成</small></span><b>{source === "vocal" ? "已选" : ""}</b></button></div></section>
+      <section className="source-panel panel" aria-labelledby="source-heading"><div className="panel-heading"><div><p className="section-kicker">01 · SOURCE</p><h2 id="source-heading">先告诉我音频来自哪里</h2></div><span className="step-badge">V2</span></div><div className="source-cards" role="group" aria-label="音频来源"><button type="button" className={`source-card ${source === "instrumental" ? "selected" : ""}`} onClick={() => chooseSource("instrumental")}><span className="source-mark">M</span><span><strong>伴奏 / 纯音乐</strong><small>MuScriptor · 全量识别后再选乐器</small></span><b>{source === "instrumental" ? "已选" : ""}</b></button><button type="button" className={`source-card ${source === "vocal" ? "selected" : ""}`} onClick={() => chooseSource("vocal")}><span className="source-mark vocal-mark">G</span><span><strong>人声</strong><small>Demucs 分离人声 → GAME · 先试听再生成</small></span><b>{source === "vocal" ? "已选" : ""}</b></button></div></section>
       <div className="desk-grid upload-grid"><section className="control-panel panel"><div className="panel-heading"><div><p className="section-kicker">02 · INPUT</p><h2>放入一段音频</h2></div><span className="step-badge">{source === "instrumental" ? "M" : "G"}</span></div><div className={`dropzone ${file ? "has-file" : ""}`} onClick={() => inputRef.current?.click()} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") inputRef.current?.click(); }} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} role="button" tabIndex={0} aria-label="选择音频文件"><input ref={inputRef} type="file" accept=".mp3,.wav,.flac,.m4a,audio/*" onChange={onFileChange} hidden /><span className="drop-orbit">{file ? "✓" : "↑"}</span>{file ? <><strong>{file.name}</strong><small>{formatBytes(file.size)} · 点击更换</small></> : <><strong>拖入一段音频</strong><small>或点击选择 · MP3 / WAV / FLAC / M4A</small></>}</div><div className="field-stack"><label htmlFor="title">任务标题 <small>可留空，使用文件名</small></label><input id="title" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：夜行片段" /></div>{source === "vocal" && <fieldset className="demucs-options" disabled={modelChoiceDisabled(busy)}><legend>人声分离模型</legend><div className="model-choice-list">{DEMUCS_MODEL_OPTIONS.map((option) => { const selected = separationModel === option.id; return <label className={`model-choice ${selected ? "selected" : ""}`} key={option.id}><input type="radio" name="separation-model" value={option.id} checked={selected} onChange={() => setSeparationModel(option.id)} /><span className="model-choice-copy"><strong>{option.label}</strong><small>{option.speed} · {option.quality}</small></span><span className="model-choice-state" aria-hidden="true">{selected ? "已选" : ""}</span></label>; })}</div><p className="model-note">{modelChoiceHint(activeVocalJob ? actualDemucsModel : null)}</p></fieldset>}{error && <div className="error-message" role="alert"><span>!</span>{error}</div>}{notice && <div className="notice-message" role="status"><span>✦</span>{notice}</div>}<button type="button" className="primary-action" onClick={() => void submit()} disabled={busy || !file}><span>{busy ? "正在送入队列…" : "开始本机识别"}</span><strong>↗</strong></button><p className="privacy-note"><span>⌁</span> 文件只保留在本机任务目录，完成后按服务策略清理。</p></section>
         <section className="status-panel panel" aria-live="polite"><div className="panel-heading"><div><p className="section-kicker">03 · QUEUE</p><h2>{shortStatus(job)}</h2></div>{job && <span className={`status-chip ${job.status}`}><i />{job.status === "completed" ? "完成" : job.status === "failed" ? "失败" : job.status === "selection_ready" ? "可选择" : job.status === "vocal_ready" ? "可生成" : "处理中"}</span>}</div>{job ? <><div className="job-meta"><span><b>{job.input?.original_name || sourceLabel(source)}</b><small>{sourceLabel(job.v2?.source_kind || source)} · 第 {job.attempt || 1} 次</small>{activeVocalJob && <small className="model-readout">Demucs · {actualDemucsModel.label} · {actualDemucsModel.id}</small>}</span><span className="job-id">{job.id.slice(0, 8)}</span></div><div className="phase-rail">{PHASES.map(([phase, label], index) => <span key={phase} className={`${index < statusIndex ? "done" : ""} ${index === statusIndex ? "active" : ""}`} title={label}><i /></span>)}</div><div className="phase-labels">{PHASES.map(([phase, label]) => <span key={phase} className={phase === job.status || phase === job.phase ? "current" : ""}>{label}</span>)}</div>{job.progress !== null && job.progress !== undefined && <div className="progress-meter"><span style={{ width: `${Math.max(2, Math.min(100, job.progress * 100))}%` }} /></div>}{(job.status === "failed" || job.status === "interrupted") && <div className="failure-state"><span className="failure-mark">×</span><div><strong>{job.status === "interrupted" ? "任务中断" : "这次识别没有完成"}</strong><p>{job.error?.message || "可以保留当前选择并重试。"}</p><button type="button" className="outline-action" onClick={() => void retry()} disabled={!job.retryable || busy}>重新排队</button></div></div>}</> : <div className="empty-state"><span className="empty-wave">∿</span><p>上传后，这里会显示识别进度与可用产物。</p><small>{capabilities?.hardware?.cuda ? `CUDA · ${capabilities.hardware.gpu || "本机 GPU"}` : "本机任务队列"}</small></div>}</section></div>
-
-      {isInstrumental && isReady && <section className="instrument-workspace panel" aria-labelledby="workspace-heading" data-selection-policy="single-checkbox-controls-roll-synth-midi-score"><div className="panel-heading workspace-title"><div><p className="section-kicker">04 · SELECTION READY</p><h2 id="workspace-heading">全量识别完成，选出要留下的轨道</h2><p className="heading-note">{trackCountLabel} · 勾选变化不会重新运行 MuScriptor。</p></div><span className="selection-revision">R{job?.v2?.selection_revision || 0}</span></div><div className="listen-strip"><div className="listen-card original-listen"><span className="listen-icon">◉</span><div><strong>原曲试听</strong><small>音频文件的真实播放</small></div>{originalArtifact?.url ? <audio ref={audioRef} controls src={originalArtifact.url} onTimeUpdate={(event) => setOriginalTime(event.currentTarget.currentTime)} onEnded={() => setOriginalTime(0)} /> : <span className="listen-pending">识别后可用</span>}</div><div className="listen-card synth-listen"><span className="listen-icon">⌁</span><div><strong>本机合成试听</strong><small title={soundfontStatus?.sha256 || "官方 SF3 音色库"} aria-live="polite">{synthResource}</small></div>{soundfontCacheNotice && <small className="synth-cache-note" aria-live="polite">{soundfontCacheNotice}</small>}<button type="button" className={`listen-button ${synthPlaying ? "playing" : ""}`} onClick={() => void playSynth()} disabled={synthLoading}>{synthLoading ? "准备试听…" : synthPlaying ? "暂停" : synthPaused ? "播放" : "播放选中轨"}</button>{synthLoading && soundfontDownloading && <button type="button" className="lightweight-action" onClick={useLightweightNow}>立即使用轻量试听</button>}<span className="synth-time">{formatDuration(synthTime)} / {formatDuration(duration)}</span>{synthError && <p className="synth-diagnostic" role="alert">{synthError}</p>}{lightweightActive && !synthLoading && <button type="button" className="lightweight-action" onClick={reloadHighQuality}>重新加载高质量音色</button>}</div></div><div className="workspace-grid"><div className="roll-column"><div className="subhead"><div><span className="section-kicker">PIANO ROLL</span><strong>时间同步试听轨</strong></div><div className="roll-tools"><label><input type="checkbox" checked={rollVisible} onChange={(event) => setRollVisible(event.target.checked)} />显示</label><label>缩放 <input aria-label="钢琴卷帘缩放" type="range" min="1" max="4" step="0.5" value={rollZoom} onChange={(event) => setRollZoom(Number(event.target.value))} /></label></div></div>{renderPianoRoll()}<p className="roll-caption">播放原曲或本机合成时，米白播放头沿原始秒数移动。颜色只表示轨道，音符时间不经过简谱量化。</p></div><aside className="track-roster"><div className="subhead"><div><span className="section-kicker">TRACK ROSTER</span><strong>乐器清单</strong></div><span className="roster-count">{selectedTrackIds.length}/{tracks.length}</span></div><div className="track-list">{tracks.map((track, index) => { const color = LANE_COLORS[index % LANE_COLORS.length]; const selected = selectedTrackIds.includes(track.track_id); return <div className={`track-row ${selected ? "selected" : ""}`} key={track.track_id}><span className="track-color" style={{ background: color }} /><label className="track-check"><input type="checkbox" checked={selected} onChange={() => toggleTrack(track.track_id)} /><span><strong>{track.label_zh}</strong><small>{track.instrument_group} · {track.note_count} notes · {track.is_drum ? "不生成简谱" : `program ${track.program}`}</small></span></label></div>; })}</div>{selectedTracks.some((track) => track.is_drum) && <p className="drum-note">鼓组保留在试听与选择 MIDI 中，但不会生成简谱。</p>}{!pitchedSelected && selectedTrackIds.length > 0 && <p className="drum-note">当前只选中鼓组：可以下载 MIDI，简谱按钮会保持禁用。</p>}</aside></div><div className="export-rail"><div className="analysis-advice" role="status"><div><strong>识别建议，可修改</strong><span>{analysisSuggestion ? `${analysisSuggestion.bpm} BPM · ${analysisSuggestion.key} · ${analysisSuggestion.time_signature}` : "等待原音分析"}</span></div>{analysisSuggestion?.candidates && <small>候选：BPM {analysisSuggestion.candidates.bpm?.join(" / ") || "—"} · 调性 {analysisSuggestion.candidates.key?.join(" / ") || "—"} · 拍号 {analysisSuggestion.candidates.time_signature?.join(" / ") || "—"}</small>}{analysisSuggestion?.warnings?.map((warning, index) => <small key={`analysis-warning-${index}`}>{warning}</small>)}</div><div className="override-fields"><div><label htmlFor="export-bpm">BPM</label><input id="export-bpm" inputMode="decimal" value={bpm} onChange={(event) => updateSelectionField("bpm", event.target.value)} /></div><div><label htmlFor="export-key">调性</label><select id="export-key" value={key} onChange={(event) => updateSelectionField("key", event.target.value)}>{KEYS.map((item) => <option key={item}>{item}</option>)}</select></div><div><label htmlFor="export-meter">拍号</label><select id="export-meter" value={meter} onChange={(event) => updateSelectionField("meter", event.target.value)}>{METERS.map((item) => <option key={item}>{item}</option>)}</select></div></div><label className="merge-option"><input type="checkbox" checked={mergeMainMelody} onChange={(event) => setMergeMainMelody(event.target.checked)} />另外生成单声部主旋律 <small>会丢失和声</small></label><div className="export-actions"><button type="button" className="outline-action" onClick={() => void submitSelection("midi")} disabled={busy || selectedTrackIds.length === 0}>下载所选 MIDI</button><button type="button" className="primary-action compact" onClick={() => void submitSelection("score")} disabled={busy || !pitchedSelected}><span>生成分谱</span><strong>↗</strong></button></div></div>{scoreArtifacts.length > 0 && <div className="score-deck"><div className="subhead"><div><span className="section-kicker">SCORE PAGES</span><strong>已选有音高乐器分谱</strong></div><span className="score-warning">鼓组不在分谱中</span></div><div className="score-grid">{longScoreArtifacts.map((artifact) => <a className="score-card score-long-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>纵向长图 SVG · 默认预览</small></a>)}</div>{pagedScoreArtifacts.length > 0 && <details className="score-pages"><summary>分页 SVG（{pagedScoreArtifacts.length} 页）</summary><div className="score-grid">{pagedScoreArtifacts.map((artifact) => <a className="score-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>分页 SVG · 下载或新窗口查看</small></a>)}</div></details>}{longScoreArtifacts.map((artifact) => <a className="download-line" key={`${artifact.artifact_id}-download`} href={artifact.url || "#"}>↓ 下载长图 SVG · {artifact.label}</a>)}{selectedZip?.url && <a className="download-line" href={selectedZip.url}>↓ 下载全部分页 SVG ZIP</a>}{selectedMidi && <a className="download-line" href={selectedMidi.url || "#"}>↓ 下载选择版本 MIDI · R{job?.v2?.selection_revision || 0}</a>}</div>}{originalMidi && <a className="download-line muted-line" href={originalMidi.url || "#"}>↓ 完整识别 MIDI（原始时间） · 含全部轨道</a>}</section>}
-
+      {isInstrumental && isReady && (
+        <section className="instrument-workspace panel" aria-labelledby="workspace-heading" data-selection-policy="single-checkbox-controls-roll-synth-midi-score">
+          <div className="panel-heading workspace-title">
+            <div>
+              <p className="section-kicker">04 · SELECTION READY</p>
+              <h2 id="workspace-heading">全量识别完成，选出要留下的轨道</h2>
+              <p className="heading-note">{trackCountLabel} · 勾选变化不会重新运行 MuScriptor。</p>
+            </div>
+            <span className="selection-revision">R{job?.v2?.selection_revision || 0}</span>
+          </div>
+          <div className="listen-strip">
+            <div className="listen-card original-listen">
+              <span className="listen-icon">◉</span>
+              <div><strong>原曲试听</strong><small>音频文件的真实播放</small></div>
+              {originalArtifact?.url ? <audio ref={audioRef} controls src={originalArtifact.url} onTimeUpdate={(event) => setOriginalTime(event.currentTarget.currentTime)} onEnded={() => setOriginalTime(0)} /> : <span className="listen-pending">识别后可用</span>}
+            </div>
+            <div className="listen-card synth-listen">
+              <span className="listen-icon">⌁</span>
+              <div><strong>本机合成试听</strong><small title={soundfontStatus?.sha256 || "官方 SF3 音色库"} aria-live="polite">{synthResource}</small></div>
+              {soundfontCacheNotice && <small className="synth-cache-note" aria-live="polite">{soundfontCacheNotice}</small>}
+              <button type="button" className={`listen-button ${synthPlaying ? "playing" : ""}`} onClick={() => void playSynth()} disabled={synthLoading}>{synthLoading ? "准备试听…" : synthPlaying ? "暂停" : synthPaused ? "播放" : "播放选中轨"}</button>
+              {synthLoading && soundfontDownloading && <button type="button" className="lightweight-action" onClick={useLightweightNow}>立即使用轻量试听</button>}
+              <span className="synth-time">{formatDuration(synthTime)} / {formatDuration(duration)}</span>
+              {synthError && <p className="synth-diagnostic" role="alert">{synthError}</p>}
+              {lightweightActive && !synthLoading && <button type="button" className="lightweight-action" onClick={reloadHighQuality}>重新加载高质量音色</button>}
+            </div>
+          </div>
+          <div className="workspace-grid">
+            <div className="roll-column">
+              <div className="subhead"><div><span className="section-kicker">PIANO ROLL</span><strong>时间同步试听轨</strong></div><div className="roll-tools"><label><input type="checkbox" checked={rollVisible} onChange={(event) => setRollVisible(event.target.checked)} />显示</label><label>缩放 <input aria-label="钢琴卷帘缩放" type="range" min="1" max="4" step="0.5" value={rollZoom} onChange={(event) => setRollZoom(Number(event.target.value))} /></label></div></div>
+              {renderPianoRoll()}
+              <p className="roll-caption">播放原曲或本机合成时，米白播放头沿原始秒数移动。颜色只表示轨道，音符时间不经过简谱量化。简谱播放按钮会读取最终 score.json。</p>
+            </div>
+            <aside className="track-roster">
+              <div className="subhead"><div><span className="section-kicker">TRACK ROSTER</span><strong>乐器清单</strong></div><span className="roster-count">{selectedTrackIds.length}/{tracks.length}</span></div>
+              <div className="track-list">{tracks.map((track, index) => { const color = LANE_COLORS[index % LANE_COLORS.length]; const selected = selectedTrackIds.includes(track.track_id); return <div className={`track-row ${selected ? "selected" : ""}`} key={track.track_id}><span className="track-color" style={{ background: color }} /><label className="track-check"><input type="checkbox" checked={selected} onChange={() => toggleTrack(track.track_id)} /><span><strong>{track.label_zh}</strong><small>{track.instrument_group} · {track.note_count} notes · {track.is_drum ? "不生成简谱" : `program ${track.program}`}</small></span></label></div>; })}</div>
+              {selectedTracks.some((track) => track.is_drum) && <p className="drum-note">鼓组保留在试听与选择 MIDI 中，但不会生成简谱。</p>}
+              {!pitchedSelected && selectedTrackIds.length > 0 && <p className="drum-note">当前只选中鼓组：可以下载 MIDI，简谱按钮会保持禁用。</p>}
+            </aside>
+          </div>
+          <div className="export-rail">
+            <div className="analysis-advice" role="status"><div><strong>识别建议，可修改</strong><span>{analysisSuggestion ? `${analysisSuggestion.bpm} BPM · ${analysisSuggestion.key} · ${analysisSuggestion.time_signature}` : "等待原音分析"}</span></div>{analysisSuggestion?.candidates && <small>候选：BPM {analysisSuggestion.candidates.bpm?.join(" / ") || "—"} · 调性 {analysisSuggestion.candidates.key?.join(" / ") || "—"} · 拍号 {analysisSuggestion.candidates.time_signature?.join(" / ") || "—"}</small>}{analysisSuggestion?.warnings?.map((warning, index) => <small key={`analysis-warning-${index}`}>{warning}</small>)}</div>
+            <div className="override-fields"><div><label htmlFor="export-bpm">BPM</label><input id="export-bpm" inputMode="decimal" value={bpm} onChange={(event) => updateSelectionField("bpm", event.target.value)} /></div><div><label htmlFor="export-key">调性</label><select id="export-key" value={key} onChange={(event) => updateSelectionField("key", event.target.value)}>{KEYS.map((item) => <option key={item}>{item}</option>)}</select></div><div><label htmlFor="export-meter">拍号</label><select id="export-meter" value={meter} onChange={(event) => updateSelectionField("meter", event.target.value)}>{METERS.map((item) => <option key={item}>{item}</option>)}</select></div></div>
+            <label className="merge-option"><input type="checkbox" checked={mergeMainMelody} onChange={(event) => setMergeMainMelody(event.target.checked)} />另外生成单声部主旋律 <small>会丢失和声</small></label>
+            <div className="export-actions"><button type="button" className="outline-action" onClick={() => void submitSelection("midi")} disabled={busy || selectedTrackIds.length === 0}>下载所选 MIDI</button><button type="button" className="primary-action compact" onClick={() => void submitSelection("score")} disabled={busy || !pitchedSelected}><span>生成分谱</span><strong>↗</strong></button></div>
+          </div>
+          {scoreArtifacts.length > 0 && <div className="score-deck"><div className="subhead"><div><span className="section-kicker">SCORE PAGES</span><strong>已选有音高乐器分谱</strong></div><span className="score-warning">鼓组不在分谱中</span></div><div className="score-grid">{longScoreArtifacts.map((artifact) => renderScoreCard(artifact, true))}</div>{pagedScoreArtifacts.length > 0 && <details className="score-pages"><summary>分页 SVG（{pagedScoreArtifacts.length} 页）</summary><div className="score-grid">{pagedScoreArtifacts.map((artifact) => renderScoreCard(artifact))}</div></details>}<div className="download-stack">{longScoreArtifacts.map((artifact) => <a className="download-line" key={`${artifact.artifact_id}-download`} href={artifact.url || "#"}>↓ 下载长图 SVG · {artifact.label}</a>)}{selectedZip?.url && <a className="download-line" href={selectedZip.url}>↓ 下载全部分页 SVG ZIP</a>}{selectedMidi && <a className="download-line" href={selectedMidi.url || "#"}>↓ 下载选择版本 MIDI · R{job?.v2?.selection_revision || 0}</a>}</div></div>}
+          {originalMidi && <a className="download-line muted-line" href={originalMidi.url || "#"}>↓ 完整识别 MIDI（原始时间） · 含全部轨道</a>}
+        </section>
+      )}
       {source === "vocal" && job?.status === "vocal_ready" && <section className="vocal-result panel" aria-labelledby="vocal-ready-heading"><div className="panel-heading"><div><p className="section-kicker">04 · VOCALS READY</p><h2 id="vocal-ready-heading">人声已经分离，可以先试听</h2><p className="heading-note">这是 Demucs 模型分离结果，可能含伴奏残留；下一步才会交给 GAME。当前模型：{actualDemucsModel.label}（{actualDemucsModel.id}）。</p></div><span className="status-chip vocal_ready"><i />可生成</span></div><div className="vocal-listen"><div><strong>原曲试听</strong>{originalArtifact?.url && <audio controls src={originalArtifact.url} />}</div><div><strong>已分离人声</strong>{vocalArtifact?.url && <audio controls src={vocalArtifact.url} />}</div></div><button type="button" className="primary-action" onClick={() => void generateVocal()} disabled={busy}><span>{busy ? "正在排队…" : "下一步 · 生成人声简谱"}</span><strong>↗</strong></button></section>}
-      {source === "vocal" && job?.status === "completed" && <section className="vocal-result panel" aria-labelledby="vocal-heading"><div className="panel-heading"><div><p className="section-kicker">04 · GAME RESULT</p><h2 id="vocal-heading">人声主旋律已经展开</h2><p className="heading-note">GAME 只处理已分离的人声，结果保留为单一主旋律谱面。分离模型：{actualDemucsModel.label}（{actualDemucsModel.id}）。</p></div><span className="status-chip completed"><i />完成</span></div><div className="vocal-listen"><div><strong>原曲试听</strong>{originalArtifact?.url && <audio controls src={originalArtifact.url} />}</div><div><strong>已分离人声</strong>{vocalArtifact?.url && <audio controls src={vocalArtifact.url} />}</div></div><div className="score-grid">{artifacts.filter((item) => item.kind === "score_svg_long").map((artifact) => <a className="score-card score-long-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>纵向长图 SVG · 默认预览</small></a>)}</div><details className="score-pages"><summary>分页 SVG（{artifacts.filter((item) => item.kind === "score_svg").length} 页）</summary><div className="score-grid">{artifacts.filter((item) => item.kind === "score_svg").map((artifact) => <a className="score-card" key={artifact.artifact_id} href={artifact.url || "#"} target="_blank" rel="noreferrer"><span className="score-thumb"><img src={artifact.url || ""} alt={artifact.label} /></span><strong>{artifact.label}</strong><small>分页 SVG · 下载或新窗口查看</small></a>)}</div></details><div className="download-stack">{artifacts.filter((item) => item.kind === "score_svg_long").map((artifact) => <a className="download-line" key={`${artifact.artifact_id}-download`} href={artifact.url || "#"}>↓ 下载长图 SVG · {artifact.label}</a>)}{vocalMidi?.url && <a className="download-line" href={vocalMidi.url}>↓ 下载人声主旋律 MIDI</a>}{artifacts.filter((item) => ["jianpu_source", "lilypond_source"].includes(item.kind)).map((artifact) => <a className="download-line" key={artifact.artifact_id} href={artifact.url || "#"}>↓ {artifact.label}</a>)}</div></section>}
+      {source === "vocal" && job?.status === "completed" && <section className="vocal-result panel" aria-labelledby="vocal-heading"><div className="panel-heading"><div><p className="section-kicker">04 · GAME RESULT</p><h2 id="vocal-heading">人声主旋律已经展开</h2><p className="heading-note">GAME 只处理已分离的人声，结果保留为单一主旋律谱面。分离模型：{actualDemucsModel.label}（{actualDemucsModel.id}）。</p></div><span className="status-chip completed"><i />完成</span></div><div className="vocal-listen"><div><strong>原曲试听</strong>{originalArtifact?.url && <audio controls src={originalArtifact.url} />}</div><div><strong>已分离人声</strong>{vocalArtifact?.url && <audio controls src={vocalArtifact.url} />}</div></div><div className="score-grid">{artifacts.filter((item) => item.kind === "score_svg_long").map((artifact) => renderScoreCard(artifact, true))}</div><details className="score-pages"><summary>分页 SVG（{artifacts.filter((item) => item.kind === "score_svg").length} 页）</summary><div className="score-grid">{artifacts.filter((item) => item.kind === "score_svg").map((artifact) => renderScoreCard(artifact))}</div></details><div className="download-stack">{artifacts.filter((item) => item.kind === "score_svg_long").map((artifact) => <a className="download-line" key={`${artifact.artifact_id}-download`} href={artifact.url || "#"}>↓ 下载长图 SVG · {artifact.label}</a>)}{vocalMidi?.url && <a className="download-line" href={vocalMidi.url}>↓ 下载人声主旋律 MIDI</a>}{artifacts.filter((item) => ["jianpu_source", "lilypond_source"].includes(item.kind)).map((artifact) => <a className="download-line" key={artifact.artifact_id} href={artifact.url || "#"}>↓ {artifact.label}</a>)}</div></section>}
       {!fixtureMode && job && (job.status === "selection_ready" || job.status === "vocal_ready" || job.status === "completed") && <p className="retention-note">任务 {job.id} · 人声分离结果与生成阶段可在刷新后从本机任务目录恢复。</p>}
     </main><footer className="footer"><span>谱面工作台 / V2</span><span>{capabilities?.api?.retention_hours ? `本机保留 ${capabilities.api.retention_hours} 小时` : "LOCAL ONLY"}</span></footer>
   </div>;
