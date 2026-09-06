@@ -28,10 +28,16 @@ def test_stage_a_fixture_is_deterministic_and_covers_notation_boundaries() -> No
     assert fixture["expected"] == {
         "requires_polyphony": True,
         "requires_ties": True,
+        "requires_triplet": True,
+        "triplet_pitches": [74, 76, 78],
         "requires_meter": "6/8",
         "requires_adaptive_quantization": True,
         "minimum_score_ticks_per_quarter": 48,
+        "voice_count": 4,
     }
+    assert fixture["voice_stress"]["source"]["time_signature"] == "4/4"
+    assert fixture["voice_stress"]["source"]["duration_ticks"] == 3840
+    assert len(fixture["voice_stress"]["notes"]) == 20
     assert len({(item["start_tick"], item["midi"]) for item in fixture["notes"]}) == len(fixture["notes"])
 
 

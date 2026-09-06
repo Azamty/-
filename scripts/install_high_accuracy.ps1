@@ -1,5 +1,5 @@
 param(
-    [string]$Python310 = "E:\develop\anaconda3\envs\py310\python.exe",
+    [string]$Python310 = "",
     [string]$Python39 = "",
     [switch]$InstallMuseScore,
     [switch]$SkipBeatNet,
@@ -16,7 +16,8 @@ $museScoreVersion = "4.7.4"
 $museScoreUrl = "https://ftp.osuosl.org/pub/musescore-nightlies/windows/4x/stable/MuseScore-Studio-4.7.4.260706075-x86_64.msi"
 $museScoreSha256 = "64FE70E5CB9FFE159D047D1E88DB567BD101F60D36B0DE28FEB674716929A378"
 $museScoreRoot = Join-Path $projectRoot "tools\musescore-4.7.4"
-$museScoreInstaller = Join-Path $env:TEMP "MuseScore-Studio-4.7.4.260706075-x86_64.msi"
+$packageCache = Join-Path $projectRoot ".cache\packages"
+$museScoreInstaller = Join-Path $packageCache "MuseScore-Studio-4.7.4.260706075-x86_64.msi"
 
 function Assert-Executable([string]$Path, [string]$Label) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -55,6 +56,12 @@ if ([string]::IsNullOrWhiteSpace($Python39)) {
 }
 
 if (-not $SkipMusic21) {
+    if ([string]::IsNullOrWhiteSpace($Python310)) {
+        $Python310 = (uv python find 3.10 2>$null | Select-Object -First 1)
+    }
+    if ([string]::IsNullOrWhiteSpace($Python310)) {
+        throw "No Python 3.10 interpreter was found. Install Python 3.10 or pass -Python310 <path>."
+    }
     $notationPython = Ensure-Venv $Python310 (Join-Path $projectRoot ".venv-notation") "music21"
     & uv pip install --python $notationPython --index-url https://pypi.org/simple -r (Join-Path $projectRoot "requirements\high_accuracy_notation.txt")
     if ($LASTEXITCODE -ne 0) { throw "Failed to install music21 $music21Version (exit $LASTEXITCODE)." }
@@ -63,15 +70,25 @@ if (-not $SkipMusic21) {
 }
 
 if ($InstallMuseScore) {
-    $target = Join-Path $museScoreRoot "bin\MuseScore4.exe"
-    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+    $target = @(
+        (Join-Path $museScoreRoot "MuseScore4.exe"),
+        (Join-Path $museScoreRoot "bin\MuseScore4.exe"),
+        (Join-Path $museScoreRoot "MuseScore 4\bin\MuseScore4.exe")
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $target) {
+        New-Item -ItemType Directory -Path $packageCache -Force | Out-Null
         if (-not (Test-Path -LiteralPath $museScoreInstaller -PathType Leaf)) {
             Write-Output "Downloading fixed MuseScore Studio $museScoreVersion from $museScoreUrl"
+            $partial = "$museScoreInstaller.part"
+            if (Test-Path -LiteralPath $partial -PathType Leaf) {
+                Remove-Item -LiteralPath $partial -Force
+            }
             try {
-                Start-BitsTransfer -Source $museScoreUrl -Destination $museScoreInstaller -ErrorAction Stop
+                Start-BitsTransfer -Source $museScoreUrl -Destination $partial -ErrorAction Stop
             } catch {
                 throw "MuseScore download failed. Use the official URL with a browser or retry with BITS: $museScoreUrl`n$($_.Exception.Message)"
             }
+            Move-Item -LiteralPath $partial -Destination $museScoreInstaller -Force
         }
         $length = (Get-Item -LiteralPath $museScoreInstaller).Length
         if ($length -lt 100000000) {

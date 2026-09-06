@@ -35,13 +35,51 @@
     {"start_tick": 1200, "duration_tick": 240, "midi": 71, "voice": 1},
     {"start_tick": 1440, "duration_tick": 1440, "midi": 57, "voice": 2},
     {"start_tick": 1440, "duration_tick": 480, "midi": 66, "voice": 1},
-    {"start_tick": 1920, "duration_tick": 960, "midi": 69, "voice": 1}
+    {"start_tick": 1920, "duration_tick": 960, "midi": 69, "voice": 1},
+    {"start_tick": 2400, "duration_tick": 160, "midi": 74, "voice": 3},
+    {"start_tick": 2560, "duration_tick": 160, "midi": 76, "voice": 3},
+    {"start_tick": 2720, "duration_tick": 160, "midi": 78, "voice": 3}
   ],
   "expected": {
     "requires_polyphony": true,
     "requires_ties": true,
+    "requires_triplet": true,
+    "triplet_pitches": [74, 76, 78],
     "requires_meter": "6/8",
     "requires_adaptive_quantization": true,
-    "minimum_score_ticks_per_quarter": 48
+    "minimum_score_ticks_per_quarter": 48,
+    "voice_count": 4
+  },
+  "voice_stress": {
+    "source": {
+      "kind": "synthetic-midi",
+      "title": "Stage A four voice fixture",
+      "ticks_per_quarter": 480,
+      "tempo_bpm": 96.0,
+      "time_signature": "4/4",
+      "duration_ticks": 3840
+    },
+    "notes": [
+      {"start_tick": 0, "duration_tick": 1920, "midi": 60, "voice": 1},
+      {"start_tick": 1920, "duration_tick": 1920, "midi": 61, "voice": 1},
+      {"start_tick": 0, "duration_tick": 960, "midi": 64, "voice": 2},
+      {"start_tick": 960, "duration_tick": 960, "midi": 65, "voice": 2},
+      {"start_tick": 1920, "duration_tick": 960, "midi": 66, "voice": 2},
+      {"start_tick": 2880, "duration_tick": 960, "midi": 67, "voice": 2},
+      {"start_tick": 0, "duration_tick": 640, "midi": 67, "voice": 3},
+      {"start_tick": 640, "duration_tick": 640, "midi": 68, "voice": 3},
+      {"start_tick": 1280, "duration_tick": 640, "midi": 69, "voice": 3},
+      {"start_tick": 1920, "duration_tick": 640, "midi": 70, "voice": 3},
+      {"start_tick": 2560, "duration_tick": 640, "midi": 71, "voice": 3},
+      {"start_tick": 3200, "duration_tick": 640, "midi": 72, "voice": 3},
+      {"start_tick": 0, "duration_tick": 480, "midi": 72, "voice": 4},
+      {"start_tick": 480, "duration_tick": 480, "midi": 73, "voice": 4},
+      {"start_tick": 960, "duration_tick": 480, "midi": 74, "voice": 4},
+      {"start_tick": 1440, "duration_tick": 480, "midi": 75, "voice": 4},
+      {"start_tick": 1920, "duration_tick": 480, "midi": 76, "voice": 4},
+      {"start_tick": 2400, "duration_tick": 480, "midi": 77, "voice": 4},
+      {"start_tick": 2880, "duration_tick": 480, "midi": 78, "voice": 4},
+      {"start_tick": 3360, "duration_tick": 480, "midi": 79, "voice": 4}
+    ]
   }
 }
