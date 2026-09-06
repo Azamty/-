@@ -44,6 +44,14 @@ def main() -> int:
         raise RuntimeError(f"BeatNet smoke used an unexpected decoder: {grid.get('mode')}/{grid.get('inference')}")
     if grid.get("beatnet", {}).get("version") != "1.1.3":
         raise RuntimeError(f"BeatNet version contract mismatch: {grid.get('beatnet')}")
+    meter = grid.get("time_signature", {})
+    if meter.get("selected") != "4/4":
+        if float(meter.get("confidence", 1.0)) >= 0.65 or not meter.get("warning"):
+            raise RuntimeError(
+                "synthetic 4/4 accent was not independently recovered: "
+                f"selected={meter.get('selected')} confidence={meter.get('confidence')} "
+                f"warning={meter.get('warning')!r}"
+            )
     print(
         json.dumps(
             {

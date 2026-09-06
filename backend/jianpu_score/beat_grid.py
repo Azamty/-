@@ -120,7 +120,7 @@ def infer_time_signature(
     observations: Sequence[BeatObservation],
     *,
     meter_hint: str | None = None,
-    accent_times: Sequence[float] | None = None,
+    independent_accent_times: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Infer meter candidates from bar resets and explicit compound accents.
 
@@ -148,7 +148,12 @@ def infer_time_signature(
     intervals = _intervals(times)
     stability = max(0.0, 1.0 - min(1.0, _coefficient_of_variation(intervals)))
     reset_distances = [right - left for left, right in zip(downbeats, downbeats[1:])]
-    accent_set = tuple(sorted(_finite_float(value, label="accent time") for value in (accent_times or ())))
+    # BeatNet's own downbeat labels are not independent audio evidence.  The
+    # caller must explicitly provide an independent accent stream before a
+    # meter can receive confidence above the warning threshold.
+    accent_set = tuple(
+        sorted(_finite_float(value, label="independent accent time") for value in (independent_accent_times or ()))
+    )
 
     scores: dict[str, float] = {}
     compound_accent_evidence = False
@@ -169,11 +174,13 @@ def infer_time_signature(
             # compound meter.  Without a secondary accent this is still only
             # a candidate, not evidence of a direct 6/8 prediction.
             midpoint_accents = 0
-            for index in downbeats[:-1]:
-                midpoint = times[index] + (times[min(index + 3, len(times) - 1)] - times[index]) / 2.0
+            for downbeat_index, index in enumerate(downbeats[:-1]):
+                next_downbeat = downbeats[downbeat_index + 1]
+                midpoint = times[index] + (times[next_downbeat] - times[index]) / 2.0
                 if any(abs(accent - midpoint) <= 0.12 for accent in accent_set):
                     midpoint_accents += 1
-            if midpoint_accents:
+            required_accents = max(2, math.ceil(0.6 * max(1, len(downbeats) - 1)))
+            if midpoint_accents >= required_accents:
                 compound_accent_evidence = True
                 score = min(1.0, score + 0.45 * midpoint_accents / max(1, len(downbeats) - 1))
                 if "3/4" in scores:
@@ -182,13 +189,21 @@ def infer_time_signature(
 
     ranked = sorted(scores.items(), key=lambda item: (-item[1], TIME_SIGNATURE_CANDIDATES.index(item[0])))
     selected, top_score = ranked[0]
+    meter_warning: str | None = None
+    if selected == "6/8" and not compound_accent_evidence:
+        # BeatNet 1.1.3 cannot natively distinguish a compound 6/8 bar from
+        # other beat-number interpretations.  Keep 6/8 in candidates but do
+        # not silently select it without independent compound-accent support.
+        selected = "4/4"
+        top_score = scores[selected]
+        meter_warning = "BeatNet 未获得跨多数小节的独立复合拍重音证据，6/8 仅保留为候选"
     if compound_accent_evidence and "6/8" in scores and "3/4" in scores and scores["6/8"] >= scores["3/4"]:
         selected, top_score = "6/8", scores["6/8"]
     tied = [value for value, score in ranked if abs(score - top_score) < 0.08]
     if selected == "6/8" and compound_accent_evidence:
         tied = ["6/8"]
     confidence = top_score
-    warning: str | None = None
+    warning: str | None = meter_warning
     compound_ambiguous = (
         selected == "3/4"
         and reset_distances
@@ -203,6 +218,10 @@ def infer_time_signature(
         confidence = min(confidence, 0.55)
         if warning is None:
             warning = "BeatNet 的重拍证据无法区分 " + "、".join(tied) + "；请确认拍号"
+    if not accent_set:
+        confidence = min(confidence, 0.55)
+        if warning is None:
+            warning = "未提供独立音频重音证据；BeatNet 拍号仅作候选，请确认拍号"
     elif confidence < CONFIDENCE_WARNING_THRESHOLD:
         warning = f"拍号识别置信度较低（{confidence:.2f}），请确认 {selected}"
     return {
@@ -259,25 +278,50 @@ def _score_candidate(
     onsets: tuple[tuple[str, tuple[float, ...]], ...],
     *,
     beats_per_bar: int,
-) -> tuple[float, float, float]:
+    factor: float,
+    strong_octave_evidence: bool,
+) -> tuple[float, float, float, float, float]:
     if not onsets:
-        return 0.0, 0.0, 0.0
+        prior = 0.0 if factor == 1.0 else (0.18 if strong_octave_evidence else 0.6)
+        return prior, 0.0, 0.0, 1.0, 1.0
     intervals = _intervals(beat_times)
     base_interval = float(median(intervals))
+    dedupe_tolerance = max(0.035, base_interval * 0.08)
+    deduped = tuple(
+        (source, _dedupe_onsets(values, tolerance=dedupe_tolerance))
+        for source, values in onsets
+    )
+    support_tolerance = max(0.06, base_interval * 0.16)
     weighted_error = 0.0
     total_weight = 0.0
-    for source, values in onsets:
+    supported_weight = 0.0
+    for source, values in deduped:
         weight = ONSET_WEIGHTS.get(source, 1.0)
         for onset in values:
-            weighted_error += weight * (_nearest_distance(onset, beat_times) / max(base_interval, 1e-9))
+            distance = _nearest_distance(onset, beat_times)
+            weighted_error += weight * (distance / max(base_interval, 1e-9))
+            if distance <= support_tolerance:
+                supported_weight += weight
             total_weight += weight
     onset_error = weighted_error / total_weight if total_weight else 0.0
+
+    combined = [value for _source, values in deduped for value in values]
+    if combined:
+        lower = min(combined) - support_tolerance
+        upper = max(combined) + support_tolerance
+        candidate_points = [value for value in beat_times if lower <= value <= upper]
+    else:
+        candidate_points = []
+    supported_points = sum(
+        _nearest_distance(point, combined) <= support_tolerance for point in candidate_points
+    )
+    precision = supported_points / len(candidate_points) if candidate_points else 1.0
+    coverage = supported_weight / total_weight if total_weight else 1.0
 
     # Compare the amount of onset error in each bar.  This favors a candidate
     # whose alignment is stable across the track instead of one that wins only
     # because of a dense opening.
     bar_errors: list[float] = []
-    combined = [value for _source, values in onsets for value in values]
     for start in range(0, len(beat_times) - 1, beats_per_bar):
         end = min(len(beat_times), start + beats_per_bar)
         points = beat_times[start:end]
@@ -287,8 +331,26 @@ def _score_candidate(
         if bar_onsets:
             bar_errors.append(sum(_nearest_distance(value, points) / max(base_interval, 1e-9) for value in bar_onsets) / len(bar_onsets))
     stability = _coefficient_of_variation([max(0.0, 1.0 - error) for error in bar_errors]) if len(bar_errors) > 1 else 0.0
-    score = onset_error + 0.25 * stability
-    return score, onset_error, stability
+    prior = 0.0 if factor == 1.0 else (0.18 if strong_octave_evidence else 0.6)
+    # A denser candidate must explain its additional grid points.  The prior
+    # blocks full-track eighth-note subdivisions from flipping to double time;
+    # drums/bass evidence is allowed to overcome it when it supports the
+    # octave change consistently.
+    score = onset_error + 0.5 * (1.0 - precision) + 0.4 * (1.0 - coverage) + 0.25 * stability + prior
+    return score, onset_error, stability, precision, coverage
+
+
+def _dedupe_onsets(values: Sequence[float], *, tolerance: float) -> tuple[float, ...]:
+    """Collapse chord/onset clusters so one chord cannot dominate a score."""
+
+    ordered = sorted(values)
+    if not ordered:
+        return ()
+    result = [ordered[0]]
+    for value in ordered[1:]:
+        if value - result[-1] > tolerance:
+            result.append(value)
+    return tuple(result)
 
 
 def choose_tempo_candidate(
@@ -304,12 +366,19 @@ def choose_tempo_candidate(
     normalized_meter = normalize_time_signature(time_signature)
     beats_per_bar = METER_BEAT_COUNTS[normalized_meter]
     evidence = _onset_evidence(source_onsets)
+    strong_octave_evidence = any(source in {"drums", "bass"} and values for source, values in evidence)
     intervals = _intervals(source)
     detected_bpm = 60.0 / float(median(intervals))
     candidates: list[dict[str, Any]] = []
     for factor in TEMPO_FACTORS:
         candidate_grid = _candidate_times(source, factor)
-        score, onset_error, stability = _score_candidate(candidate_grid, evidence, beats_per_bar=beats_per_bar)
+        score, onset_error, stability, precision, coverage = _score_candidate(
+            candidate_grid,
+            evidence,
+            beats_per_bar=beats_per_bar,
+            factor=factor,
+            strong_octave_evidence=strong_octave_evidence,
+        )
         label = "half" if factor == 0.5 else "original" if factor == 1.0 else "double"
         candidates.append(
             {
@@ -319,6 +388,9 @@ def choose_tempo_candidate(
                 "score": round(score, 6),
                 "onset_error": round(onset_error, 6),
                 "bar_stability": round(stability, 6),
+                "grid_precision": round(precision, 6),
+                "onset_coverage": round(coverage, 6),
+                "prior_penalty": round(0.0 if factor == 1.0 else (0.18 if strong_octave_evidence else 0.6), 6),
                 "selected": False,
                 "beat_times": list(candidate_grid),
             }
@@ -337,11 +409,16 @@ def choose_tempo_candidate(
     else:
         selected_bpm = float(selected["bpm"])
         manual_scale = 1.0
-        selection_reason = (
-            "无 MuScriptor/全轨 onset 证据，保留原速 BeatNet 网格"
-            if not evidence
-            else f"按鼓/贝斯/全轨 onset 对齐误差与小节稳定性选择 {selected['label']} 速度"
-        )
+        if not evidence:
+            selection_reason = "无 MuScriptor/全轨 onset 证据，保留原速 BeatNet 网格"
+        elif not strong_octave_evidence:
+            selection_reason = (
+                "仅有全轨/非鼓贝斯 onset；候选拍点精确率与原速先验阻止仅凭细分翻倍"
+            )
+        else:
+            selection_reason = (
+                f"按鼓/贝斯/全轨 onset 对齐误差、候选精确率与小节稳定性选择 {selected['label']} 速度"
+            )
     for item in candidates:
         item["selected"] = item is selected
         item["rationale"] = (
@@ -402,20 +479,16 @@ def build_beat_grid(
     manual_bpm: float | None = None,
     manual_time_signature: str | None = None,
     source_onsets: Mapping[str, Sequence[float]] | Sequence[float] | None = None,
+    independent_accent_times: Sequence[float] | None = None,
     engine: str = "beatnet",
 ) -> dict[str, Any]:
     """Build the durable ``beat_grid.json`` representation."""
 
     normalized = normalize_beat_observations(observations)
-    accent_times: Sequence[float] | None = None
-    if isinstance(source_onsets, Mapping):
-        accent_times = source_onsets.get("drums") or source_onsets.get("bass") or source_onsets.get("full_track")
-    elif source_onsets is not None:
-        accent_times = source_onsets
     meter = infer_time_signature(
         normalized,
         meter_hint=manual_time_signature or meter_hint,
-        accent_times=accent_times,
+        independent_accent_times=independent_accent_times,
     )
     tempo = choose_tempo_candidate(
         tuple(item.time_sec for item in normalized),
@@ -426,14 +499,17 @@ def build_beat_grid(
     selected_factor = float(tempo["selected_factor"])
     selected_times = tuple(float(value) for value in next(item for item in tempo["candidates"] if item["selected"])["beat_times"])
     raw_downbeats = [item.downbeat or item.beat_number == 1 for item in normalized]
+    raw_times = tuple(item.time_sec for item in normalized)
     if selected_factor == 1.0:
         selected_downbeats = raw_downbeats
         selected_numbers = [item.beat_number for item in normalized]
     elif selected_factor == 0.5:
-        selected_downbeats = raw_downbeats[::2]
-        if len(selected_downbeats) < len(selected_times):
-            selected_downbeats.append(raw_downbeats[-1])
-        selected_numbers = [item.beat_number for item in normalized[::2]]
+        selected_downbeats = [False] * len(selected_times)
+        selected_numbers = []
+        for time_sec in selected_times:
+            nearest_index = min(range(len(raw_times)), key=lambda index: abs(raw_times[index] - time_sec))
+            selected_downbeats[len(selected_numbers)] = raw_downbeats[nearest_index]
+            selected_numbers.append(normalized[nearest_index].beat_number)
     else:
         selected_downbeats = [flag for flag in raw_downbeats for _ in (0, 1)]
         selected_downbeats = selected_downbeats[: len(selected_times)]
@@ -448,6 +524,15 @@ def build_beat_grid(
     if not downbeat_starts or downbeat_starts[0] != 0:
         downbeat_starts = [0, *downbeat_starts]
     downbeat_starts = sorted(set(downbeat_starts))
+    first_downbeat_index = next(
+        (index for index, value in enumerate(selected_downbeats) if value),
+        None,
+    )
+    first_downbeat_sec = (
+        selected_times[first_downbeat_index]
+        if first_downbeat_index is not None
+        else selected_times[0]
+    )
     duration = None if duration_sec is None else _finite_float(duration_sec, label="duration_sec")
     warnings = [str(meter["warning"])] if meter.get("warning") else []
     if not source_onsets:
@@ -489,6 +574,21 @@ def build_beat_grid(
             "seconds_to_beat": "piecewise_linear_with_linear_extrapolation",
             "manual_bpm_scale": tempo["manual_scale"],
             "first_beat_sec": selected_times[0],
+            "score_origin": {
+                "strategy": "first_downbeat" if first_downbeat_index is not None else "first_beat_fallback",
+                "downbeat_index": first_downbeat_index,
+                "downbeat_sec": first_downbeat_sec,
+                "pickup_candidate": bool(first_downbeat_index and first_downbeat_index > 0),
+                "downbeat_score_beat": (
+                    0.0 if first_downbeat_index is not None and not (first_downbeat_index and first_downbeat_index > 0) else None
+                ),
+                "pickup_beats": 0.0,
+                "origin_shift_beats": (
+                    -first_downbeat_index * float(tempo["manual_scale"])
+                    if first_downbeat_index is not None
+                    else 0.0
+                ),
+            },
         },
         "warnings": list(dict.fromkeys(warnings)),
     }

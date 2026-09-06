@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_right
-from dataclasses import dataclass
-from typing import Iterable
+from dataclasses import dataclass, field
+from typing import Any, Iterable
 
 from .domain import (
     MusicAnalysis,
@@ -118,6 +118,7 @@ class _BeatMapper:
     fixed: bool
     shift_beats: float = 0.0
     beat_scale: float = 1.0
+    score_origin: dict[str, Any] = field(default_factory=dict)
 
     def seconds_to_beat(self, seconds: float) -> float:
         if self.fixed or len(self.beat_times) < 2:
@@ -147,13 +148,122 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
     # when the user overrides BPM.
     fixed = (analysis.metadata.get("beat_source") == "manual_bpm" and not beat_grid) or len(beat_times) < 2
     if fixed:
-        return _BeatMapper(analysis.bpm, beat_times, True)
+        return _BeatMapper(
+            analysis.bpm,
+            beat_times,
+            True,
+            score_origin={
+                "strategy": "legacy_fixed_bpm",
+                "downbeat_status": "undetermined",
+                "pickup_candidate": False,
+                "pickup_beats": 0.0,
+            },
+        )
     unshifted = _BeatMapper(analysis.bpm, beat_times, False, beat_scale=beat_scale)
-    # Preserve the original audio zero on the non-negative Score timeline.
-    # Beat detectors commonly return their first beat after the audio starts;
-    # translating that map keeps an onset at t=0 instead of clamping it away.
-    shift_beats = -unshifted.seconds_to_beat(0.0)
-    return _BeatMapper(analysis.bpm, beat_times, False, shift_beats=shift_beats, beat_scale=beat_scale)
+
+    if not isinstance(beat_grid, dict) or not beat_grid:
+        # Keep the legacy non-BeatNet contract for hand-built analyses.  The
+        # production BeatNet path always persists beat_grid.json and therefore
+        # uses the explicit downbeat origin below.
+        shift_beats = -unshifted.seconds_to_beat(0.0)
+        return _BeatMapper(
+            analysis.bpm,
+            beat_times,
+            False,
+            shift_beats=shift_beats,
+            beat_scale=beat_scale,
+            score_origin={
+                "strategy": "legacy_audio_zero",
+                "downbeat_status": "undetermined",
+                "pickup_candidate": False,
+                "pickup_beats": 0.0,
+                "origin_shift_beats": shift_beats,
+            },
+        )
+
+    # A BeatNet grid owns the phase of the score.  The old implementation
+    # translated audio zero to Score zero, which silently moved a detected
+    # downbeat into the middle of a measure whenever the first returned beat
+    # was not the downbeat.  Align the first detected downbeat to a measure
+    # boundary and persist the decision so MusicXML normalization can handle a
+    # possible pickup explicitly later.
+    origin = mapping.get("score_origin") if isinstance(mapping, dict) else None
+    grid_beats = beat_grid.get("beats", []) if isinstance(beat_grid, dict) else []
+    first_downbeat_index: int | None = None
+    first_downbeat_sec: float | None = None
+    if isinstance(origin, dict) and origin.get("downbeat_index") is not None:
+        try:
+            candidate_index = int(origin["downbeat_index"])
+        except (TypeError, ValueError):
+            candidate_index = -1
+        if 0 <= candidate_index < len(beat_times):
+            first_downbeat_index = candidate_index
+            first_downbeat_sec = float(beat_times[candidate_index])
+    if first_downbeat_index is None and isinstance(grid_beats, list):
+        for index, beat in enumerate(grid_beats):
+            if isinstance(beat, dict) and bool(beat.get("downbeat")) and index < len(beat_times):
+                first_downbeat_index = index
+                first_downbeat_sec = float(beat_times[index])
+                break
+
+    if first_downbeat_index is None:
+        return _BeatMapper(
+            analysis.bpm,
+            beat_times,
+            False,
+            shift_beats=0.0,
+            beat_scale=beat_scale,
+            score_origin={
+                "strategy": "first_beat_fallback",
+                "downbeat_status": "undetermined",
+                "downbeat_index": None,
+                "downbeat_sec": None,
+                "downbeat_score_beat": None,
+                "pickup_candidate": False,
+                "pickup_beats": 0.0,
+            },
+        )
+
+    downbeat_raw_beat = first_downbeat_index * beat_scale
+    earliest_event_sec = min((event.start_sec for event in events), default=0.0)
+    has_pre_downbeat_note = (
+        first_downbeat_sec is not None and earliest_event_sec < first_downbeat_sec - 1e-6
+    )
+    numerator, denominator = _time_signature_values(analysis.time_signature)
+    bar_beats = numerator * 4.0 / denominator
+    if has_pre_downbeat_note:
+        # Keep a leading note on the non-negative score timeline while making
+        # the detected downbeat land on the next complete measure boundary.
+        target_downbeat_beat = max(bar_beats, math.ceil((downbeat_raw_beat + 1e-9) / bar_beats) * bar_beats)
+        strategy = "first_downbeat_with_pickup_candidate"
+        raw_pre_downbeat_beat = unshifted.seconds_to_beat(earliest_event_sec)
+        pickup_span = max(0.0, downbeat_raw_beat - raw_pre_downbeat_beat)
+    else:
+        target_downbeat_beat = 0.0
+        strategy = "first_downbeat"
+        raw_pre_downbeat_beat = None
+        pickup_span = 0.0
+    shift_beats = target_downbeat_beat - downbeat_raw_beat
+    score_origin = {
+        "strategy": strategy,
+        "downbeat_status": "aligned",
+        "downbeat_index": first_downbeat_index,
+        "downbeat_sec": first_downbeat_sec,
+        "downbeat_score_beat": target_downbeat_beat,
+        "downbeat_bar_beats": bar_beats,
+        "pickup_candidate": has_pre_downbeat_note,
+        "pickup_beats": pickup_span if has_pre_downbeat_note else 0.0,
+        "pre_downbeat_note_start_beat": raw_pre_downbeat_beat,
+        "origin_shift_beats": shift_beats,
+    }
+    return _BeatMapper(
+        analysis.bpm,
+        beat_times,
+        False,
+        shift_beats=shift_beats,
+        beat_scale=beat_scale,
+        score_origin=score_origin,
+    )
 
 
 def _straight_tick(value: float, quarter_ticks: int) -> int:
@@ -335,8 +445,9 @@ def quantize_events(
         "beat_scale": mapper.beat_scale,
         "beat_grid": analysis.metadata.get("beat_grid"),
         "beat_offset_sec": analysis.beat_times[0] if analysis.beat_times else 0.0,
-        "pickup_beats": max(0.0, -mapper.seconds_to_beat(0.0)),
-        "downbeat_status": "undetermined",
+        "score_origin": mapper.score_origin,
+        "pickup_beats": float(mapper.score_origin.get("pickup_beats", max(0.0, -mapper.seconds_to_beat(0.0)))),
+        "downbeat_status": mapper.score_origin.get("downbeat_status", "undetermined"),
         "triplet_group_count": triplet_group_count,
         "source_stems": sorted({event.stem_id for event in selected if event.stem_id}),
     }

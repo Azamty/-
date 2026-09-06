@@ -53,6 +53,31 @@ def test_tempo_candidates_use_onsets_and_keep_half_original_double_evidence() ->
     assert any(item["selected"] for item in result["candidates"])
 
 
+def test_dense_full_track_eighth_notes_do_not_force_double_tempo() -> None:
+    result = choose_tempo_candidate(
+        [index * 0.5 for index in range(17)],
+        source_onsets={"full_track": [index * 0.25 for index in range(33)]},
+    )
+    assert result["selected_factor"] == 1.0
+    assert "细分翻倍" in result["selection_reason"]
+    candidates = {item["label"]: item for item in result["candidates"]}
+    assert candidates["double"]["prior_penalty"] > 0
+    assert candidates["double"]["grid_precision"] == pytest.approx(1.0)
+    assert candidates["double"]["score"] > candidates["original"]["score"]
+
+
+def test_sparse_drum_and_bass_evidence_can_select_half_tempo() -> None:
+    result = choose_tempo_candidate(
+        [index * 0.5 for index in range(17)],
+        source_onsets={
+            "drums": [index * 1.0 for index in range(9)],
+            "bass": [index * 1.0 for index in range(9)],
+        },
+    )
+    assert result["selected_factor"] == 0.5
+    assert "鼓/贝斯" in result["selection_reason"]
+
+
 def test_manual_bpm_scales_local_beat_shape_without_discarding_phase() -> None:
     grid = build_beat_grid(
         _observations(9, step=0.5),
@@ -83,9 +108,74 @@ def test_quantizer_consumes_manual_scale_and_retains_beatnet_phase() -> None:
     assert score.metadata["beat_offset_sec"] == pytest.approx(0.25)
 
 
+def test_beatnet_score_origin_aligns_first_downbeat_to_measure_boundary() -> None:
+    beat_times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+    beat_grid = {
+        "beats": [
+            {"index": index, "time_sec": time, "downbeat": index == 1}
+            for index, time in enumerate(beat_times)
+        ],
+        "mapping": {
+            "beat_times": beat_times,
+            "manual_bpm_scale": 1.0,
+            "score_origin": {"downbeat_index": 1, "downbeat_sec": 0.5},
+        },
+    }
+    analysis = MusicAnalysis(
+        sample_rate=22050,
+        duration_sec=2.5,
+        bpm=120,
+        time_signature="4/4",
+        beat_times=beat_times,
+        metadata={"beat_source": "beatnet", "beat_grid": beat_grid},
+    )
+    score = quantize_events([NoteEvent(start_sec=0.5, end_sec=0.75, midi=60)], analysis, mode="monophonic")
+    origin = score.metadata["score_origin"]
+    assert origin["strategy"] == "first_downbeat"
+    assert origin["downbeat_score_beat"] == pytest.approx(0.0)
+    assert origin["origin_shift_beats"] == pytest.approx(-1.0)
+    assert score.metadata["downbeat_status"] == "aligned"
+    note = next(event for event in score.voices[0].events if event.midi == 60)
+    assert note.start_tick == 0
+
+
+def test_beatnet_score_origin_records_pre_downbeat_pickup_candidate() -> None:
+    beat_times = [0.0, 0.5, 1.0, 1.5, 2.0]
+    beat_grid = {
+        "beats": [
+            {"index": index, "time_sec": time, "downbeat": index == 1}
+            for index, time in enumerate(beat_times)
+        ],
+        "mapping": {
+            "beat_times": beat_times,
+            "manual_bpm_scale": 1.0,
+            "score_origin": {"downbeat_index": 1, "downbeat_sec": 0.5},
+        },
+    }
+    analysis = MusicAnalysis(
+        sample_rate=22050,
+        duration_sec=2.0,
+        bpm=120,
+        time_signature="4/4",
+        beat_times=beat_times,
+        metadata={"beat_source": "beatnet", "beat_grid": beat_grid},
+    )
+    score = quantize_events(
+        [NoteEvent(start_sec=0.1, end_sec=0.25, midi=60), NoteEvent(start_sec=0.5, end_sec=0.75, midi=62)],
+        analysis,
+        mode="polyphonic",
+    )
+    origin = score.metadata["score_origin"]
+    assert origin["strategy"] == "first_downbeat_with_pickup_candidate"
+    assert origin["pickup_candidate"] is True
+    assert origin["downbeat_score_beat"] == pytest.approx(4.0)
+    assert origin["downbeat_score_beat"] % origin["downbeat_bar_beats"] == pytest.approx(0.0)
+    assert score.metadata["downbeat_status"] == "aligned"
+
+
 @pytest.mark.parametrize(
     ("beats_per_bar", "expected"),
-    [(2, "2/4"), (3, "3/4"), (4, "4/4"), (6, "6/8")],
+    [(2, "2/4"), (3, "3/4"), (4, "4/4")],
 )
 def test_meter_candidates_cover_supported_signatures(beats_per_bar: int, expected: str) -> None:
     observations = normalize_beat_observations(_observations(beats_per_bar * 3, beats_per_bar=beats_per_bar))
@@ -93,8 +183,7 @@ def test_meter_candidates_cover_supported_signatures(beats_per_bar: int, expecte
     assert result["selected"] == expected
     if expected == "3/4":
         assert result["confidence"] < 0.65
-    else:
-        assert result["confidence"] >= 0.65
+    assert result["confidence"] < 0.65
 
 
 def test_six_eighths_without_compound_accent_remains_explicitly_ambiguous() -> None:
@@ -109,7 +198,27 @@ def test_compound_accent_can_select_six_eighths_from_three_beat_dbn_output() -> 
     observations = _observations(9, beats_per_bar=3)
     result = infer_time_signature(
         normalize_beat_observations(observations),
-        accent_times=[0.75, 2.25],
+        independent_accent_times=[0.75, 2.25],
+    )
+    assert result["selected"] == "6/8"
+    assert result["confidence"] >= 0.65
+    assert result["warning"] is None
+
+
+def test_six_eighths_candidate_needs_independent_compound_evidence() -> None:
+    observations = normalize_beat_observations(_observations(18, step=0.5, beats_per_bar=6))
+    result = infer_time_signature(observations)
+    assert result["selected"] == "4/4"
+    assert result["confidence"] < 0.65
+    assert result["warning"]
+    assert any(item["value"] == "6/8" for item in result["candidates"])
+
+
+def test_six_eighths_can_be_selected_when_compound_accents_are_stable() -> None:
+    observations = normalize_beat_observations(_observations(18, step=0.5, beats_per_bar=6))
+    result = infer_time_signature(
+        observations,
+        independent_accent_times=[1.5, 4.5, 7.5, 10.5],
     )
     assert result["selected"] == "6/8"
     assert result["confidence"] >= 0.65
