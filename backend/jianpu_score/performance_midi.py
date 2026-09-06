@@ -10,6 +10,7 @@ ticks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -45,6 +46,7 @@ class PerformanceTrack:
     program: int = 0
     is_drum: bool = False
     title: str | None = None
+    track_id: str | None = None
 
 
 def _finite_positive(value: float, *, label: str) -> float:
@@ -68,9 +70,21 @@ def _bounded_velocity(value: int | None) -> int:
 
 
 def _midi_key(value: str) -> str:
-    """Validate a jianpu key and return the mido-compatible spelling."""
+    """Validate a jianpu key and return the mido-compatible spelling.
 
-    return normalize_key(value)
+    mido follows the compact MIDI key-signature vocabulary and does not accept
+    the enharmonic minor spellings ``Dbm`` and ``Gbm`` even though they are
+    valid application keys.  Keep the analysis spelling in JSON and emit an
+    equivalent key signature for MIDI consumers.
+    """
+
+    normalized = normalize_key(value)
+    return {"Dbm": "C#m", "Gbm": "F#m"}.get(normalized, normalized)
+
+
+def _default_track_id(instrument_group: str, program: int, is_drum: bool) -> str:
+    identity = f"{instrument_group}|{program}|{int(is_drum)}".encode("utf-8")
+    return "track-" + hashlib.sha1(identity).hexdigest()[:12]
 
 
 def _midi_denominator(denominator: int) -> int:
@@ -274,6 +288,7 @@ def build_performance_midi(
     program: int = 0,
     is_drum: bool = False,
     title: str = "Performance",
+    track_id: str | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Build one independent 480 PPQ performance MIDI and audit metadata."""
 
@@ -282,6 +297,7 @@ def build_performance_midi(
         raise ValueError("performance MIDI requires at least one note")
     group = str(instrument_group).strip() or "unknown"
     bounded_program = _bounded_program(program)
+    resolved_track_id = str(track_id).strip() if track_id is not None and str(track_id).strip() else _default_track_id(group, bounded_program, is_drum)
     mapper = _build_beat_mapper(analysis, list(materialized))
     mapped = _absolute_note_ticks(materialized, mapper)
     tempo_points = _tempo_points(mapper)
@@ -306,6 +322,7 @@ def build_performance_midi(
         "ticks_per_quarter": PERFORMANCE_TICKS_PER_QUARTER,
         "title": track_title,
         "instrument_group": group,
+        "track_id": resolved_track_id,
         "program": bounded_program,
         "is_drum": bool(is_drum),
         "channel": channel + 1,
@@ -313,6 +330,7 @@ def build_performance_midi(
         "note_count": len(mapped),
         "time_signature": analysis.time_signature,
         "key": analysis.key,
+        "emitted_key": _midi_key(analysis.key),
         "tempo_points": [
             {"tick": tick, "bpm": round(bpm, 9), "microseconds_per_beat": tempo}
             for tick, tempo, bpm in tempo_points
@@ -359,6 +377,7 @@ def write_performance_midi(
     title: str = "Performance",
     metadata_destination: str | Path | None = None,
     overwrite: bool = False,
+    track_id: str | None = None,
 ) -> PerformanceMidiArtifact:
     """Write ``*.performance.mid`` and its adjacent audit JSON.
 
@@ -378,6 +397,7 @@ def write_performance_midi(
         program=program,
         is_drum=is_drum,
         title=title,
+        track_id=track_id,
     )
     path.write_bytes(midi_bytes)
     metadata_path = (
@@ -406,18 +426,27 @@ def write_performance_midi_bundle(
     destination = Path(output_dir).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
     result: list[PerformanceMidiArtifact] = []
+    used_stems: dict[str, int] = {}
     for track in tracks:
         safe_group = "".join(char if char.isalnum() or char in "-_" else "_" for char in track.instrument_group).strip("_") or "unknown"
+        bounded_program = _bounded_program(track.program)
+        resolved_track_id = str(track.track_id).strip() if track.track_id is not None and str(track.track_id).strip() else _default_track_id(track.instrument_group, bounded_program, track.is_drum)
+        safe_track_id = "".join(char if char.isalnum() or char in "-_" else "_" for char in resolved_track_id).strip("_") or "track"
+        base_stem = f"{safe_group}.p{bounded_program}.d{int(track.is_drum)}.{safe_track_id}.performance"
+        occurrence = used_stems.get(base_stem, 0) + 1
+        used_stems[base_stem] = occurrence
+        stem = base_stem if occurrence == 1 else f"{base_stem}.{occurrence}"
         result.append(
             write_performance_midi(
                 track.notes,
                 analysis,
-                destination / f"{safe_group}.performance.mid",
+                destination / f"{stem}.mid",
                 instrument_group=track.instrument_group,
-                program=track.program,
+                program=bounded_program,
                 is_drum=track.is_drum,
                 title=track.title or title,
                 overwrite=overwrite,
+                track_id=resolved_track_id,
             )
         )
     return result

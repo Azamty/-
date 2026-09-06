@@ -6,7 +6,7 @@ import json
 import mido
 import pytest
 
-from backend.jianpu_score.domain import MusicAnalysis, NoteEvent
+from backend.jianpu_score.domain import VALID_KEYS, MusicAnalysis, NoteEvent
 from backend.jianpu_score.performance_midi import (
     PERFORMANCE_TICKS_PER_QUARTER,
     PerformanceTrack,
@@ -207,6 +207,22 @@ def test_program_key_meter_and_drum_channel_are_written() -> None:
     assert metadata["drum_jianpu_policy"] == "midi_only"
 
 
+@pytest.mark.parametrize("key", sorted(VALID_KEYS))
+def test_all_application_keys_emit_a_mido_compatible_key_signature(key: str) -> None:
+    analysis = _analysis(beat_times=[0.0, 0.5, 1.0], key=key)
+    midi_bytes, metadata = build_performance_midi(
+        [NoteEvent(start_sec=0.0, end_sec=0.5, midi=60)],
+        analysis,
+        instrument_group="piano",
+    )
+    midi, _parsed_messages = _messages(midi_bytes)
+    emitted = next(message.key for message in midi.tracks[0] if message.type == "key_signature")
+    expected = {"Dbm": "C#m", "Gbm": "F#m"}.get(key, key)
+    assert metadata["key"] == key
+    assert metadata["emitted_key"] == expected
+    assert emitted == expected
+
+
 def test_manual_bpm_scale_is_reflected_in_performance_tempo_map() -> None:
     analysis = _analysis(
         beat_times=[0.0, 0.5, 1.0, 1.5],
@@ -253,13 +269,17 @@ def test_bundle_writes_one_performance_artifact_per_selected_instrument(tmp_path
     artifacts = write_performance_midi_bundle(
         [
             PerformanceTrack("acoustic_piano", (NoteEvent(start_sec=0.0, end_sec=0.5, midi=60),), program=0),
-            PerformanceTrack("violin", (NoteEvent(start_sec=0.0, end_sec=0.5, midi=67),), program=40),
+            PerformanceTrack("acoustic_piano", (NoteEvent(start_sec=0.0, end_sec=0.5, midi=67),), program=40),
+            PerformanceTrack("acoustic_piano", (NoteEvent(start_sec=0.0, end_sec=0.5, midi=36),), program=0, is_drum=True),
         ],
         analysis,
         tmp_path,
     )
-    assert [artifact.midi_path.name for artifact in artifacts] == [
-        "acoustic_piano.performance.mid",
-        "violin.performance.mid",
-    ]
+    assert len({artifact.midi_path.name for artifact in artifacts}) == 3
+    assert all(
+        name.startswith("acoustic_piano.p") and name.endswith(".performance.mid")
+        for name in (artifact.midi_path.name for artifact in artifacts)
+    )
+    assert [artifact.metadata["program"] for artifact in artifacts] == [0, 40, 0]
+    assert [artifact.metadata["is_drum"] for artifact in artifacts] == [False, False, True]
     assert all(artifact.midi_path.is_file() and artifact.metadata_path.is_file() for artifact in artifacts)
