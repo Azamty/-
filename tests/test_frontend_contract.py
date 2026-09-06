@@ -27,6 +27,17 @@ def test_vocal_ready_contract_uses_staged_generation_and_long_svg_first() -> Non
     assert "切换只对新任务生效" in source
 
 
+def test_demucs_model_cards_hide_native_dot_but_keep_keyboard_radio_semantics() -> None:
+    source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+    styles = (ROOT / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'type="radio" name="separation-model"' in source
+    assert "model-choice-state" in source
+    assert '.model-choice input[type="radio"]' in styles
+    assert "clip-path: inset(50%)" in styles
+    assert ".model-choice:focus-within" in styles
+
+
 def test_remote_synth_contract_reports_secure_context_and_download_progress() -> None:
     source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
 
