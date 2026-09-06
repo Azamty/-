@@ -24,15 +24,19 @@ def test_vocal_ready_contract_uses_staged_generation_and_long_svg_first() -> Non
     assert "score_svg_long" in source
     assert 'name="separation-model"' in source
     assert "htdemucs_ft" in source
-    assert "切换只对新任务生效" in source
+    assert "modelChoiceHint" in source
 
 
 def test_demucs_model_cards_hide_native_dot_but_keep_keyboard_radio_semantics() -> None:
     source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
     styles = (ROOT / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
+    model_choice = (ROOT / "frontend" / "src" / "modelChoice.ts").read_text(encoding="utf-8")
 
     assert 'type="radio" name="separation-model"' in source
     assert "model-choice-state" in source
+    assert "modelChoiceDisabled(busy)" in source
+    assert "modelChoiceHint(activeVocalJob ? actualDemucsModel : null)" in source
+    assert "return busy;" in model_choice
     assert '.model-choice input[type="radio"]' in styles
     assert "clip-path: inset(50%)" in styles
     assert ".model-choice:focus-within" in styles
