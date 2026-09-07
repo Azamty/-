@@ -605,6 +605,78 @@ def test_non_exact_48_tpq_duration_is_rejected_explicitly() -> None:
         standardize_musicxml_payload(payload)
 
 
+def test_finer_binary_musescore_fragment_is_bounded_to_48_tpq_with_alignment_diagnostic() -> None:
+    payload = _manual_payload()
+    payload.highest_time_quarter = 16
+    payload.parts[0].highest_time_quarter = 16
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="supported-32nd",
+            kind="note",
+            offset_quarter=15.75,
+            duration_quarter=0.1875,
+            pitches=[60],
+            tie="start",
+            tie_types=["start"],
+        ),
+        WorkerEvent(
+            event_id="finer-fragment-1",
+            kind="note",
+            offset_quarter=15.9375,
+            duration_quarter=0.03125,
+            pitches=[60],
+            tie="stop",
+            tie_types=["stop"],
+        ),
+        WorkerEvent(
+            event_id="finer-fragment-2",
+            kind="note",
+            offset_quarter=15.96875,
+            duration_quarter=0.03125,
+            pitches=[67],
+        ),
+    ]
+    payload.parts[0].measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=16,
+            end_quarter=16,
+            time_signature="4/4",
+        )
+    ]
+    payload.measures = list(payload.parts[0].measures)
+    score, report = standardize_musicxml_payload(
+        payload,
+        performance_metadata={
+            "notes": [
+                {"index": 0, "midi": 60, "start_tick": 7560, "end_tick": 7660},
+                {"index": 1, "midi": 67, "start_tick": 7660, "end_tick": 7680},
+            ]
+        },
+    )
+    notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
+    assert [(event.midi, event.start_tick, event.end_tick) for event in notes] == [(60, 756, 765), (67, 765, 768)]
+    repairs = report["fine_grid_quantization"]
+    assert len(repairs) == 2
+    assert {item["original_quarter"] for item in repairs} == {15.96875}
+    assert all(abs(float(item["movement_ticks"])) <= 0.5 for item in repairs)
+    notation_repairs = report["notation_grid_repairs"]
+    assert [item["reason"] for item in notation_repairs] == [
+        "fine_grid_tie_fragment_merged_for_jianpu_atom",
+        "fine_grid_note_shifted_to_jianpu_atom",
+    ]
+    assert all(abs(int(item["movement_ticks"])) <= 2 for item in notation_repairs)
+    assert all(event.duration_tick >= 3 for event in notes)
+    assert report["source_to_score"][0]["score_end_tick"] == 765
+    assert report["source_to_score"][0]["musicxml_to_score_movement_end_ticks"] == -1
+    assert report["source_to_score"][1]["score_start_tick"] == 765
+    assert report["source_to_score"][1]["musicxml_to_score_movement_start_ticks"] == -1
+    assert "Finer binary MusicXML fragments" in " ".join(score.warnings)
+    assert "bounded jianpu atom repairs" in " ".join(score.warnings)
+
+
 def test_score_normalizer_retains_pickup_and_meter_key_tempo_changes_in_metadata() -> None:
     payload = _manual_payload()
     payload.highest_time_quarter = 6

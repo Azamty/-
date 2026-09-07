@@ -18,6 +18,7 @@ import tempfile
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,6 +43,14 @@ from .high_accuracy import (
 WORKER_SCHEMA_VERSION = "1.0"
 SCORE_QUARTER_TICKS = 48
 PERFORMANCE_QUARTER_TICKS = 480
+MAX_FINE_GRID_MOVEMENT_TICKS = 0.5
+# jianpu-ly's smallest exact atom at the shared 48 TPQ grid is a 64th-note
+# (3 ticks).  MuseScore can nevertheless emit a final 1/32-quarter fragment
+# that rounds to one or two ticks.  Keep the 48 TPQ contract and repair only
+# those notation fragments, with the movement recorded in the alignment
+# report so the renderer never silently changes timing.
+MIN_JIANPU_ATOM_TICKS = 3
+MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS = 2
 WORKER = ROOT / "scripts" / "musicxml_score_worker.py"
 
 
@@ -282,16 +291,39 @@ def _part_group(part_id: str) -> str:
     return part_id.split(marker, 1)[0] if marker in part_id else part_id
 
 
-def _quarter_to_tick(value: float, *, context: str = "MusicXML quarter value") -> int:
+def _quarter_to_tick(
+    value: float,
+    *,
+    context: str = "MusicXML quarter value",
+    allow_finer_binary: bool = False,
+    quantization_repairs: list[dict[str, Any]] | None = None,
+) -> int:
     if not math.isfinite(value):
         raise MusicXMLStandardizationError(f"non-finite MusicXML quarter position: {value!r}")
     scaled = value * SCORE_QUARTER_TICKS
     rounded = round(scaled)
-    if abs(scaled - rounded) > 1e-7:
-        raise MusicXMLStandardizationError(
-            f"{context} {value!r} cannot be represented exactly at {SCORE_QUARTER_TICKS} TPQ; "
-            "the notation contains a tuplet or duration outside the supported exact grid"
-        )
+    movement = float(rounded - scaled)
+    if abs(movement) > 1e-7:
+        fraction = Fraction(str(value)).limit_denominator(4096)
+        denominator = fraction.denominator
+        is_finer_binary = denominator >= 32 and denominator & (denominator - 1) == 0
+        if not (allow_finer_binary and is_finer_binary and abs(movement) <= MAX_FINE_GRID_MOVEMENT_TICKS):
+            raise MusicXMLStandardizationError(
+                f"{context} {value!r} cannot be represented exactly at {SCORE_QUARTER_TICKS} TPQ; "
+                "the notation contains a tuplet or duration outside the supported exact grid"
+            )
+        if quantization_repairs is not None:
+            quantization_repairs.append(
+                {
+                    "reason": "finer_binary_musicxml_value_quantized_to_48_tpq",
+                    "context": context,
+                    "original_quarter": float(value),
+                    "original_fraction": f"{fraction.numerator}/{fraction.denominator}",
+                    "score_tick": int(rounded),
+                    "movement_ticks": movement,
+                    "bounded_by_ticks": MAX_FINE_GRID_MOVEMENT_TICKS,
+                }
+            )
     return int(rounded)
 
 
@@ -380,8 +412,21 @@ def _worker_raw_events(payload: WorkerPayload) -> tuple[list[_RawEvent], list[di
                     }
                 )
                 continue
-            start_tick = _quarter_to_tick(item.offset_quarter)
-            end_tick = max(start_tick + 1, _quarter_to_tick(item.offset_quarter + item.duration_quarter))
+            start_tick = _quarter_to_tick(
+                item.offset_quarter,
+                context="MusicXML event offset",
+                allow_finer_binary=True,
+                quantization_repairs=diagnostics,
+            )
+            end_tick = max(
+                start_tick + 1,
+                _quarter_to_tick(
+                    item.offset_quarter + item.duration_quarter,
+                    context="MusicXML event end",
+                    allow_finer_binary=True,
+                    quantization_repairs=diagnostics,
+                ),
+            )
             events.append(
                 _RawEvent(
                     event_id=item.event_id,
@@ -1125,6 +1170,202 @@ def _score_voice_events(
     return result
 
 
+def _alignment_items_for_events(
+    alignment: list[dict[str, Any]],
+    event_ids: set[str],
+) -> list[dict[str, Any]]:
+    if not event_ids:
+        return []
+    return [
+        item
+        for item in alignment
+        if event_ids.intersection(str(value) for value in item.get("musicxml_event_ids", []))
+    ]
+
+
+def _update_alignment_start(item: dict[str, Any], start_tick: int) -> None:
+    item["score_start_tick"] = int(start_tick)
+    source_start = item.get("source_start_tick")
+    musicxml_start = item.get("musicxml_start_tick")
+    if source_start is not None:
+        item["source_to_score_movement_start_ticks"] = int(start_tick) - int(source_start)
+    if musicxml_start is not None:
+        item["musicxml_to_score_movement_start_ticks"] = int(start_tick) - int(musicxml_start)
+
+
+def _update_alignment_end(item: dict[str, Any], end_tick: int) -> None:
+    item["score_end_tick"] = int(end_tick)
+    source_end = item.get("source_end_tick")
+    musicxml_end = item.get("musicxml_chain_end_tick")
+    if source_end is not None:
+        item["source_to_score_movement_end_ticks"] = int(end_tick) - int(source_end)
+    if musicxml_end is not None:
+        item["musicxml_to_score_movement_end_ticks"] = int(end_tick) - int(musicxml_end)
+
+
+def _event_pitch(event: ScoreNote) -> int | None:
+    pitches = event.chord_pitches or ([event.midi] if event.midi is not None else [])
+    return pitches[0] if len(pitches) == 1 else None
+
+
+def _event_musicxml_id(event: ScoreNote) -> str | None:
+    value = event.metadata.get("musicxml_event_id")
+    return str(value) if value is not None else None
+
+
+def _set_tie_stop(event: ScoreNote) -> ScoreNote:
+    """Close the surviving part of a tie after its tiny terminal fragment is removed."""
+
+    if event.chord_pitches:
+        tie_types = list(event.tie_types)
+        if not tie_types:
+            tie_types = [event.tie] * len(event.chord_pitches)
+        tie_types = ["stop" if value in {"start", "continue"} else value for value in tie_types]
+        tie = "stop" if tie_types and all(value == "stop" for value in tie_types) else None
+    else:
+        tie_types = ["stop"]
+        tie = "stop"
+    return event.model_copy(update={"tie": tie, "tie_types": tie_types})
+
+
+def _repair_fine_score_events(
+    voices: list[ScoreVoice],
+    alignment: list[dict[str, Any]],
+    *,
+    total_ticks: int,
+) -> tuple[list[ScoreVoice], list[dict[str, Any]]]:
+    """Make rounded finer-grid fragments representable by jianpu-ly.
+
+    The raw worker events and the 48 TPQ rounding remain authoritative.  This
+    pass only handles a renderer boundary: a one/two-tick terminal tie piece
+    is folded into its preceding same-pitch event, and a following tiny note
+    may move back to the preceding lane boundary when that yields the minimum
+    three-tick atom.  Every changed boundary is written into source alignment.
+    """
+
+    repairs: list[dict[str, Any]] = []
+    repaired_voices: list[ScoreVoice] = []
+    for voice in voices:
+        events = list(voice.events)
+        index = 0
+        while index < len(events):
+            current = events[index]
+            if current.duration_tick >= MIN_JIANPU_ATOM_TICKS:
+                index += 1
+                continue
+
+            previous = events[index - 1] if index else None
+            current_pitch = _event_pitch(current)
+            previous_pitch = _event_pitch(previous) if previous is not None else None
+            current_id = _event_musicxml_id(current)
+            previous_id = _event_musicxml_id(previous) if previous is not None else None
+
+            # A terminal tied fragment is part of the preceding logical note.
+            # Snap the complete tied span to the nearest 3-tick boundary and
+            # close the tie on the surviving event.
+            if (
+                current_pitch is not None
+                and previous is not None
+                and previous_pitch == current_pitch
+                and previous.end_tick == current.start_tick
+                and current.tie in {"stop", "continue"}
+            ):
+                combined_ticks = current.end_tick - previous.start_tick
+                snapped_duration = max(
+                    MIN_JIANPU_ATOM_TICKS,
+                    round(combined_ticks / MIN_JIANPU_ATOM_TICKS) * MIN_JIANPU_ATOM_TICKS,
+                )
+                snapped_end = min(total_ticks, previous.start_tick + snapped_duration)
+                movement = snapped_end - current.end_tick
+                if abs(movement) <= MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS and snapped_end > previous.start_tick:
+                    event_ids = {value for value in (previous_id, current_id) if value is not None}
+                    updated_previous = _set_tie_stop(
+                        previous.model_copy(update={"duration_tick": snapped_end - previous.start_tick})
+                    )
+                    updated_metadata = dict(updated_previous.metadata)
+                    updated_metadata["notation_grid_repair"] = {
+                        "reason": "fine_grid_tie_fragment_merged_for_jianpu_atom",
+                        "removed_musicxml_event_id": current_id,
+                    }
+                    updated_previous = updated_previous.model_copy(update={"metadata": updated_metadata})
+                    events[index - 1] = updated_previous
+                    del events[index]
+                    for item in _alignment_items_for_events(alignment, event_ids):
+                        _update_alignment_end(item, snapped_end)
+                    repairs.append(
+                        {
+                            "reason": "fine_grid_tie_fragment_merged_for_jianpu_atom",
+                            "action": "removed_terminal_tie_fragment",
+                            "voice_id": voice.voice_id,
+                            "musicxml_event_ids": sorted(event_ids),
+                            "pitch": current_pitch,
+                            "original_start_tick": current.start_tick,
+                            "original_end_tick": current.end_tick,
+                            "repaired_end_tick": snapped_end,
+                            "movement_ticks": movement,
+                            "bounded_by_ticks": MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS,
+                        }
+                    )
+                    continue
+
+            # A tiny note after a preceding event can use that event's end as
+            # its onset when the resulting atom is exactly representable.  In
+            # the MuseScore fragment that triggered this repair this is a
+            # two-tick bass note shifted one tick earlier to become 3 ticks.
+            if previous is not None and previous.end_tick <= current.end_tick:
+                target_start = max(previous.end_tick, current.end_tick - MIN_JIANPU_ATOM_TICKS)
+                movement = target_start - current.start_tick
+                if (
+                    target_start <= current.start_tick
+                    and current.end_tick - target_start >= MIN_JIANPU_ATOM_TICKS
+                    and abs(movement) <= MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS
+                ):
+                    updated = current.model_copy(
+                        update={"start_tick": target_start, "duration_tick": current.end_tick - target_start}
+                    )
+                    metadata = dict(updated.metadata)
+                    metadata["notation_grid_repair"] = {
+                        "reason": "fine_grid_note_shifted_to_jianpu_atom",
+                        "original_start_tick": current.start_tick,
+                    }
+                    events[index] = updated.model_copy(update={"metadata": metadata})
+                    if current_id is not None:
+                        for item in _alignment_items_for_events(alignment, {current_id}):
+                            _update_alignment_start(item, target_start)
+                    repairs.append(
+                        {
+                            "reason": "fine_grid_note_shifted_to_jianpu_atom",
+                            "action": "move_note_onset_to_previous_lane_boundary",
+                            "voice_id": voice.voice_id,
+                            "musicxml_event_id": current_id,
+                            "pitch": current_pitch,
+                            "original_start_tick": current.start_tick,
+                            "repaired_start_tick": target_start,
+                            "end_tick": current.end_tick,
+                            "movement_ticks": movement,
+                            "bounded_by_ticks": MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS,
+                        }
+                    )
+                    index += 1
+                    continue
+
+            # A tiny rest directly following another rest can be coalesced
+            # without changing any pitched boundary.  This keeps the same
+            # explicit policy available for an equivalent MuseScore rest
+            # fragment.
+            if current.is_rest and previous is not None and previous.is_rest and previous.end_tick == current.start_tick:
+                events[index - 1] = previous.model_copy(
+                    update={"duration_tick": current.end_tick - previous.start_tick}
+                )
+                del events[index]
+                continue
+
+            index += 1
+
+        repaired_voices.append(voice.model_copy(update={"events": events}))
+    return repaired_voices, repairs
+
+
 def _dedupe_events(values: Iterable[Mapping[str, Any]], key: tuple[str, ...]) -> list[dict[str, Any]]:
     seen: set[tuple[Any, ...]] = set()
     result: list[dict[str, Any]] = []
@@ -1489,6 +1730,11 @@ def standardize_musicxml_payload(
             )
     if not voices:
         raise MusicXMLStandardizationError("MusicXML contained no printable notes, chords, or rests")
+    voices, notation_grid_repairs = _repair_fine_score_events(
+        voices,
+        alignment,
+        total_ticks=total_ticks,
+    )
 
     measure_metadata: list[dict[str, Any]] = []
     for measure in payload.measures:
@@ -1587,9 +1833,13 @@ def standardize_musicxml_payload(
         "musicxml_matched_logical_unit_count": len(logical_units) - len(musicxml_extras),
         "musicxml_extra_count": len(musicxml_extras),
         "musicxml_extras": musicxml_extras,
+        "fine_grid_quantization": [
+            item for item in diagnostics if item.get("reason") == "finer_binary_musicxml_value_quantized_to_48_tpq"
+        ],
+        "notation_grid_repairs": notation_grid_repairs,
         "score_voice_count": len(voices),
         "source_to_score": alignment,
-        "repairs": diagnostics + lane_reasons,
+        "repairs": diagnostics + notation_grid_repairs + lane_reasons,
         "tie_voice_repairs": [
             item
             for item in diagnostics
@@ -1597,12 +1847,16 @@ def standardize_musicxml_payload(
         ],
         "source_note_policy": "performance metadata is used only for auditable source-to-MusicXML alignment; XML pitch/timing remains authoritative",
         "alignment_tick_semantics": "source_to_score_movement_* = final Score tick - source performance tick; musicxml_to_score_movement_* = final Score tick - MusicXML tick",
-        "score_grid_precision_policy": "48 TPQ accepts exact 1/32, dotted, and supported triplet values; other fractional values are rejected explicitly",
+        "score_grid_precision_policy": "48 TPQ preserves exact 1/32-note, dotted, and supported triplet values; finer binary MuseScore fragments are rounded within 0.5 score tick, and one/two-tick renderer fragments may move within a 2-tick jianpu atom bound with every movement recorded; other fractional values are rejected explicitly",
         "conductor_reconciliation": conductor["reconciliation"],
     }
     warnings: list[str] = []
     if any(item.get("reason") == "grace_event_not_representable_at_48_tpq" for item in diagnostics):
         warnings.append("MusicXML contained grace events that cannot be represented at positive 48 TPQ duration")
+    if any(item.get("reason") == "finer_binary_musicxml_value_quantized_to_48_tpq" for item in diagnostics):
+        warnings.append("Finer binary MusicXML fragments were quantized to the nearest 48 TPQ tick within a 0.5 tick bound; inspect alignment_report.json")
+    if notation_grid_repairs:
+        warnings.append("Finer MusicXML fragments required bounded jianpu atom repairs; inspect alignment_report.json")
     if any(item.get("reason") in {"tie_chain_voice_reassigned", "tie_chain_event_split"} for item in diagnostics):
         warnings.append("MusicXML tie fragments were normalized into serializable ScoreVoice lanes")
     if lane_reasons:
@@ -1616,7 +1870,7 @@ def standardize_musicxml_payload(
         "music21_version": payload.music21_version,
         "musicxml_worker_schema_version": payload.schema_version,
         "score_ticks_per_quarter": SCORE_QUARTER_TICKS,
-        "score_grid_precision_policy": "exact 48 TPQ; unsupported fractional MusicXML durations are rejected",
+        "score_grid_precision_policy": "exact 48 TPQ for supported notation; finer binary MusicXML fragments are quantized within 0.5 tick and any one/two-tick jianpu atom repair is bounded to 2 ticks and recorded in alignment_report.json; other unsupported fractions are rejected",
         "source_musicxml": payload.source_path,
         "parts": [
             {
