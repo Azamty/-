@@ -13,6 +13,7 @@ import hashlib
 import itertools
 import json
 import math
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,10 +30,22 @@ DEFAULT_VELOCITY = 80
 DRUM_CHANNEL = 9  # MIDI channel 10 in one-based terminology.
 
 
-def _midi_text(value: str) -> str:
-    """Keep track names encodable by the SMF latin-1 text convention."""
+def _midi_text(value: str, *, fallback: str = "track") -> str:
+    """Return a deterministic ASCII SMF track name.
 
-    return str(value).encode("ascii", "replace").decode("ascii")
+    The full Unicode title is kept in the adjacent metadata/manifest.  SMF
+    text fields are limited by the mido codec, so use a readable transliterated
+    prefix plus a hash whenever the original title cannot be represented.
+    """
+
+    original = str(value).strip() or fallback
+    readable = unicodedata.normalize("NFKD", original).encode("ascii", "ignore").decode("ascii")
+    readable = "".join(char if char.isalnum() or char in " ._-" else "_" for char in readable)
+    readable = " ".join(readable.split()).strip(" ._-") or fallback
+    if readable != original:
+        digest = hashlib.sha1(original.encode()).hexdigest()[:10]
+        readable = f"{readable[:51].rstrip(' ._-')}-{digest}"
+    return readable[:63]
 
 
 @dataclass(frozen=True)
@@ -222,7 +235,7 @@ def _write_track_messages(
     is_drum: bool,
 ) -> mido.MidiTrack:
     track = mido.MidiTrack()
-    track.append(mido.MetaMessage("track_name", name=_midi_text(title), time=0))
+    track.append(mido.MetaMessage("track_name", name=_midi_text(title, fallback="Instrument"), time=0))
     if not is_drum:
         track.append(mido.Message("program_change", channel=channel, program=program, time=0))
     events: list[tuple[int, int, int, mido.Message]] = []
@@ -267,7 +280,7 @@ def _write_conductor_track(
 ) -> mido.MidiTrack:
     numerator, denominator = (int(value) for value in normalize_time_signature(analysis.time_signature).split("/"))
     track = mido.MidiTrack()
-    track.append(mido.MetaMessage("track_name", name=_midi_text(title), time=0))
+    track.append(mido.MetaMessage("track_name", name=_midi_text(title, fallback="Performance"), time=0))
     track.append(
         mido.MetaMessage(
             "time_signature",
@@ -310,6 +323,8 @@ def build_performance_midi(
     tempo_points = _tempo_points(mapper)
     channel = DRUM_CHANNEL if is_drum else 0
     track_title = str(title).strip() or group
+    conductor_track_name = _midi_text(track_title, fallback="Performance")
+    instrument_track_name = _midi_text(group, fallback="Instrument")
     midi = mido.MidiFile(type=1, ticks_per_beat=PERFORMANCE_TICKS_PER_QUARTER)
     midi.tracks.append(
         _write_conductor_track(title=track_title, analysis=analysis, tempo_points=tempo_points)
@@ -328,6 +343,10 @@ def build_performance_midi(
         "artifact_kind": "performance_midi",
         "ticks_per_quarter": PERFORMANCE_TICKS_PER_QUARTER,
         "title": track_title,
+        "midi_track_names": {
+            "conductor": conductor_track_name,
+            "instrument": instrument_track_name,
+        },
         "instrument_group": group,
         "track_id": resolved_track_id,
         "program": bounded_program,

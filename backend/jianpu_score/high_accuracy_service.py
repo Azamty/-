@@ -283,6 +283,7 @@ def _event_payload(events: tuple[NoteEvent, ...], *, instrument_id: str, title: 
         "schema_version": SERVICE_SCHEMA_VERSION,
         "instrument_id": instrument_id,
         "title": title,
+        "title_unicode": title,
         "variant": variant,
         "event_count": len(events),
         "events": [event.model_dump(mode="json") for event in events],
@@ -603,6 +604,10 @@ class HighAccuracyArtifactService:
                 "musescore_version": MUSESCORE_VERSION,
                 "score_ticks_per_quarter": SCORE_TICKS_PER_QUARTER,
             }
+            # Keep the complete Unicode title in JSON while recording the
+            # deterministic ASCII names emitted into SMF text fields.
+            manifest["title_unicode"] = safe_title
+            manifest["midi_track_names"] = performance_metadata.get("midi_track_names", {})
             try:
                 _validate_performance_metadata(materialized, performance_metadata)
             except (TypeError, ValueError) as exc:

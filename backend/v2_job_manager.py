@@ -59,6 +59,33 @@ HIGH_ACCURACY_V2_METADATA = {
     "musescore_version": MUSESCORE_VERSION,
     "score_ticks_per_quarter": 48,
 }
+V2_RECOGNITION_ARTIFACT_IDS = frozenset(
+    {
+        "v2-recognition-json",
+        "v2-original-midi",
+        "v2-analysis-suggestion",
+        "v2-analysis-full",
+        "v2-beat-grid",
+        "v2-recognition-log",
+    }
+)
+def _is_vocal_generation_artifact_id(artifact_id: str) -> bool:
+    """Return whether an ID belongs to the replaceable latest vocal attempt."""
+
+    return (
+        artifact_id in {
+            "v2-vocal-game-raw-notes",
+            "v2-vocal-game-cleaned-notes",
+            "v2-vocal-game-cleanup-failure",
+            "v2-vocal-game-cleanup-report",
+            "v2-vocal-analysis-cleaned",
+        }
+        or artifact_id.startswith("v2-vocal-high-accuracy-")
+    )
+
+
+def _is_historical_attempt_artifact_id(artifact_id: str) -> bool:
+    return bool(re.search(r"-attempt-\d{4}(?:-\d+)?$", artifact_id))
 
 
 def _analysis_suggestion(analysis: MusicAnalysis) -> dict[str, Any]:
@@ -417,9 +444,16 @@ class V2JobService:
         return output
 
     def _run_instrumental_recognition(self, job_id: str) -> None:
-        output = self._output_dir(job_id) / "v2-recognition"
-        if output.exists() and output.is_symlink():
+        state_at_start = self.manager._read(job_id)
+        attempt = int(state_at_start.get("attempt", 1))
+        recognition_root = self._output_dir(job_id) / "v2-recognition"
+        if recognition_root.is_symlink() or (
+            recognition_root.exists() and recognition_root.resolve().parent != self._output_dir(job_id)
+        ):
             raise ValueError("invalid V2 recognition output path")
+        output = recognition_root / f"attempt-{attempt:04d}"
+        if output.is_symlink() or (output.exists() and output.resolve().parent != recognition_root):
+            raise ValueError("invalid V2 recognition attempt output path")
         output.mkdir(parents=True, exist_ok=True)
         progress_path = output / "progress.json"
         self.manager._set_phase(job_id, "recognizing")
@@ -462,7 +496,14 @@ class V2JobService:
         if isinstance(beat_grid, Mapping):
             _safe_json(beat_grid_path, beat_grid)
         job_dir = self.manager._safe_job_dir(job_id)
+        prior_artifacts = [
+            item
+            for item in state_at_start.get("artifacts", [])
+            if str(item.get("artifact_id")) not in V2_RECOGNITION_ARTIFACT_IDS
+            and str(item.get("artifact_id")) != "v2-source-audio"
+        ]
         artifacts = [
+            *prior_artifacts,
             self.manager._register(
                 job_dir,
                 self.manager.input_path(job_id),
@@ -1086,10 +1127,10 @@ class V2JobService:
             ),
         )
         job_dir = self.manager._safe_job_dir(job_id)
-        prior_artifacts = [
-            item for item in state.get("artifacts", [])
-            if str(item.get("artifact_id")) in {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis", "v2-beat-grid"}
-        ]
+        # Retry preserves prior attempts under unique historical IDs.  Carry
+        # those registrations forward so diagnostics remain downloadable;
+        # only the current attempt uses the stable latest IDs below.
+        prior_artifacts = list(state.get("artifacts", []))
         raw_artifacts = [
             *prior_artifacts,
             self.manager._register(job_dir, raw_path, artifact_id="v2-vocal-game-raw-notes", kind="vocal_raw_notes", label="GAME 原始音符（保留）", media_type="application/json", stem_id="vocals"),

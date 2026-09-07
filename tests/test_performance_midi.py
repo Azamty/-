@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from io import BytesIO
 import json
+from io import BytesIO
 
 import mido
 import pytest
@@ -262,6 +262,29 @@ def test_write_performance_midi_uses_independent_names_and_refuses_accidental_ov
             destination,
             instrument_group="acoustic_piano",
         )
+
+
+def test_unicode_title_is_preserved_in_metadata_with_stable_ascii_midi_names() -> None:
+    analysis = _analysis(beat_times=[0.0, 0.5, 1.0])
+    title = "中文歌曲・日本語"
+    midi_bytes, metadata = build_performance_midi(
+        [NoteEvent(start_sec=0.0, end_sec=0.5, midi=60)],
+        analysis,
+        instrument_group="人声",
+        title=title,
+    )
+    midi, _messages_list = _messages(midi_bytes)
+    names = [
+        message.name
+        for track in midi.tracks
+        for message in track
+        if message.type == "track_name"
+    ]
+    assert metadata["title"] == title
+    assert metadata["midi_track_names"]["conductor"] in names
+    assert metadata["midi_track_names"]["instrument"] in names
+    assert all(name.isascii() for name in metadata["midi_track_names"].values())
+    assert all(name and "?" not in name for name in metadata["midi_track_names"].values())
 
 
 def test_bundle_writes_one_performance_artifact_per_selected_instrument(tmp_path) -> None:

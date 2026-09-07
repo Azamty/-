@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 import mido
 import pytest
 
 from backend.jianpu_score import high_accuracy_service as service_module
 from backend.jianpu_score.domain import MusicAnalysis, NoteEvent, Score
-from backend.jianpu_score.high_accuracy import resolve_musescore, resolve_notation_python
-from backend.jianpu_score.musescore_import import MusicXMLArtifact, MuseScoreImportError
+from backend.jianpu_score.high_accuracy import (
+    resolve_musescore,
+    resolve_notation_python,
+)
+from backend.jianpu_score.musescore_import import MuseScoreImportError, MusicXMLArtifact
 from backend.jianpu_score.musicxml_standardize import MusicXMLStandardizationError
 from backend.jianpu_score.render import JIANPU, LILYPOND
-
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE56_INPUT = ROOT / "fixtures" / "high_accuracy" / "beat_grid_fixture.json"
@@ -128,6 +130,21 @@ def test_invalid_beatnet_writes_failure_manifest_and_preserves_raw_notes(tmp_pat
     assert manifest["status"] == "failed"
     assert manifest["failure"]["stage"] == "validate"
     assert manifest["artifacts"]
+
+
+def test_unicode_title_is_kept_in_service_metadata_and_manifest(tmp_path: Path) -> None:
+    kwargs = _valid_build_kwargs(tmp_path, is_drum=True)
+    kwargs["title"] = "中文歌曲・日本語"
+    result = service_module.HighAccuracyArtifactService().build(**kwargs)
+
+    metadata = json.loads((result.output_dir / "stage56-drums.source.performance.metadata.json").read_text(encoding="utf-8"))
+    manifest = _manifest(result.output_dir)
+    assert metadata["title"] == kwargs["title"]
+    assert metadata["midi_track_names"]["conductor"].isascii()
+    assert metadata["midi_track_names"]["instrument"].isascii()
+    assert manifest["title"] == kwargs["title"]
+    assert manifest["title_unicode"] == kwargs["title"]
+    assert manifest["midi_track_names"] == metadata["midi_track_names"]
 
 
 def test_musescore_failure_keeps_performance_prefix_without_fallback(

@@ -23,7 +23,12 @@ from .jianpu_score.pipeline import run_pipeline
 from .jianpu_score.quantize import NoNotesError
 from .jianpu_score.render import RenderArtifacts, render_score
 from .jianpu_score.svg_long import merge_svg_pages
-from .v2_job_manager import V2JobService
+from .v2_job_manager import (
+    V2JobService,
+    V2_RECOGNITION_ARTIFACT_IDS,
+    _is_historical_attempt_artifact_id,
+    _is_vocal_generation_artifact_id,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -304,7 +309,8 @@ class JobManager:
         directory = self._safe_job_dir(job_id)
         output = directory / "output"
         output.mkdir(parents=True, exist_ok=True)
-        log_path = output / "v2-recognition" / "muscriptor-worker.log"
+        log_root = progress_path.parent if progress_path is not None else output / "v2-recognition"
+        log_path = log_root / "muscriptor-worker.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         environment = os.environ.copy()
         environment["PYTHONNOUSERSITE"] = "1"
@@ -493,23 +499,62 @@ class JobManager:
                     # and will only overwrite a matching manifest; deleting
                     # the whole selections tree here could remove an unknown
                     # file supplied by a caller.
+                    selection = v2_state.get("selection") or {}
+                    revision = int(selection.get("revision", v2_state.get("selection_revision", 0)))
+                    revision_prefix = f"v2-selection-r{revision}-"
                     state["artifacts"] = [
-                        item for item in state.get("artifacts", [])
-                        if not str(item.get("artifact_id", "")).startswith("v2-selection-")
+                        item
+                        for item in state.get("artifacts", [])
+                        if not str(item.get("artifact_id", "")).startswith(revision_prefix)
                     ]
                     retained_artifacts = list(state["artifacts"])
+                elif state.get("kind") == "v2" and v2_state.get("stage") == "recognize":
+                    recognition = output / "v2-recognition"
+                    if recognition.is_symlink() or (recognition.exists() and recognition.resolve().parent != output):
+                        raise ValueError("invalid V2 recognition output path")
+                    previous_attempt = int(state.get("attempt", 1))
+                    used_ids = {str(item.get("artifact_id")) for item in state.get("artifacts", [])}
+                    preserved: list[dict[str, Any]] = []
+                    for item in state.get("artifacts", []):
+                        artifact_id = str(item.get("artifact_id", ""))
+                        if artifact_id not in V2_RECOGNITION_ARTIFACT_IDS:
+                            preserved.append(item)
+                            continue
+                        historical_id = f"{artifact_id}-attempt-{previous_attempt:04d}"
+                        suffix = 2
+                        while historical_id in used_ids:
+                            historical_id = f"{artifact_id}-attempt-{previous_attempt:04d}-{suffix}"
+                            suffix += 1
+                        used_ids.add(historical_id)
+                        preserved.append({**item, "artifact_id": historical_id})
+                    state["artifacts"] = preserved
+                    retained_artifacts = list(preserved)
                 elif state.get("kind") == "v2" and v2_state.get("source_kind") == "vocal" and v2_state.get("stage") == "vocal_generate":
                     # GAME retries reuse the durable Demucs vocals stem.  Keep
-                    # only source, stem and original-analysis artifacts and
-                    # remove stale score files from the failed attempt.
+                    # prior diagnostics under historical IDs and let the new
+                    # attempt publish the stable latest IDs.
                     preparation = output / "vocal-prep"
                     if preparation.is_symlink() or (preparation.exists() and preparation.resolve().parent != output):
                         raise ValueError("invalid V2 vocal preparation path")
                     # Preserve prior GAME/raw/cleanup/service diagnostics. A
                     # retry gets a new attempt directory and never needs to
                     # delete unknown files from the output root.
-                    retained_ids = {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis", "v2-beat-grid"}
-                    state["artifacts"] = [item for item in state.get("artifacts", []) if str(item.get("artifact_id")) in retained_ids]
+                    previous_attempt = int(state.get("attempt", 1))
+                    used_ids = {str(item.get("artifact_id")) for item in state.get("artifacts", [])}
+                    preserved = []
+                    for item in state.get("artifacts", []):
+                        artifact_id = str(item.get("artifact_id", ""))
+                        if not _is_vocal_generation_artifact_id(artifact_id) or _is_historical_attempt_artifact_id(artifact_id):
+                            preserved.append(item)
+                            continue
+                        historical_id = f"{artifact_id}-attempt-{previous_attempt:04d}"
+                        suffix = 2
+                        while historical_id in used_ids:
+                            historical_id = f"{artifact_id}-attempt-{previous_attempt:04d}-{suffix}"
+                            suffix += 1
+                        used_ids.add(historical_id)
+                        preserved.append({**item, "artifact_id": historical_id})
+                    state["artifacts"] = preserved
                     retained_artifacts = list(state["artifacts"])
                 else:
                     shutil.rmtree(output)

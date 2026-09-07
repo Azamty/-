@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, ClassVar
@@ -14,6 +15,7 @@ from backend.jianpu_score.high_accuracy import (
 from backend.jianpu_score.high_accuracy_service import (
     SERVICE_SCHEMA_VERSION,
     HighAccuracyBuildResult,
+    HighAccuracyServiceError,
     ServiceArtifact,
 )
 from backend.jianpu_score.models.adapter import EngineResult
@@ -165,6 +167,106 @@ def _instrumental_fixture(manager: JobManager, tmp_path: Path, *, two_tracks: bo
     return job_id, str(input_path), ids
 
 
+def test_recognition_retry_uses_new_attempt_and_preserves_raw_outputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = JobManager(tmp_path / "jobs")
+    job_id, input_path = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture")
+    input_path.write_bytes(b"fixture")
+    manager.enqueue(job_id)
+    analysis_calls = 0
+
+    def fake_analysis(*_args: Any, **_kwargs: Any) -> tuple[None, MusicAnalysis]:
+        nonlocal analysis_calls
+        analysis_calls += 1
+        if analysis_calls == 2:
+            raise RuntimeError("BeatNet fixture failure")
+        return None, _analysis()
+
+    def fake_child(command: list[str], _job_id: str, progress_path: Path | None = None) -> int:
+        output = Path(command[command.index("--output") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        attempt = output.name
+        (output / "original.mid").write_bytes(attempt.encode("ascii"))
+        (output / "recognition.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "2.0",
+                    "engine": "muscriptor",
+                    "model": "fixture",
+                    "notes": [
+                        {
+                            "instrument_group": "acoustic_guitar",
+                            "program": 24,
+                            "is_drum": False,
+                            "pitch": 60,
+                            "start_sec": 0.0,
+                            "end_sec": 0.5,
+                        }
+                    ],
+                    "tracks": [
+                        {
+                            "track_id": stable_track_id("acoustic_guitar", 24, False),
+                            "instrument_group": "acoustic_guitar",
+                            "program": 24,
+                            "is_drum": False,
+                            "label_zh": "原声吉他",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (output / "muscriptor-worker.log").write_text(attempt, encoding="utf-8")
+        if progress_path is not None:
+            progress_path.write_text(json.dumps({"completed": 1, "total": 1, "status": "selection_ready"}), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr("backend.v2_job_manager.analyze_audio", fake_analysis)
+    monkeypatch.setattr(manager, "_run_isolated_child", fake_child)
+    manager._run_job(job_id)
+    first_root = tmp_path / "jobs" / job_id / "output" / "v2-recognition" / "attempt-0001"
+    first_files = [first_root / name for name in ("recognition.json", "original.mid", "muscriptor-worker.log")]
+    first_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in first_files}
+    assert manager._read(job_id)["status"] == "selection_ready"
+
+    state = manager._read(job_id)
+    state["status"] = "failed"
+    state["phase"] = "failed"
+    state["error"] = {"code": "fixture_retry", "message": "retry recognition"}
+    state["v2"]["stage"] = "recognize"
+    manager._write(state)
+
+    manager.retry(job_id)
+    manager._run_job(job_id)
+    second_root = tmp_path / "jobs" / job_id / "output" / "v2-recognition" / "attempt-0002"
+    assert all(path.is_file() for path in first_files)
+    assert all(hashlib.sha256(path.read_bytes()).hexdigest() == first_hashes[path.name] for path in first_files)
+    assert (second_root / "recognition.json").is_file()
+    state = manager._read(job_id)
+    assert state["status"] == "failed"
+    historical = next(item for item in state["artifacts"] if item["artifact_id"] == "v2-recognition-json-attempt-0001")
+    historical_path, _ = manager.artifact_path(job_id, historical["artifact_id"])
+    assert historical_path == first_root / "recognition.json"
+
+    second_files = [second_root / name for name in ("recognition.json", "original.mid", "muscriptor-worker.log")]
+    second_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in second_files}
+    manager.retry(job_id)
+    manager._run_job(job_id)
+    third_root = tmp_path / "jobs" / job_id / "output" / "v2-recognition" / "attempt-0003"
+    assert all(path.is_file() for path in second_files)
+    assert all(hashlib.sha256(path.read_bytes()).hexdigest() == second_hashes[path.name] for path in second_files)
+    assert (third_root / "recognition.json").is_file()
+    state = manager._read(job_id)
+    assert state["status"] == "selection_ready"
+    recognition = next(item for item in state["artifacts"] if item["artifact_id"] == "v2-recognition-json")
+    original_midi = next(item for item in state["artifacts"] if item["artifact_id"] == "v2-original-midi")
+    assert "attempt-0003" in recognition["relative_path"]
+    assert "attempt-0003" in original_midi["relative_path"]
+    assert any(item["artifact_id"] == "v2-recognition-json-attempt-0001" for item in state["artifacts"])
+    assert analysis_calls == 3
+
+
 def test_instrumental_export_registers_service_outputs_and_preserves_override_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     FakeHighAccuracyService.calls = []
     FakeHighAccuracyService.failures = set()
@@ -221,6 +323,91 @@ def test_instrumental_all_pitched_failure_is_explicit(monkeypatch: pytest.Monkey
     assert result["status"] == "failed"
     assert result["error"]["code"] == "high_accuracy_all_tracks_failed"
     assert result["v2"]["score_refusal"]["code"] == "all_pitched_tracks_failed"
+
+
+def test_retrying_failed_revision_preserves_previous_revision_artifacts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path)
+
+    manager.select_v2(job_id, ids)
+    manager._run_job(job_id)
+    first = manager._read(job_id)
+    first_score = next(item for item in first["artifacts"] if item["artifact_id"] == f"v2-selection-r1-{ids[0]}-score-json")
+    first_path, _ = manager.artifact_path(job_id, first_score["artifact_id"])
+    first_hash = hashlib.sha256(first_path.read_bytes()).hexdigest()
+
+    FakeHighAccuracyService.failures = {ids[0]}
+    manager.select_v2(job_id, ids)
+    manager._run_job(job_id)
+    failed = manager._read(job_id)
+    assert failed["status"] == "failed"
+    assert any(item["artifact_id"] == first_score["artifact_id"] for item in failed["artifacts"])
+
+    manager.retry(job_id)
+    manager._run_job(job_id)
+    retried = manager._read(job_id)
+    retained = next(item for item in retried["artifacts"] if item["artifact_id"] == first_score["artifact_id"])
+    retained_path, _ = manager.artifact_path(job_id, retained["artifact_id"])
+    assert retained_path == first_path
+    assert hashlib.sha256(retained_path.read_bytes()).hexdigest() == first_hash
+    assert any(item["artifact_id"].startswith("v2-selection-r2-") for item in retried["artifacts"])
+
+
+def test_instrumental_high_accuracy_error_registers_failure_manifest_and_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class PartialFailureService(FakeHighAccuracyService):
+        failing_id: ClassVar[str] = ""
+
+        def build(self, **kwargs: Any) -> HighAccuracyBuildResult:
+            instrument_id = str(kwargs["instrument_id"])
+            if instrument_id != self.failing_id:
+                return super().build(**kwargs)
+            output_dir = Path(kwargs["output_dir"]).resolve()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            manifest = output_dir / "manifest.json"
+            log = output_dir / "musescore_import.log"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": SERVICE_SCHEMA_VERSION,
+                        "instrument_id": instrument_id,
+                        "variant": str(kwargs["variant"]),
+                        "status": "failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            log.write_text("fixture cause", encoding="utf-8")
+            raise HighAccuracyServiceError(
+                "fixture high accuracy failure",
+                instrument_id=instrument_id,
+                stage="musescore_import",
+                cause="fixture cause",
+                manifest_path=manifest,
+                log_path=log,
+            )
+
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path, two_tracks=True)
+    PartialFailureService.failing_id = ids[0]
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", PartialFailureService)
+    manager.select_v2(job_id, ids)
+    manager._run_job(job_id)
+
+    result = manager._read(job_id)
+    failure = next(item for item in result["v2"]["track_failures"] if item["track_id"] == ids[0])
+    assert result["status"] == "completed"
+    assert failure["stage"] == "musescore_import"
+    assert failure["error"] == "fixture cause"
+    assert any(item["artifact_id"] == f"v2-selection-r1-{ids[0]}-manifest" for item in result["artifacts"])
+    assert any(item["artifact_id"] == f"v2-selection-r1-{ids[0]}-failure-log" for item in result["artifacts"])
+    json.dumps(result, ensure_ascii=False)
 
 
 def test_drum_only_export_stays_midi_only_without_notation_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -311,6 +498,97 @@ def test_vocal_generation_persists_raw_cleanup_and_service_outputs(monkeypatch: 
     assert result["v2"]["generation"]["analysis_reused_from_original"] is True
     assert result["summary"]["raw_note_count"] == 2
     assert result["summary"]["note_count"] == 1
+
+
+def test_vocal_retry_keeps_previous_attempt_diagnostics_downloadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = JobManager(tmp_path / "jobs")
+    job_id, input_path = manager.create_v2_job(original_name="voice.wav", source_kind="vocal", title="voice")
+    input_path.write_bytes(b"fixture")
+    job_dir = tmp_path / "jobs" / job_id
+    vocal_path = job_dir / "output" / "vocal-prep" / "vocals.wav"
+    vocal_path.parent.mkdir(parents=True, exist_ok=True)
+    vocal_path.write_bytes(b"stem")
+    analysis_path = job_dir / "output" / "vocal-prep" / "original-analysis.json"
+    analysis_path.write_text(_analysis().model_dump_json(), encoding="utf-8")
+    state = manager._read(job_id)
+    state.update(
+        {
+            "status": "queued",
+            "phase": "queued",
+            "v2": {
+                **state["v2"],
+                "stage": "vocal_generate",
+                "separation": {
+                    "prepared_vocals_relative": "output/vocal-prep/vocals.wav",
+                    "analysis_relative": "output/vocal-prep/original-analysis.json",
+                },
+            },
+        }
+    )
+    manager._write(state)
+    raw = [NoteEvent(start_sec=0.0, end_sec=0.20, midi=60, raw_pitch=60.02, source="game")]
+    monkeypatch.setattr(
+        "backend.v2_job_manager.run_engine",
+        lambda *_args, **_kwargs: EngineResult(events=raw, engine="game", model="GAME"),
+    )
+
+    class RetryVocalService:
+        calls = 0
+
+        def build(self, **kwargs: Any) -> HighAccuracyBuildResult:
+            type(self).calls += 1
+            if type(self).calls == 1:
+                output_dir = Path(kwargs["output_dir"]).resolve()
+                output_dir.mkdir(parents=True, exist_ok=True)
+                manifest = output_dir / "manifest.json"
+                log = output_dir / "musescore_import.log"
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": SERVICE_SCHEMA_VERSION,
+                            "instrument_id": "vocals",
+                            "variant": "game-cleaned",
+                            "status": "failed",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                log.write_text("first attempt cause", encoding="utf-8")
+                raise HighAccuracyServiceError(
+                    "first attempt failed",
+                    instrument_id="vocals",
+                    stage="musescore_import",
+                    cause="first attempt cause",
+                    manifest_path=manifest,
+                    log_path=log,
+                )
+            return FakeHighAccuracyService().build(**kwargs)
+
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", RetryVocalService)
+    manager._run_job(job_id)
+    failed = manager._read(job_id)
+    assert failed["status"] == "failed"
+    assert failed["error"]["stage"] == "musescore_import"
+    assert failed["error"]["instrument_id"] == "vocals"
+
+    manager.retry(job_id)
+    manager._run_job(job_id)
+    result = manager._read(job_id)
+    artifact_ids = [str(item["artifact_id"]) for item in result["artifacts"]]
+    assert result["status"] == "completed"
+    assert len(artifact_ids) == len(set(artifact_ids))
+    for old_id in (
+        "v2-vocal-game-raw-notes-attempt-0001",
+        "v2-vocal-high-accuracy-manifest-attempt-0001",
+        "v2-vocal-high-accuracy-failure-log-attempt-0001",
+    ):
+        old_path, _ = manager.artifact_path(job_id, old_id)
+        assert old_path.is_file()
+    latest_path, _ = manager.artifact_path(job_id, "v2-vocal-game-raw-notes")
+    assert latest_path.is_file()
+    assert any("attempt-0002" in str(item["relative_path"]) for item in result["artifacts"] if item["artifact_id"] == "v2-vocal-game-raw-notes")
 
 
 @pytest.mark.skipif(not REAL_READY, reason="pinned high-accuracy toolchain is unavailable")
