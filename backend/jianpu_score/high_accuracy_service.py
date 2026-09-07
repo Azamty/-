@@ -674,8 +674,17 @@ class HighAccuracyArtifactService:
                 )
             except (MuseScoreImportError, OSError, ValueError) as exc:
                 raise fail("musescore_import", exc) from exc
-            _write_log(destination, "musescore_import", "command=" + " ".join(musicxml_artifact.command))
-            manifest["stages"]["musescore_import"] = {"status": "completed"}
+            musescore_log = ["command=" + " ".join(musicxml_artifact.command)]
+            musescore_log.extend(
+                f"attempt_{index}=returncode:{return_code} command={' '.join(command)}"
+                for index, (command, return_code) in enumerate(musicxml_artifact.attempts, start=1)
+            )
+            _write_log(destination, "musescore_import", "\n".join(musescore_log))
+            manifest["stages"]["musescore_import"] = {
+                "status": "completed",
+                "attempt_count": len(musicxml_artifact.attempts),
+                "attempt_returncodes": [return_code for _, return_code in musicxml_artifact.attempts],
+            }
 
             try:
                 score, alignment_report = standardize_musicxml(

@@ -585,6 +585,118 @@ def test_musescore_cli_calls_are_serialized_within_one_process(
     assert intervals == [(1, 0), (1, 0)]
 
 
+def test_musescore_transient_crash_is_retried_once_with_fresh_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "MuseScore4.exe"
+    profile = tmp_path / "profile.xml"
+    source = tmp_path / "source.mid"
+    destination = tmp_path / "result.musicxml"
+    executable.write_bytes(b"stub")
+    profile.write_text(PROFILE.read_text(encoding="utf-8"), encoding="utf-8")
+    source.write_bytes(b"MThd")
+    xml = (
+        "<score-partwise version='3.1'><part-list/><part id='P1'>"
+        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
+        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
+        "</part></score-partwise>"
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(tuple(command))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(command, 3221225477, stdout="", stderr="Crashpad")
+        Path(command[command.index("-o") + 1]).write_text(xml, encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(musescore_import.subprocess, "run", fake_run)
+    monkeypatch.setattr(musescore_import.time, "sleep", lambda _seconds: None)
+
+    artifact = convert_performance_midi(
+        source,
+        destination,
+        instrument_id="transient",
+        musescore_path=executable,
+        profile_path=profile,
+    )
+
+    assert destination.is_file()
+    assert len(calls) == 2
+    assert [returncode for _, returncode in artifact.attempts] == [3221225477, 0]
+    assert artifact.command[artifact.command.index("-o") + 1] == str(destination.resolve())
+    assert all(Path(command[command.index("-o") + 1]) != destination for command in calls)
+    assert not list(tmp_path.glob(".result.musescore-*.musicxml"))
+
+
+def test_musescore_transient_crash_after_retry_is_explicit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "MuseScore4.exe"
+    profile = tmp_path / "profile.xml"
+    source = tmp_path / "source.mid"
+    destination = tmp_path / "result.musicxml"
+    executable.write_bytes(b"stub")
+    profile.write_text(PROFILE.read_text(encoding="utf-8"), encoding="utf-8")
+    source.write_bytes(b"MThd")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(command, 3221225477, stdout="", stderr="Crashpad")
+
+    monkeypatch.setattr(musescore_import.subprocess, "run", fake_run)
+    monkeypatch.setattr(musescore_import.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(MuseScoreImportError, match=r"attempts:.*returncode=3221225477"):
+        convert_performance_midi(
+            source,
+            destination,
+            instrument_id="transient-failure",
+            musescore_path=executable,
+            profile_path=profile,
+        )
+
+    assert len(calls) == 2
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".result.musescore-*.musicxml"))
+
+
+def test_musescore_nontransient_failure_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "MuseScore4.exe"
+    profile = tmp_path / "profile.xml"
+    source = tmp_path / "source.mid"
+    destination = tmp_path / "result.musicxml"
+    executable.write_bytes(b"stub")
+    profile.write_text(PROFILE.read_text(encoding="utf-8"), encoding="utf-8")
+    source.write_bytes(b"MThd")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="ordinary failure")
+
+    monkeypatch.setattr(musescore_import.subprocess, "run", fake_run)
+
+    with pytest.raises(MuseScoreImportError, match=r"failed \(1\)"):
+        convert_performance_midi(
+            source,
+            destination,
+            instrument_id="ordinary-failure",
+            musescore_path=executable,
+            profile_path=profile,
+        )
+
+    assert len(calls) == 1
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".result.musescore-*.musicxml"))
+
+
 def test_drum_performance_is_explicitly_midi_only(tmp_path: Path) -> None:
     with pytest.raises(MusicXMLStandardizationError, match="MIDI-only"):
         standardize_musicxml(

@@ -7,6 +7,8 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import tempfile
+import time
 from typing import Mapping
 import xml.etree.ElementTree as ET
 
@@ -33,6 +35,11 @@ class MusicXMLArtifact:
     musicxml_path: Path
     instrument_id: str
     command: tuple[str, ...]
+    attempts: tuple[tuple[tuple[str, ...], int], ...] = ()
+
+
+MUSESCORE_TRANSIENT_CRASH_CODES = frozenset({3221225477})
+MUSESCORE_TRANSIENT_RETRY_DELAY_SEC = 0.2
 
 
 def convert_performance_midi(
@@ -76,52 +83,96 @@ def convert_performance_midi(
     if timeout_sec <= 0:
         raise MuseScoreImportError("MuseScore timeout must be greater than zero")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    command = (
+    command_prefix = (
         os.fspath(muse),
         "--factory-settings",
         "--test-mode",
         "-M",
         os.fspath(profile),
-        "-o",
-        os.fspath(destination),
-        os.fspath(source),
     )
+    attempts: list[tuple[tuple[str, ...], int]] = []
+    attempt_details: list[str] = []
     with MUSESCORE_CLI_LOCK:
-        try:
-            completed = subprocess.run(
-                list(command),
-                cwd=destination.parent,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_sec,
-                check=False,
+        for attempt_number in range(2):
+            temporary_handle, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.stem}.musescore-{attempt_number + 1}-",
+                suffix=destination.suffix or ".musicxml",
+                dir=destination.parent,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise MuseScoreImportError(
-                f"MuseScore {MUSESCORE_VERSION} timed out after {timeout_sec}s for {source.name}"
-            ) from exc
-        except OSError as exc:
-            raise MuseScoreImportError(f"MuseScore could not start: {exc}") from exc
-    if completed.returncode:
-        detail = (completed.stderr or completed.stdout).strip()
-        raise MuseScoreImportError(
-            f"MuseScore MIDI import failed ({completed.returncode}) for {instrument_id}: {detail[-4000:]}"
-        )
-    if not destination.is_file() or destination.stat().st_size < 200:
-        raise MuseScoreImportError(
-            f"MuseScore exited successfully but produced no usable MusicXML for {instrument_id}: {destination}"
-        )
-    try:
-        root_tag = ET.parse(destination).getroot().tag.rsplit("}", 1)[-1]
-    except (ET.ParseError, OSError) as exc:
-        raise MuseScoreImportError(f"MuseScore produced invalid MusicXML for {instrument_id}: {exc}") from exc
-    if root_tag != "score-partwise":
-        raise MuseScoreImportError(
-            f"MuseScore produced {root_tag!r} for {instrument_id}; expected partwise MusicXML"
-        )
-    return MusicXMLArtifact(source, destination, str(instrument_id), command)
+            os.close(temporary_handle)
+            temporary_output = Path(temporary_name)
+            try:
+                # MuseScore expects to create the output itself.  Start from a
+                # fresh path so a Crashpad abort cannot poison the retry.
+                temporary_output.unlink(missing_ok=True)
+                command = command_prefix + ("-o", os.fspath(temporary_output), os.fspath(source))
+                try:
+                    completed = subprocess.run(
+                        list(command),
+                        cwd=destination.parent,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout_sec,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise MuseScoreImportError(
+                        f"MuseScore {MUSESCORE_VERSION} timed out after {timeout_sec}s for {source.name}"
+                    ) from exc
+                except OSError as exc:
+                    raise MuseScoreImportError(f"MuseScore could not start: {exc}") from exc
+                return_code = int(completed.returncode)
+                attempts.append((command, return_code))
+                detail = (completed.stderr or completed.stdout or "").strip()
+                attempt_details.append(
+                    f"attempt={attempt_number + 1}; returncode={return_code}; command={' '.join(command)}; "
+                    f"detail={detail[-1000:]}"
+                )
+                if return_code:
+                    if return_code in MUSESCORE_TRANSIENT_CRASH_CODES and attempt_number == 0:
+                        time.sleep(MUSESCORE_TRANSIENT_RETRY_DELAY_SEC)
+                        continue
+                    retry_note = "; ".join(attempt_details)
+                    raise MuseScoreImportError(
+                        f"MuseScore MIDI import failed ({return_code}) for {instrument_id}; "
+                        f"attempts: {retry_note}"
+                    )
+                if not temporary_output.is_file() or temporary_output.stat().st_size < 200:
+                    raise MuseScoreImportError(
+                        f"MuseScore exited successfully but produced no usable MusicXML for {instrument_id}: "
+                        f"{temporary_output}; attempts: {'; '.join(attempt_details)}"
+                    )
+                try:
+                    root_tag = ET.parse(temporary_output).getroot().tag.rsplit("}", 1)[-1]
+                except (ET.ParseError, OSError) as exc:
+                    raise MuseScoreImportError(
+                        f"MuseScore produced invalid MusicXML for {instrument_id}: {exc}; "
+                        f"attempts: {'; '.join(attempt_details)}"
+                    ) from exc
+                if root_tag != "score-partwise":
+                    raise MuseScoreImportError(
+                        f"MuseScore produced {root_tag!r} for {instrument_id}; expected partwise MusicXML; "
+                        f"attempts: {'; '.join(attempt_details)}"
+                    )
+                if destination.exists() and not overwrite:
+                    raise MuseScoreImportError(f"MusicXML output appeared during conversion: {destination}")
+                os.replace(temporary_output, destination)
+                final_command = command_prefix + ("-o", os.fspath(destination), os.fspath(source))
+                return MusicXMLArtifact(
+                    source,
+                    destination,
+                    str(instrument_id),
+                    final_command,
+                    tuple(attempts),
+                )
+            finally:
+                temporary_output.unlink(missing_ok=True)
+    raise MuseScoreImportError(
+        f"MuseScore MIDI import exhausted retry attempts for {instrument_id}; "
+        f"attempts: {'; '.join(attempt_details)}"
+    )
 
 
 def convert_selected_performance_tracks(
