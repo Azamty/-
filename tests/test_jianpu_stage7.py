@@ -74,6 +74,47 @@ def test_48_tpq_serializer_preserves_durations_chord_and_explicit_tuplet() -> No
     assert "3[ q1 s2 d3. ]" in jianpu
     assert jianpu.count("NextPart") == 2
     assert jianpu.count("|") == 6
+    assert jianpu.count("OctavesAfter") == 3
+
+
+def test_chord_token_preserves_independent_extreme_octaves() -> None:
+    from backend.jianpu_score.quantize import _pitch_token
+
+    # Vendor syntax is a single simple-chord token with octave marks after
+    # each figure; the repeated OctavesAfter directive disambiguates the
+    # marks.  No pitch is reduced to the chord's lowest tone.
+    assert _pitch_token((0, 60, 127), "C") == "1,,,,,15'''''"
+
+
+@pytest.mark.skipif(
+    not render_module.JIANPU.is_file() or not render_module.LILYPOND.is_file(),
+    reason="pinned jianpu-ly or LilyPond is unavailable",
+)
+def test_extreme_multi_octave_chord_renders_without_pitch_loss(tmp_path: Path) -> None:
+    score = Score(
+        title="extreme octave chord",
+        bpm=96,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=192,
+        voices=[
+            ScoreVoice(
+                voice_id="extreme",
+                events=[
+                    ScoreNote(start_tick=0, duration_tick=48, midi=0, chord_pitches=[0, 60, 127]),
+                    ScoreNote(start_tick=48, duration_tick=144, midi=None),
+                ],
+            )
+        ],
+    )
+
+    artifacts = render_score(score, tmp_path, basename="extreme-octave")
+    assert artifacts.svg_paths
+    assert artifacts.midi_path is not None
+    midi = mido.MidiFile(artifacts.midi_path)
+    pitches = {message.note for track in midi.tracks for message in track if message.type == "note_on" and message.velocity}
+    assert {0, 60, 127} <= pitches
 
 
 def test_explicit_tuplet_ratio_is_required_to_be_three_over_two() -> None:

@@ -1449,6 +1449,12 @@ def score_to_jianpu(score: Score) -> str:
         _key_command(key),
         f"4={contexts[0].tempo_bpm}",
         meter_header,
+        # A chord token may contain octave marks between its figures (for
+        # example ``1,,11''``).  jianpu-ly needs the explicit policy to know
+        # that a mark after a figure belongs to that preceding figure.  The
+        # directive is repeated for every NextPart because the vendor resets
+        # NoteheadMarkup state at each part boundary.
+        "OctavesAfter",
         "",
     ]
     serialization_voices = _serialization_voices(score.voices)
@@ -1462,7 +1468,9 @@ def score_to_jianpu(score: Score) -> str:
                 # the score context for later parts so compound meters (and
                 # their key/tempo context) are not reset to the vendor
                 # defaults when a new voice starts.
-                lines.extend([_key_command(key), f"4={contexts[0].tempo_bpm}", meter_header])
+                lines.extend(
+                    [_key_command(key), f"4={contexts[0].tempo_bpm}", meter_header, "OctavesAfter"]
+                )
         output: list[str] = []
         flattened = [item for bar in bars for item in bar]
         global_tuplet_groups = _explicit_tuplet_groups(flattened)
