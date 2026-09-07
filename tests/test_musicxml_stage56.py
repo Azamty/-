@@ -30,7 +30,7 @@ from backend.jianpu_score.musicxml_standardize import (
 )
 from backend.jianpu_score.musescore_import import MuseScoreImportError, convert_performance_midi
 import backend.jianpu_score.musescore_import as musescore_import
-from backend.jianpu_score.quantize import score_to_jianpu
+from backend.jianpu_score.quantize import _validate_explicit_ties, score_to_jianpu
 from backend.jianpu_score.high_accuracy import (
     MUSESCORE_IMPORT_PROFILE_EXPECTED,
     MUSESCORE_IMPORT_PROFILE_SHA256,
@@ -658,6 +658,11 @@ def test_finer_binary_musescore_fragment_is_bounded_to_48_tpq_with_alignment_dia
     )
     notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
     assert [(event.midi, event.start_tick, event.end_tick) for event in notes] == [(60, 756, 765), (67, 765, 768)]
+    assert notes[0].tie is None
+    assert notes[0].tie_types == []
+    for voice in score.voices:
+        _validate_explicit_ties(voice)
+    assert score_to_jianpu(score)
     repairs = report["fine_grid_quantization"]
     assert len(repairs) == 2
     assert {item["original_quarter"] for item in repairs} == {15.96875}
@@ -675,6 +680,124 @@ def test_finer_binary_musescore_fragment_is_bounded_to_48_tpq_with_alignment_dia
     assert report["source_to_score"][1]["musicxml_to_score_movement_start_ticks"] == -1
     assert "Finer binary MusicXML fragments" in " ".join(score.warnings)
     assert "bounded jianpu atom repairs" in " ".join(score.warnings)
+
+
+def test_finer_binary_three_fragment_tie_keeps_stop_for_existing_chain() -> None:
+    payload = _manual_payload()
+    payload.highest_time_quarter = 16
+    payload.parts[0].highest_time_quarter = 16
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="tie-start",
+            kind="note",
+            offset_quarter=15,
+            duration_quarter=0.75,
+            pitches=[60],
+            tie="start",
+            tie_types=["start"],
+        ),
+        WorkerEvent(
+            event_id="tie-continue",
+            kind="note",
+            offset_quarter=15.75,
+            duration_quarter=0.1875,
+            pitches=[60],
+            tie="continue",
+            tie_types=["continue"],
+        ),
+        WorkerEvent(
+            event_id="tie-stop-fine",
+            kind="note",
+            offset_quarter=15.9375,
+            duration_quarter=0.03125,
+            pitches=[60],
+            tie="stop",
+            tie_types=["stop"],
+        ),
+        WorkerEvent(
+            event_id="following-fine",
+            kind="note",
+            offset_quarter=15.96875,
+            duration_quarter=0.03125,
+            pitches=[55],
+        ),
+    ]
+    payload.parts[0].measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=16,
+            end_quarter=16,
+            time_signature="4/4",
+        )
+    ]
+    payload.measures = list(payload.parts[0].measures)
+
+    score, report = standardize_musicxml_payload(payload)
+
+    notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
+    assert [(event.midi, event.start_tick, event.end_tick, event.tie, event.tie_types) for event in notes] == [
+        (60, 720, 756, "start", ["start"]),
+        (60, 756, 765, "stop", ["stop"]),
+        (55, 765, 768, None, []),
+    ]
+    assert report["notation_grid_repairs"][0]["reason"] == "fine_grid_tie_fragment_merged_for_jianpu_atom"
+    for voice in score.voices:
+        _validate_explicit_ties(voice)
+    assert score_to_jianpu(score)
+
+
+def test_finer_binary_chord_tie_slots_clear_only_merged_pitches() -> None:
+    payload = _manual_payload()
+    payload.highest_time_quarter = 16
+    payload.parts[0].highest_time_quarter = 16
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="chord-start",
+            kind="chord",
+            offset_quarter=15.75,
+            duration_quarter=0.1875,
+            pitches=[60, 64],
+            tie_types=["start", "start"],
+        ),
+        WorkerEvent(
+            event_id="chord-stop-fine",
+            kind="chord",
+            offset_quarter=15.9375,
+            duration_quarter=0.03125,
+            pitches=[60, 64],
+            tie_types=["stop", "stop"],
+        ),
+        WorkerEvent(
+            event_id="following-fine",
+            kind="note",
+            offset_quarter=15.96875,
+            duration_quarter=0.03125,
+            pitches=[55],
+        ),
+    ]
+    payload.parts[0].measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=16,
+            end_quarter=16,
+            time_signature="4/4",
+        )
+    ]
+    payload.measures = list(payload.parts[0].measures)
+
+    score, _report = standardize_musicxml_payload(payload)
+
+    notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
+    assert notes[0].chord_pitches == [60, 64]
+    assert notes[0].tie is None
+    assert notes[0].tie_types == [None, None]
+    for voice in score.voices:
+        _validate_explicit_ties(voice)
+    assert score_to_jianpu(score)
 
 
 def test_score_normalizer_retains_pickup_and_meter_key_tempo_changes_in_metadata() -> None:

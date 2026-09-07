@@ -1203,9 +1203,19 @@ def _update_alignment_end(item: dict[str, Any], end_tick: int) -> None:
         item["musicxml_to_score_movement_end_ticks"] = int(end_tick) - int(musicxml_end)
 
 
-def _event_pitch(event: ScoreNote) -> int | None:
-    pitches = event.chord_pitches or ([event.midi] if event.midi is not None else [])
-    return pitches[0] if len(pitches) == 1 else None
+def _event_pitches(event: ScoreNote | None) -> tuple[int, ...]:
+    if event is None:
+        return ()
+    return tuple(event.chord_pitches) if event.chord_pitches else ((event.midi,) if event.midi is not None else ())
+
+
+def _event_tie_values(event: ScoreNote | None) -> list[str | None]:
+    pitches = _event_pitches(event)
+    if not pitches or event is None:
+        return []
+    if event.tie_types and len(event.tie_types) == len(pitches):
+        return list(event.tie_types)
+    return [event.tie] * len(pitches)
 
 
 def _event_musicxml_id(event: ScoreNote) -> str | None:
@@ -1213,18 +1223,28 @@ def _event_musicxml_id(event: ScoreNote) -> str | None:
     return str(value) if value is not None else None
 
 
-def _set_tie_stop(event: ScoreNote) -> ScoreNote:
-    """Close the surviving part of a tie after its tiny terminal fragment is removed."""
+def _set_tie_after_merge(event: ScoreNote, merged_pitches: set[int]) -> ScoreNote:
+    """Close or clear each surviving tie after a terminal fragment is removed.
 
-    if event.chord_pitches:
-        tie_types = list(event.tie_types)
-        if not tie_types:
-            tie_types = [event.tie] * len(event.chord_pitches)
-        tie_types = ["stop" if value in {"start", "continue"} else value for value in tie_types]
-        tie = "stop" if tie_types and all(value == "stop" for value in tie_types) else None
+    A preceding ``start`` has no incoming tie after its ``stop`` successor is
+    removed, while a preceding ``continue``/``stop`` still closes a tie that
+    began in an earlier event.  Chord tie slots are updated independently.
+    """
+
+    pitches = _event_pitches(event)
+    values = _event_tie_values(event)
+    if not pitches:
+        return event.model_copy(update={"tie": None, "tie_types": []})
+    for index, pitch in enumerate(pitches):
+        if pitch not in merged_pitches:
+            continue
+        values[index] = "stop" if values[index] in {"stop", "continue"} else None
+    if len(pitches) > 1:
+        tie_types = values
     else:
-        tie_types = ["stop"]
-        tie = "stop"
+        tie_types = values if values and values[0] is not None else []
+    present = [value for value in tie_types if value is not None]
+    tie = present[0] if present and len(present) == len(tie_types) and all(value == present[0] for value in present) else None
     return event.model_copy(update={"tie": tie, "tie_types": tie_types})
 
 
@@ -1255,8 +1275,9 @@ def _repair_fine_score_events(
                 continue
 
             previous = events[index - 1] if index else None
-            current_pitch = _event_pitch(current)
-            previous_pitch = _event_pitch(previous) if previous is not None else None
+            current_pitches = _event_pitches(current)
+            previous_pitches = _event_pitches(previous)
+            current_ties = _event_tie_values(current)
             current_id = _event_musicxml_id(current)
             previous_id = _event_musicxml_id(previous) if previous is not None else None
 
@@ -1264,11 +1285,11 @@ def _repair_fine_score_events(
             # Snap the complete tied span to the nearest 3-tick boundary and
             # close the tie on the surviving event.
             if (
-                current_pitch is not None
+                current_pitches
                 and previous is not None
-                and previous_pitch == current_pitch
+                and previous_pitches == current_pitches
                 and previous.end_tick == current.start_tick
-                and current.tie in {"stop", "continue"}
+                and all(value in {"stop", "continue"} for value in current_ties)
             ):
                 combined_ticks = current.end_tick - previous.start_tick
                 snapped_duration = max(
@@ -1279,8 +1300,9 @@ def _repair_fine_score_events(
                 movement = snapped_end - current.end_tick
                 if abs(movement) <= MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS and snapped_end > previous.start_tick:
                     event_ids = {value for value in (previous_id, current_id) if value is not None}
-                    updated_previous = _set_tie_stop(
-                        previous.model_copy(update={"duration_tick": snapped_end - previous.start_tick})
+                    updated_previous = _set_tie_after_merge(
+                        previous.model_copy(update={"duration_tick": snapped_end - previous.start_tick}),
+                        set(current_pitches),
                     )
                     updated_metadata = dict(updated_previous.metadata)
                     updated_metadata["notation_grid_repair"] = {
@@ -1298,7 +1320,8 @@ def _repair_fine_score_events(
                             "action": "removed_terminal_tie_fragment",
                             "voice_id": voice.voice_id,
                             "musicxml_event_ids": sorted(event_ids),
-                            "pitch": current_pitch,
+                            "pitch": current_pitches[0] if len(current_pitches) == 1 else None,
+                            "pitches": list(current_pitches),
                             "original_start_tick": current.start_tick,
                             "original_end_tick": current.end_tick,
                             "repaired_end_tick": snapped_end,
@@ -1338,7 +1361,8 @@ def _repair_fine_score_events(
                             "action": "move_note_onset_to_previous_lane_boundary",
                             "voice_id": voice.voice_id,
                             "musicxml_event_id": current_id,
-                            "pitch": current_pitch,
+                            "pitch": current_pitches[0] if len(current_pitches) == 1 else None,
+                            "pitches": list(current_pitches),
                             "original_start_tick": current.start_tick,
                             "repaired_start_tick": target_start,
                             "end_tick": current.end_tick,
