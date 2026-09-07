@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any, Mapping
 
 import mido
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,6 +27,7 @@ benchmark = _load("high_accuracy_benchmark_dataset_test", ROOT / "scripts" / "hi
 generator = _load("high_accuracy_fixture_generator_test", ROOT / "scripts" / "generate_high_accuracy_benchmarks.py")
 runner_module = _load("high_accuracy_batch_runner_test", ROOT / "scripts" / "run_high_accuracy_batch.py")
 maestro = _load("prepare_maestro_benchmark_test", ROOT / "scripts" / "prepare_maestro_benchmark.py")
+ccmusic = _load("prepare_ccmusic_benchmark_test", ROOT / "scripts" / "prepare_ccmusic_benchmark.py")
 
 
 def _hash(path: Path) -> str:
@@ -343,3 +345,55 @@ def test_maestro_selector_records_archive_and_member_hashes(tmp_path: Path, monk
     assert result["archive"]["sha256"] == _hash(archive)
     assert all(item["midi"]["sha256"] for item in result["cases"])
     assert (tmp_path / "maestro" / "selection_manifest.json").is_file()
+
+
+def test_ccmusic_registry_cases_are_five_independent_beat_eligible_segments() -> None:
+    registry = benchmark._load_registry(ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json")
+    cases = [item for item in registry["cases"] if item["id"].startswith("ccmusic-yueding-")]
+    assert [item["id"] for item in cases] == [f"ccmusic-yueding-{index:02d}" for index in range(1, 6)]
+    assert all(item["beat_annotation_independent"] is True for item in cases)
+    assert all(item["evaluation_scope"] == "production_end_to_end" for item in cases)
+    assert all(item["source_id"] == "ccmusic-demo" for item in cases)
+    pjs = [item for item in registry["cases"] if item["id"].startswith("pjs")]
+    assert len(pjs) == 5
+    assert all(item["reference_midi_reliable"] is False for item in pjs)
+    assert all(item["beat_annotation_independent"] is False for item in pjs)
+
+
+def test_ccmusic_archive_verification_rejects_wrong_hash_and_traversal(tmp_path: Path, monkeypatch) -> None:
+    import zipfile
+
+    archive = tmp_path / "ccmusic.zip"
+    names = [f"{ccmusic.SOURCE_PREFIX}{name}" for name in sorted(ccmusic.EXPECTED_MEMBERS)]
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for index, name in enumerate(names):
+            bundle.writestr(name, f"fixture-{index}".encode())
+    monkeypatch.setattr(ccmusic, "EXPECTED_ARCHIVE_BYTES", archive.stat().st_size)
+    monkeypatch.setattr(ccmusic, "EXPECTED_MD5", ccmusic._hash_file(archive, "md5").upper())
+    monkeypatch.setattr(ccmusic, "EXPECTED_SHA256", ccmusic._sha256(archive))
+    monkeypatch.setattr(ccmusic, "EXPECTED_SHA256", "0" * 64)
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        ccmusic._verify_archive(archive)
+    monkeypatch.setattr(ccmusic, "EXPECTED_SHA256", ccmusic._sha256(archive))
+    _sha, selected = ccmusic._verify_archive(archive)
+    assert sorted(Path(name).name for name in selected) == sorted(ccmusic.EXPECTED_MEMBERS)
+
+    traversal = tmp_path / "traversal.zip"
+    with zipfile.ZipFile(traversal, "w") as bundle:
+        bundle.writestr("../outside.txt", b"bad")
+    monkeypatch.setattr(ccmusic, "EXPECTED_ARCHIVE_BYTES", traversal.stat().st_size)
+    monkeypatch.setattr(ccmusic, "EXPECTED_MD5", ccmusic._hash_file(traversal, "md5").upper())
+    monkeypatch.setattr(ccmusic, "EXPECTED_SHA256", ccmusic._sha256(traversal))
+    with pytest.raises(ValueError, match="unsafe archive member"):
+        ccmusic._verify_archive(traversal)
+
+
+def test_ccmusic_beat_grid_has_exact_bar_downbeats(tmp_path: Path) -> None:
+    output = tmp_path / "segment.beat_grid.json"
+    ccmusic._write_beat_grid(output, 72)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    beats = payload["beat_grid"]["beats"]
+    assert len(beats) == 17
+    assert [item["score_quarter"] for item in beats[:3]] == [72, 73, 74]
+    assert [item["index"] for item in payload["beat_grid"]["downbeats"]] == [0, 4, 8, 12, 16]
+    assert beats[-1]["time_sec"] == 12.0

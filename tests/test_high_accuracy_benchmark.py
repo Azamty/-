@@ -28,31 +28,42 @@ def _write_midi(path: Path, *, pitch: int = 60, ppq: int = 480, pitches: tuple[i
 def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
     registry = benchmark._load_registry(ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json")
     assert registry["schema_version"] == "2.0"
-    assert len(registry["cases"]) == 31
+    assert len(registry["cases"]) == 36
     assert sum(item.get("reference_midi_reliable") is True for item in registry["cases"]) == 30
-    assert {item["id"] for item in registry["cases"] if item["category"] == "vocal"} == {"pjs001", "pjs002", "pjs003", "pjs004", "pjs005"}
+    assert {item["id"] for item in registry["cases"] if item["category"] == "vocal"} == {
+        "ccmusic-yueding-01",
+        "ccmusic-yueding-02",
+        "ccmusic-yueding-03",
+        "ccmusic-yueding-04",
+        "ccmusic-yueding-05",
+    }
+    assert {item["id"] for item in registry["cases"] if item["category"] == "vocal_diagnostic"} == {
+        "pjs001",
+        "pjs002",
+        "pjs003",
+        "pjs004",
+        "pjs005",
+    }
     assert sum(item["category"] == "synthetic_rendered" for item in registry["cases"]) == 10
     assert sum(item["category"] == "official_piano_rendered" for item in registry["cases"]) == 10
     assert sum(item["category"] == "specialized_fixture" for item in registry["cases"]) == 5
     reliable = [item for item in registry["cases"] if item.get("reference_midi_reliable") is True]
-    assert sum(item.get("beat_annotation_independent") is True for item in reliable) == 25
-    assert sum(item.get("beat_annotation_independent") is False for item in reliable) == 5
+    assert sum(item.get("beat_annotation_independent") is True for item in reliable) == 30
+    assert sum(item.get("beat_annotation_independent") is False for item in reliable) == 0
     assert all(
-        item.get("beat_annotation_source") == "deterministic_midi_render_ground_truth"
+        item.get("beat_annotation_source") in {"deterministic_midi_render_ground_truth", "ccmusic_musicxml_score_ground_truth"}
         for item in reliable
         if item.get("beat_annotation_independent") is True
     )
-    assert all(
-        item.get("beat_annotation_source") == "reference_midi_derived"
-        for item in reliable
-        if item.get("beat_annotation_independent") is False
-    )
+    assert all(item.get("reference_midi_reliable") is False for item in registry["cases"] if item["category"] == "vocal_diagnostic")
+    assert all(item.get("evaluation_policy") == "diagnostic_only" for item in registry["cases"] if item["category"] == "vocal_diagnostic")
+    assert registry["sources"]["ccmusic-demo"]["archive_sha256"] == "477b5466936eec40cef7dfd43205900e3e4a651b8ec671fdccaff48910523053"
     luv = next(item for item in registry["cases"] if item["id"] == "luv-letter")
     assert luv["evaluation_policy"] == "integrity_and_manual_listening_only"
     assert luv["reference_midi_reliable"] is False
 
     report = benchmark.build_report(registry)
-    assert report["registered_count"] == 31
+    assert report["registered_count"] == 36
     assert report["evaluated_count"] == 0
     assert report["accuracy_claim_ready"] is False
     assert all(item["metrics"]["pitch_f1"] is None for item in report["cases"])

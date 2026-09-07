@@ -30,7 +30,7 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
 
 ## 重复验收
 
-验收登记文件是 `fixtures/high_accuracy/benchmark_manifest.json`。当前清单包含 30 个可靠 case，另保留 `luv-letter` 作为本机完整性候选；脚本不会把音频或语料复制进 Git。30 个可靠 case 的构成为：10 个固定 seed 的钢琴/吉他/贝斯/多轨合成样本、10 个 MAESTRO v3 官方钢琴 MIDI 渲染候选、PJS 日语歌声 5 条和 5 个弱起/3/4/6/8/三连音/变速/复杂和弦专门 fixture。
+验收登记文件是 `fixtures/high_accuracy/benchmark_manifest.json`。当前清单包含 30 个可靠 case，另保留 5 个 PJS 孤立歌声诊断 case 和 `luv-letter` 本机完整性候选；脚本不会把音频或语料复制进 Git。30 个可靠 case 的构成为：10 个固定 seed 的钢琴/吉他/贝斯/多轨合成样本、10 个 MAESTRO v3 官方钢琴 MIDI 渲染候选、5 个 CCMusic 中文混合曲片段和 5 个弱起/3/4/6/8/三连音/变速/复杂和弦专门 fixture。CCMusic 的五段来自同一首 Yueding 录音，分别覆盖 MusicXML q40、56、72、88、104 的 16 个四分音符（每段 12 秒），用于真实混合人声的 production smoke 与主门槛；它们不是五首独立歌曲。
 
 ```powershell
 & .\.venv\Scripts\python.exe scripts\high_accuracy_benchmark.py --check
@@ -44,7 +44,7 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
   --case-id special-triplet
 ```
 
-它会登记本机可用的 PJS `pjs001`–`pjs005`（PJS 数据为 CC BY-SA 4.0），并登记 `E:\edge\first\Luv Letter.mp3`。如果已有服务结果，按 case id 放入结果目录后计算真实的 pitch F1、和弦保留率、节奏误差、拍点 F1、重拍 F1 和崩溃状态：
+它会保留本机可用的 PJS `pjs001`–`pjs005`（PJS 数据为 CC BY-SA 4.0）作为孤立歌声 pitch/rhythm 诊断，不把它们算入可靠 production 集或独立 BeatNet gate；同时登记 `E:\edge\first\Luv Letter.mp3`。如果已有服务结果，按 case id 放入结果目录后计算真实的 pitch F1、和弦保留率、节奏误差、拍点 F1、重拍 F1 和崩溃状态：
 
 ```powershell
 & .\.venv\Scripts\python.exe scripts\high_accuracy_benchmark.py `
@@ -67,6 +67,14 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
 
 MAESTRO 10 条目前只登记官方入口、CC BY-NC-SA 4.0、MIDI archive SHA-256 和选取规则，状态是 `not_downloaded`；它没有被下载或冒充本地结果。待审查后按清单中的官方下载地址取得 archive，校验 `70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c`，再记录实际 archive 字节数、选中文件 hash，并从 MIDI 渲染音频。该本地音频是确定性的谐波振荡器渲染，保留 MIDI 音高、时值、起音、力度和 tempo map；它不代表真实钢琴音色、踏板噪声、房间声学或原始演奏细节，manifest 会把这些限制写入 `render_domain`。合成 fixture 会按拍号在记谱 downbeat 提高 MIDI velocity，音高和时序保持不变，以便原曲 BeatNet 有可解释的小节重音；guitar 采用较小的 downbeat 增量来保持 MuScriptor 对基音的稳定识别，其他音色使用更明显的增量。这仍是本地合成域，不能冒充真实表演录音。PJS 的拍点文件由同源 MIDI 透明推导，报告会保留这一限制，不把它描述成独立人工 beat 标注。
 
+CCMusic demo 使用官方 Zenodo 记录 `https://zenodo.org/records/5676893`（DOI `10.5281/zenodo.5676893`）。准备脚本只接受本地 archive，要求字节数 `302024881`、MD5 `DBDC4A7E019C6B7A1424D99FDD8A7838` 和 SHA-256 `477B5466936EEC40CEF7DFD43205900E3E4A651B8EC671FDCCAFF48910523053` 全部匹配；记录说明其可用于 computational musicology，但没有 SPDX license identifier。它只解包 cpop/Yueding 的五个成员，使用 pinned music21 worker 读取 MusicXML，按 onset correlation 记录 tuned vocal 与 XML guide 的全局延迟，再将 vocal 放入 48 kHz accompaniment，生成五段 12 秒混合音频、裁剪 vocal-score MIDI 和独立于模型输出的 MusicXML beat/downbeat grid。所有生成音频和 MIDI 仍在 `.cache`，不提交到仓库：
+
+```powershell
+& .\.venv\Scripts\python.exe scripts\prepare_ccmusic_benchmark.py `
+  --archive .\.cache\packages\ccmusic-database-demo.zip `
+  --overwrite
+```
+
 校验和选取官方 MIDI 的命令是：
 
 ```powershell
@@ -86,7 +94,7 @@ MIDI 音符指标先把各文件的 tick 精确换算为四分音符位置，因
   --baseline-result-root .\artifacts\review\high-accuracy-benchmark\baseline
 ```
 
-报告会分别给出 `accuracy_gate_scopes.quantizer_isolation_overall` 与 `accuracy_gate_scopes.production_end_to_end_subset`，但它们只是诊断。`accuracy_claim_ready` 的唯一主门槛是 baseline/new 共享的 30 个可靠 production case，且 production raw 必须来自模型输出；quantizer isolation case、1+1 的 scope 拆分或 reference-derived raw 都不能替代这 30 个 case。production gate 还要求至少 25 个 eligible case 同时有 BeatNet beat/downbeat 指标，不能用少数 case 的高平均分覆盖缺失样本。合成音频和本地 MIDI 渲染的 25 个拍点文件是由精确 MIDI render ground truth 推导的可复现模型独立标注，不是人工拍点；PJS 的 5 个同源 MIDI 派生拍点明确 excluded，不计入独立 BeatNet F1。量化器隔离总体只比较共享 raw 上的节奏、音高和和弦；端到端子集按真实音频模型产物比较同样指标。主门槛还必须满足无崩溃、节奏误差相对 baseline 下降至少 20%、pitch F1 下降不超过 0.01 且和弦保留率不下降；缺少任何数据会列出具体原因并保持 `false`。也可以用 `--baseline-report` 读取已经生成的 baseline 报告。
+报告会分别给出 `accuracy_gate_scopes.quantizer_isolation_overall` 与 `accuracy_gate_scopes.production_end_to_end_subset`，但它们只是诊断。`accuracy_claim_ready` 的唯一主门槛是 baseline/new 共享的 30 个可靠 production case，且 production raw 必须来自模型输出；quantizer isolation case、1+1 的 scope 拆分或 reference-derived raw 都不能替代这 30 个 case。production gate 还要求全部 30 个 eligible case 同时有 BeatNet beat/downbeat 指标，不能用少数 case 的高平均分覆盖缺失样本。合成音频和本地 MIDI 渲染的 25 个拍点文件，以及 CCMusic 五段从 MusicXML score timing 生成的拍点文件，都是独立于模型输出的可复现 ground truth；PJS 的 5 个同源 MIDI 派生拍点明确 excluded，不计入独立 BeatNet F1。量化器隔离总体只比较共享 raw 上的节奏、音高和和弦；端到端子集按真实音频模型产物比较同样指标。主门槛还必须满足无崩溃、节奏误差相对 baseline 下降至少 20%、pitch F1 下降不超过 0.01 且和弦保留率不下降；缺少任何数据会列出具体原因并保持 `false`。也可以用 `--baseline-report` 读取已经生成的 baseline 报告。
 
 运行后端与前端检查：
 

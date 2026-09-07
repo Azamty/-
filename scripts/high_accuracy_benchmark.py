@@ -645,7 +645,7 @@ def build_report(
         production_baseline,
         minimum_cases=30,
         require_beat_metrics=True,
-        minimum_beat_cases=25,
+        minimum_beat_cases=30,
         _include_scopes=False,
     )
     diagnostic_claim = assess_accuracy_claim(cases, baseline_cases)
