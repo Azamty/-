@@ -169,6 +169,18 @@ class ScoreNote(BaseModel):
     velocity: int | None = Field(default=None, ge=1, le=127)
     raw_pitch: float | None = Field(default=None, allow_inf_nan=False)
     stem_id: str | None = None
+    # Notation-preserving fields.  Existing callers may continue to provide
+    # only ``midi``; MusicXML normalization fills these when a chord, staff,
+    # tie, or tuplet needs to remain explicit.
+    chord_pitches: list[int] = Field(default_factory=list)
+    staff: int | None = Field(default=None, ge=1)
+    source_voice: str | None = None
+    tie: str | None = None
+    tie_types: list[str] = Field(default_factory=list)
+    tuplet_actual: int | None = Field(default=None, gt=0)
+    tuplet_normal: int | None = Field(default=None, gt=0)
+    dots: int = Field(default=0, ge=0)
+    measure_number: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @property
@@ -178,6 +190,31 @@ class ScoreNote(BaseModel):
     @property
     def is_rest(self) -> bool:
         return self.midi is None
+
+    @property
+    def is_chord(self) -> bool:
+        return len(self.chord_pitches) > 1
+
+    @field_validator("chord_pitches")
+    @classmethod
+    def validate_chord_pitches(cls, value: list[int]) -> list[int]:
+        if any(pitch < 0 or pitch > 127 for pitch in value):
+            raise ValueError("chord_pitches must contain MIDI pitches between 0 and 127")
+        return value
+
+    @field_validator("tie")
+    @classmethod
+    def validate_tie(cls, value: str | None) -> str | None:
+        if value is not None and value not in {"start", "stop", "continue"}:
+            raise ValueError("tie must be start, stop, continue, or null")
+        return value
+
+    @field_validator("tie_types")
+    @classmethod
+    def validate_tie_types(cls, value: list[str]) -> list[str]:
+        if any(item not in {"start", "stop", "continue"} for item in value):
+            raise ValueError("tie_types must contain start, stop, or continue")
+        return value
 
 
 class ScoreVoice(BaseModel):
@@ -189,6 +226,8 @@ class ScoreVoice(BaseModel):
     events: list[ScoreNote] = Field(default_factory=list)
     label: str | None = None
     stem_id: str | None = None
+    staff: int | None = Field(default=None, ge=1)
+    source_voice: str | None = None
 
 
 class Score(BaseModel):

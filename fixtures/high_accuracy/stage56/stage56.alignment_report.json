@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "source_musicxml": "fixtures/high_accuracy/stage56/stage56.musicxml",
+  "music21_version": "9.9.2",
+  "source_note_count": 0,
+  "musicxml_event_count": 18,
+  "score_voice_count": 3,
+  "source_to_score": [],
+  "repairs": [],
+  "source_note_policy": "performance_metadata_restores_truncated_or_missing_spans_when supplied"
+}

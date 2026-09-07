@@ -1,0 +1,803 @@
+"""Strict MusicXML -> 48 TPQ Score normalization.
+
+MuseScore performs the performance-MIDI notation decisions.  This module only
+invokes the isolated music21 worker, validates its versioned JSON, preserves
+notation metadata, and converts the result into the renderer-independent
+Score contract.  It never imports music21 and never falls back to the legacy
+uniform quantizer.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+from typing import Any, Iterable, Literal, Mapping
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .domain import Score, ScoreNote, ScoreVoice, TempoEvent, normalize_key, normalize_time_signature, sanitize_title
+from .high_accuracy import MUSIC21_VERSION, MUSESCORE_VERSION, ROOT, resolve_notation_python
+
+
+WORKER_SCHEMA_VERSION = "1.0"
+SCORE_QUARTER_TICKS = 48
+PERFORMANCE_QUARTER_TICKS = 480
+WORKER = ROOT / "scripts" / "musicxml_score_worker.py"
+
+
+class MusicXMLStandardizationError(RuntimeError):
+    """Raised for an explicit worker or normalization failure."""
+
+
+class WorkerEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: str
+    kind: Literal["note", "chord", "rest", "grace"]
+    offset_quarter: float = Field(ge=0)
+    duration_quarter: float = Field(ge=0)
+    pitches: list[int] = Field(default_factory=list)
+    tie: str | None = None
+    tie_types: list[str] = Field(default_factory=list)
+    tuplet_actual: int | None = Field(default=None, gt=0)
+    tuplet_normal: int | None = Field(default=None, gt=0)
+    dots: int = Field(default=0, ge=0)
+    grace: bool = False
+    voice: str = "1"
+    staff: int = Field(default=1, ge=1)
+    measure_number: int | None = None
+
+    @field_validator("pitches")
+    @classmethod
+    def validate_pitches(cls, value: list[int]) -> list[int]:
+        if any(pitch < 0 or pitch > 127 for pitch in value):
+            raise ValueError("worker pitches must be MIDI values between 0 and 127")
+        return value
+
+
+class WorkerMeasure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    part_index: int
+    number: int
+    start_quarter: float = Field(ge=0)
+    duration_quarter: float = Field(ge=0)
+    end_quarter: float = Field(ge=0)
+    time_signature: str | None = None
+    is_pickup: bool = False
+
+
+class WorkerPart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    part_id: str
+    name: str
+    instrument: str = ""
+    highest_time_quarter: float = Field(ge=0)
+    events: list[WorkerEvent] = Field(default_factory=list)
+    measures: list[WorkerMeasure] = Field(default_factory=list)
+
+
+class WorkerTempo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    offset_quarter: float = Field(ge=0)
+    bpm: float = Field(gt=0)
+
+
+class WorkerTimeSignature(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    offset_quarter: float = Field(ge=0)
+    ratio: str
+    numerator: int = Field(gt=0)
+    denominator: int = Field(gt=0)
+
+
+class WorkerKeySignature(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    offset_quarter: float = Field(ge=0)
+    key: str
+    sharps: int
+
+
+class WorkerPickup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    is_pickup: bool = False
+    duration_quarter: float = Field(default=0, ge=0)
+    measure_number: int | None = None
+
+
+class WorkerPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str
+    worker: str
+    music21_version: str
+    source_path: str
+    title: str
+    highest_time_quarter: float = Field(ge=0)
+    parts: list[WorkerPart] = Field(min_length=1)
+    measures: list[WorkerMeasure] = Field(default_factory=list)
+    tempo_events: list[WorkerTempo] = Field(default_factory=list)
+    time_signature_events: list[WorkerTimeSignature] = Field(default_factory=list)
+    key_signature_events: list[WorkerKeySignature] = Field(default_factory=list)
+    pickup: WorkerPickup = Field(default_factory=WorkerPickup)
+
+
+@dataclass(frozen=True)
+class StandardizedScoreArtifact:
+    """A validated Score and its two audit JSON outputs."""
+
+    musicxml_path: Path
+    score_json_path: Path
+    alignment_report_path: Path
+    score: Score
+    alignment_report: dict[str, Any]
+
+
+@dataclass
+class _RawEvent:
+    event_id: str
+    part_group: str
+    part_id: str
+    staff: int
+    voice: str
+    start_tick: int
+    end_tick: int
+    pitches: list[int]
+    kind: str
+    tie: str | None
+    tie_types: list[str]
+    tuplet_actual: int | None
+    tuplet_normal: int | None
+    dots: int
+    measure_number: int | None
+    metadata: dict[str, Any]
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MusicXMLStandardizationError(f"cannot read worker JSON: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise MusicXMLStandardizationError("music21 worker output must be a JSON object")
+    return value
+
+
+def run_musicxml_worker(
+    musicxml_path: str | Path,
+    *,
+    notation_python: str | Path | None = None,
+    timeout_sec: int = 180,
+) -> WorkerPayload:
+    """Run the only music21 process and validate its versioned output."""
+
+    source = Path(musicxml_path).expanduser().resolve()
+    python = Path(notation_python).expanduser().resolve() if notation_python else resolve_notation_python()
+    if not source.is_file():
+        raise MusicXMLStandardizationError(f"MusicXML input does not exist: {source}")
+    if not python.is_file():
+        raise MusicXMLStandardizationError(f"music21 notation environment is unavailable: {python}")
+    if not WORKER.is_file():
+        raise MusicXMLStandardizationError(f"music21 worker is missing: {WORKER}")
+    if timeout_sec <= 0:
+        raise MusicXMLStandardizationError("music21 worker timeout must be greater than zero")
+    with tempfile.TemporaryDirectory(prefix="jianpu-music21-worker-") as temporary:
+        output = Path(temporary) / "worker.json"
+        environment = os.environ.copy()
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment.pop("PYTHONPATH", None)
+        command = [os.fspath(python), os.fspath(WORKER), "--input", os.fspath(source), "--output", os.fspath(output)]
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise MusicXMLStandardizationError(f"music21 worker timed out after {timeout_sec}s") from exc
+        except OSError as exc:
+            raise MusicXMLStandardizationError(f"music21 worker could not start: {exc}") from exc
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise MusicXMLStandardizationError(f"music21 worker failed ({completed.returncode}): {detail[-4000:]}")
+        if not output.is_file() or output.stat().st_size < 2:
+            raise MusicXMLStandardizationError("music21 worker exited successfully without a JSON output")
+        raw = _load_json(output)
+    try:
+        payload = WorkerPayload.model_validate(raw)
+    except Exception as exc:
+        raise MusicXMLStandardizationError(f"invalid music21 worker schema: {exc}") from exc
+    if payload.schema_version != WORKER_SCHEMA_VERSION:
+        raise MusicXMLStandardizationError(
+            f"music21 worker schema mismatch: expected {WORKER_SCHEMA_VERSION}, got {payload.schema_version}"
+        )
+    if payload.music21_version != MUSIC21_VERSION:
+        raise MusicXMLStandardizationError(
+            f"music21 worker version mismatch: expected {MUSIC21_VERSION}, got {payload.music21_version}"
+        )
+    return payload
+
+
+def _part_group(part_id: str) -> str:
+    marker = "-Staff"
+    return part_id.split(marker, 1)[0] if marker in part_id else part_id
+
+
+def _quarter_to_tick(value: float) -> int:
+    if not math.isfinite(value):
+        raise MusicXMLStandardizationError(f"non-finite MusicXML quarter position: {value!r}")
+    return int(round(value * SCORE_QUARTER_TICKS))
+
+
+def _normalize_worker_key(value: str) -> str:
+    text = str(value).strip()
+    lowered = text.lower()
+    if lowered.endswith(" minor"):
+        text = text[:-6].strip() + "m"
+    elif lowered.endswith(" major"):
+        text = text[:-6].strip()
+    try:
+        return normalize_key(text)
+    except ValueError as exc:
+        raise MusicXMLStandardizationError(f"unsupported MusicXML key signature: {value!r}") from exc
+
+
+def _normalize_worker_meter(value: str) -> str:
+    try:
+        return normalize_time_signature(str(value))
+    except ValueError as exc:
+        raise MusicXMLStandardizationError(
+            f"unsupported MusicXML time signature {value!r}; supported meters are 2/4, 3/4, 4/4, 6/8"
+        ) from exc
+
+
+def _source_notes(performance_metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if not performance_metadata:
+        return []
+    values = performance_metadata.get("notes", [])
+    if not isinstance(values, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, Mapping):
+            continue
+        try:
+            start_480 = int(value["start_tick"])
+            end_480 = int(value["end_tick"])
+            midi = int(value["midi"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end_480 <= start_480:
+            continue
+        result.append(
+            {
+                "source_index": int(value.get("index", index)),
+                "midi": midi,
+                "start_tick_480": start_480,
+                "end_tick_480": end_480,
+                "start_tick": int(round(start_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS)),
+                "end_tick": int(round(end_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS)),
+                "voice_id": value.get("voice_id"),
+            }
+        )
+    return result
+
+
+def _worker_raw_events(payload: WorkerPayload) -> tuple[list[_RawEvent], list[dict[str, Any]]]:
+    events: list[_RawEvent] = []
+    diagnostics: list[dict[str, Any]] = []
+    for part in payload.parts:
+        group = _part_group(part.part_id)
+        for item in part.events:
+            if item.kind == "grace" or item.grace or item.duration_quarter <= 0:
+                diagnostics.append(
+                    {
+                        "musicxml_event_id": item.event_id,
+                        "reason": "grace_event_not_representable_at_48_tpq",
+                        "action": "omitted_with_diagnostic",
+                    }
+                )
+                continue
+            start_tick = _quarter_to_tick(item.offset_quarter)
+            end_tick = max(start_tick + 1, _quarter_to_tick(item.offset_quarter + item.duration_quarter))
+            events.append(
+                _RawEvent(
+                    event_id=item.event_id,
+                    part_group=group,
+                    part_id=part.part_id,
+                    staff=item.staff,
+                    voice=item.voice,
+                    start_tick=start_tick,
+                    end_tick=end_tick,
+                    pitches=list(item.pitches),
+                    kind=item.kind,
+                    tie=item.tie,
+                    tie_types=list(item.tie_types),
+                    tuplet_actual=item.tuplet_actual,
+                    tuplet_normal=item.tuplet_normal,
+                    dots=item.dots,
+                    measure_number=item.measure_number,
+                    metadata={"musicxml_event_id": item.event_id},
+                )
+            )
+    return events, diagnostics
+
+
+def _align_source_notes(
+    events: list[_RawEvent],
+    source_notes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Align source performance notes and restore MuseScore truncation.
+
+    A same-pitch overlap can be emitted by MuseScore as two notes in one voice
+    with the first duration shortened.  When source metadata identifies the
+    original span, the normalizer restores that span before lane allocation;
+    the overlap then becomes an additional ScoreVoice with an explicit reason.
+    """
+
+    report: list[dict[str, Any]] = []
+    used: set[tuple[str, int]] = set()
+    for source in source_notes:
+        candidates: list[tuple[float, _RawEvent, int]] = []
+        for event in events:
+            for pitch_index, pitch in enumerate(event.pitches):
+                if pitch != source["midi"] or (event.event_id, pitch_index) in used:
+                    continue
+                distance = abs(event.start_tick - source["start_tick"])
+                if distance <= 4:
+                    candidates.append((float(distance), event, pitch_index))
+        if candidates:
+            _distance, event, pitch_index = min(candidates, key=lambda value: (value[0], value[1].event_id, value[2]))
+            used.add((event.event_id, pitch_index))
+            original_start = event.start_tick
+            original_end = event.end_tick
+            reason = "matched_musicxml_event"
+            if len(event.pitches) == 1:
+                if event.start_tick != source["start_tick"]:
+                    event.start_tick = source["start_tick"]
+                if event.end_tick != source["end_tick"]:
+                    if event.end_tick < source["end_tick"]:
+                        reason = "musescore_truncated_source_span_restored"
+                    else:
+                        reason = "musescore_duration_changed_source_span_recorded"
+                    event.end_tick = max(event.start_tick + 1, source["end_tick"])
+            report.append(
+                {
+                    "source_index": source["source_index"],
+                    "source_midi": source["midi"],
+                    "source_start_tick_480": source["start_tick_480"],
+                    "source_end_tick_480": source["end_tick_480"],
+                    "musicxml_event_id": event.event_id,
+                    "musicxml_start_tick": original_start,
+                    "musicxml_end_tick": original_end,
+                    "score_start_tick": event.start_tick,
+                    "score_end_tick": event.end_tick,
+                    "movement_start_ticks": event.start_tick - original_start,
+                    "movement_end_ticks": event.end_tick - original_end,
+                    "reason": reason,
+                }
+            )
+        else:
+            restored = _RawEvent(
+                event_id=f"restored-source-{source['source_index']}",
+                part_group="restored-source",
+                part_id="restored-source",
+                staff=1,
+                voice="restored",
+                start_tick=source["start_tick"],
+                end_tick=max(source["start_tick"] + 1, source["end_tick"]),
+                pitches=[source["midi"]],
+                kind="note",
+                tie=None,
+                tie_types=[],
+                tuplet_actual=None,
+                tuplet_normal=None,
+                dots=0,
+                measure_number=None,
+                metadata={"alignment_reason": "missing_from_musicxml_restored_from_performance_metadata"},
+            )
+            events.append(restored)
+            report.append(
+                {
+                    "source_index": source["source_index"],
+                    "source_midi": source["midi"],
+                    "source_start_tick_480": source["start_tick_480"],
+                    "source_end_tick_480": source["end_tick_480"],
+                    "musicxml_event_id": None,
+                    "score_start_tick": restored.start_tick,
+                    "score_end_tick": restored.end_tick,
+                    "movement_start_ticks": 0,
+                    "movement_end_ticks": 0,
+                    "reason": "missing_from_musicxml_restored_from_performance_metadata",
+                }
+            )
+    return report
+
+
+def _allocate_lanes(events: Iterable[_RawEvent]) -> list[list[_RawEvent]]:
+    lanes: list[list[_RawEvent]] = []
+    lane_ends: list[int] = []
+    for event in sorted(events, key=lambda item: (item.start_tick, item.end_tick, item.event_id)):
+        lane_index = next((index for index, end in enumerate(lane_ends) if end <= event.start_tick), None)
+        if lane_index is None:
+            lane_index = len(lanes)
+            lanes.append([])
+            lane_ends.append(0)
+        lanes[lane_index].append(event)
+        lane_ends[lane_index] = max(lane_ends[lane_index], event.end_tick)
+    return lanes
+
+
+def _score_voice_events(
+    lane: list[_RawEvent],
+    *,
+    total_ticks: int,
+    staff: int | None,
+    source_voice: str,
+) -> list[ScoreNote]:
+    result: list[ScoreNote] = []
+    cursor = 0
+    for event in sorted(lane, key=lambda item: (item.start_tick, item.end_tick, item.event_id)):
+        start = max(0, min(total_ticks, event.start_tick))
+        end = max(start + 1, min(total_ticks, event.end_tick))
+        if start > cursor:
+            result.append(
+                ScoreNote(
+                    start_tick=cursor,
+                    duration_tick=start - cursor,
+                    midi=None,
+                    voice_id=source_voice,
+                    source="rest",
+                    staff=staff,
+                    source_voice=source_voice,
+                    metadata={"implicit": True, "reason": "timeline_gap_filled"},
+                )
+            )
+        if start < cursor:
+            # Lane allocation should prevent this.  Keep the event visible by
+            # moving it to the current cursor and record the repair reason.
+            event.metadata["overlap_repair"] = "event_start_moved_to_lane_cursor"
+            start = cursor
+        if end <= start:
+            continue
+        pitches = list(event.pitches)
+        result.append(
+            ScoreNote(
+                start_tick=start,
+                duration_tick=end - start,
+                midi=min(pitches) if pitches else None,
+                chord_pitches=pitches,
+                voice_id=source_voice,
+                source="rest" if event.kind == "rest" else "musicxml",
+                staff=staff,
+                source_voice=event.voice,
+                tie=event.tie,
+                tie_types=[value for value in event.tie_types if value],
+                tuplet_actual=event.tuplet_actual,
+                tuplet_normal=event.tuplet_normal,
+                dots=event.dots,
+                measure_number=event.measure_number,
+                metadata=dict(event.metadata),
+            )
+        )
+        cursor = end
+    if cursor < total_ticks:
+        result.append(
+            ScoreNote(
+                start_tick=cursor,
+                duration_tick=total_ticks - cursor,
+                midi=None,
+                voice_id=source_voice,
+                source="rest",
+                staff=staff,
+                source_voice=source_voice,
+                metadata={"implicit": True, "reason": "timeline_tail_filled"},
+            )
+        )
+    if not result:
+        result.append(
+            ScoreNote(
+                start_tick=0,
+                duration_tick=max(1, total_ticks),
+                midi=None,
+                voice_id=source_voice,
+                source="rest",
+                staff=staff,
+                source_voice=source_voice,
+                metadata={"implicit": True, "reason": "empty_voice_filled"},
+            )
+        )
+    return result
+
+
+def _dedupe_events(values: Iterable[Mapping[str, Any]], key: tuple[str, ...]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    result: list[dict[str, Any]] = []
+    for value in values:
+        identity = tuple(value.get(item) for item in key)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(dict(value))
+    return result
+
+
+def standardize_musicxml_payload(
+    payload: WorkerPayload,
+    *,
+    performance_metadata: Mapping[str, Any] | None = None,
+    title: str | None = None,
+) -> tuple[Score, dict[str, Any]]:
+    """Convert validated worker data to a 48 TPQ Score and alignment report."""
+
+    if not payload.time_signature_events:
+        time_signature = "4/4"
+    else:
+        time_signature = _normalize_worker_meter(payload.time_signature_events[0].ratio)
+    if payload.key_signature_events:
+        key = _normalize_worker_key(payload.key_signature_events[0].key)
+    else:
+        key = "C"
+    tempo_values = _dedupe_events(
+        ({"offset_quarter": item.offset_quarter, "bpm": item.bpm} for item in payload.tempo_events),
+        ("offset_quarter",),
+    )
+    tempo_values = sorted(tempo_values, key=lambda value: float(value["offset_quarter"]))
+    if not tempo_values:
+        tempo_values = [{"offset_quarter": 0.0, "bpm": 120.0}]
+    tempo_events = [
+        TempoEvent(start_tick=max(0, _quarter_to_tick(float(item["offset_quarter"]))), bpm=float(item["bpm"]))
+        for item in tempo_values
+    ]
+    if tempo_events[0].start_tick > 0:
+        tempo_events.insert(0, TempoEvent(start_tick=0, bpm=tempo_events[0].bpm))
+
+    total_quarter = max(
+        payload.highest_time_quarter,
+        *(part.highest_time_quarter for part in payload.parts),
+        *(measure.end_quarter for measure in payload.measures),
+    )
+    total_ticks = max(1, _quarter_to_tick(total_quarter))
+    raw_events, diagnostics = _worker_raw_events(payload)
+    source_notes = _source_notes(performance_metadata)
+    alignment = _align_source_notes(raw_events, source_notes) if source_notes else []
+
+    grouped: dict[tuple[str, int, str], list[_RawEvent]] = {}
+    for event in raw_events:
+        grouped.setdefault((event.part_group, event.staff, event.voice), []).append(event)
+    voices: list[ScoreVoice] = []
+    lane_reasons: list[dict[str, Any]] = []
+    for (part_group, staff, source_voice), group_events in sorted(grouped.items()):
+        lanes = _allocate_lanes(group_events)
+        for lane_index, lane in enumerate(lanes):
+            voice_id = f"{part_group}:staff-{staff}:voice-{source_voice}:lane-{lane_index + 1}"
+            voice_events = _score_voice_events(
+                lane,
+                total_ticks=total_ticks,
+                staff=staff,
+                source_voice=source_voice,
+            )
+            if lane_index:
+                lane_reasons.append(
+                    {
+                        "voice_id": voice_id,
+                        "reason": "overlapping_events_allocated_to_additional_score_voice",
+                        "source_part": part_group,
+                        "staff": staff,
+                        "source_voice": source_voice,
+                    }
+                )
+            voices.append(
+                ScoreVoice(
+                    voice_id=voice_id,
+                    events=voice_events,
+                    label=f"{part_group} staff {staff} voice {source_voice} lane {lane_index + 1}",
+                    stem_id=part_group,
+                    staff=staff,
+                    source_voice=source_voice,
+                )
+            )
+    if not voices:
+        raise MusicXMLStandardizationError("MusicXML contained no printable notes, chords, or rests")
+
+    measure_metadata: list[dict[str, Any]] = []
+    for measure in payload.measures:
+        measure_metadata.append(
+            {
+                "part_index": measure.part_index,
+                "number": measure.number,
+                "start_tick": _quarter_to_tick(measure.start_quarter),
+                "duration_tick": _quarter_to_tick(measure.duration_quarter),
+                "end_tick": _quarter_to_tick(measure.end_quarter),
+                "time_signature": measure.time_signature,
+                "is_pickup": measure.is_pickup,
+            }
+        )
+    # A piano part is commonly split into one music21 part per staff.  Keep
+    # each source record above for auditability, but derive one timeline for
+    # duration checks so the same bar is not counted once per staff/part.
+    timeline_measures = _dedupe_events(
+        (
+            {
+                "start_tick": item["start_tick"],
+                "duration_tick": item["duration_tick"],
+                "end_tick": item["end_tick"],
+                "time_signature": item["time_signature"],
+                "is_pickup": item["is_pickup"],
+            }
+            for item in measure_metadata
+        ),
+        ("start_tick", "duration_tick", "end_tick", "time_signature", "is_pickup"),
+    )
+    time_signature_events = [
+        {
+            "start_tick": _quarter_to_tick(item["offset_quarter"]),
+            "time_signature": _normalize_worker_meter(item["ratio"]),
+            "numerator": item["numerator"],
+            "denominator": item["denominator"],
+        }
+        for item in _dedupe_events(
+            (
+                {
+                    "offset_quarter": item.offset_quarter,
+                    "ratio": item.ratio,
+                    "numerator": item.numerator,
+                    "denominator": item.denominator,
+                }
+                for item in payload.time_signature_events
+            ),
+            ("offset_quarter", "ratio"),
+        )
+    ]
+    key_signature_events = [
+        {"start_tick": _quarter_to_tick(item["offset_quarter"]), "key": _normalize_worker_key(item["key"]), "sharps": item["sharps"]}
+        for item in _dedupe_events(
+            ({"offset_quarter": item.offset_quarter, "key": item.key, "sharps": item.sharps} for item in payload.key_signature_events),
+            ("offset_quarter", "key"),
+        )
+    ]
+    report: dict[str, Any] = {
+        "schema_version": "1.0",
+        "source_musicxml": payload.source_path,
+        "music21_version": payload.music21_version,
+        "source_note_count": len(source_notes),
+        "musicxml_event_count": len(raw_events),
+        "score_voice_count": len(voices),
+        "source_to_score": alignment,
+        "repairs": diagnostics + lane_reasons,
+        "source_note_policy": "performance_metadata_restores_truncated_or_missing_spans_when supplied",
+    }
+    warnings: list[str] = []
+    if diagnostics:
+        warnings.append("MusicXML contained grace events that cannot be represented at positive 48 TPQ duration")
+    if lane_reasons:
+        warnings.append("Overlapping MusicXML events were preserved in additional ScoreVoice lanes")
+    if any(item.get("reason") != "matched_musicxml_event" for item in alignment):
+        warnings.append("Source performance alignment changed or restored note spans; inspect alignment_report.json")
+    metadata: dict[str, Any] = {
+        "notation_engine": "musescore-midi-import",
+        "score_normalizer": "music21",
+        "musescore_version": MUSESCORE_VERSION,
+        "music21_version": payload.music21_version,
+        "musicxml_worker_schema_version": payload.schema_version,
+        "score_ticks_per_quarter": SCORE_QUARTER_TICKS,
+        "source_musicxml": payload.source_path,
+        "parts": [
+            {
+                "part_id": part.part_id,
+                "part_group": _part_group(part.part_id),
+                "name": part.name,
+                "instrument": part.instrument,
+                "highest_time_quarter": part.highest_time_quarter,
+            }
+            for part in payload.parts
+        ],
+        "measures": measure_metadata,
+        "timeline_measures": timeline_measures,
+        "measure_total_ticks": max((item["end_tick"] for item in timeline_measures), default=total_ticks),
+        "measure_duration_total_ticks": sum(item["duration_tick"] for item in timeline_measures),
+        "time_signature_events": time_signature_events,
+        "key_signature_events": key_signature_events,
+        "pickup": {
+            "is_pickup": payload.pickup.is_pickup,
+            "duration_tick": _quarter_to_tick(payload.pickup.duration_quarter),
+            "measure_number": payload.pickup.measure_number,
+        },
+        "alignment_report": report,
+        "chord_policy": "ScoreNote.chord_pitches retains every MusicXML chord pitch; midi is the lowest pitch for backward compatibility",
+        "staff_policy": "Piano staff parts are grouped by the MusicXML parent id and retain staff on ScoreVoice/ScoreNote",
+        "voice_policy": "Overlapping events receive additional lanes and are never deleted, including lanes beyond four",
+        "source_performance_metadata": bool(source_notes),
+    }
+    score = Score(
+        title=sanitize_title(title or payload.title),
+        bpm=tempo_events[0].bpm,
+        key=key,
+        time_signature=time_signature,
+        quarter_ticks=SCORE_QUARTER_TICKS,
+        total_ticks=total_ticks,
+        voices=voices,
+        tempo_events=tempo_events,
+        source="musicxml-music21",
+        warnings=warnings,
+        metadata=metadata,
+    )
+    return score, report
+
+
+def standardize_musicxml(
+    musicxml_path: str | Path,
+    *,
+    performance_metadata: Mapping[str, Any] | str | Path | None = None,
+    title: str | None = None,
+    notation_python: str | Path | None = None,
+    timeout_sec: int = 180,
+) -> tuple[Score, dict[str, Any]]:
+    """Run the isolated worker and normalize its versioned payload."""
+
+    metadata_value: Mapping[str, Any] | None
+    if performance_metadata is None:
+        metadata_value = None
+    elif isinstance(performance_metadata, (str, Path)):
+        loaded = _load_json(Path(performance_metadata).expanduser().resolve())
+        metadata_value = loaded
+    else:
+        metadata_value = performance_metadata
+    if metadata_value and (
+        metadata_value.get("is_drum") is True
+        or metadata_value.get("drum_jianpu_policy") == "midi_only"
+    ):
+        raise MusicXMLStandardizationError("drum performance is MIDI-only and does not produce a digital Score")
+    payload = run_musicxml_worker(musicxml_path, notation_python=notation_python, timeout_sec=timeout_sec)
+    return standardize_musicxml_payload(payload, performance_metadata=metadata_value, title=title)
+
+
+def write_standardized_score(
+    musicxml_path: str | Path,
+    score_json_path: str | Path,
+    *,
+    alignment_report_path: str | Path | None = None,
+    performance_metadata: Mapping[str, Any] | str | Path | None = None,
+    title: str | None = None,
+    notation_python: str | Path | None = None,
+    timeout_sec: int = 180,
+) -> StandardizedScoreArtifact:
+    """Write Score JSON and alignment_report.json beside a MusicXML artifact."""
+
+    musicxml = Path(musicxml_path).expanduser().resolve()
+    score_destination = Path(score_json_path).expanduser().resolve()
+    alignment_destination = (
+        Path(alignment_report_path).expanduser().resolve()
+        if alignment_report_path is not None
+        else score_destination.with_name("alignment_report.json")
+    )
+    if musicxml == score_destination or musicxml == alignment_destination:
+        raise MusicXMLStandardizationError("standardized outputs must not overwrite MusicXML")
+    score, report = standardize_musicxml(
+        musicxml,
+        performance_metadata=performance_metadata,
+        title=title,
+        notation_python=notation_python,
+        timeout_sec=timeout_sec,
+    )
+    score_destination.parent.mkdir(parents=True, exist_ok=True)
+    alignment_destination.parent.mkdir(parents=True, exist_ok=True)
+    score_destination.write_text(json.dumps(score.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    alignment_destination.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return StandardizedScoreArtifact(musicxml, score_destination, alignment_destination, score, report)

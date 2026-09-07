@@ -1,0 +1,647 @@
+{
+  "schema_version": "1.0",
+  "title": "Stage 56 boundary fixture",
+  "bpm": 96.0,
+  "key": "C",
+  "time_signature": "6/8",
+  "quarter_ticks": 48,
+  "total_ticks": 288,
+  "voices": [
+    {
+      "voice_id": "P1:staff-1:voice-1:lane-1",
+      "events": [
+        {
+          "start_tick": 0,
+          "duration_tick": 24,
+          "midi": 62,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            62
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 1,
+          "metadata": {
+            "musicxml_event_id": "p0:e0"
+          }
+        },
+        {
+          "start_tick": 24,
+          "duration_tick": 24,
+          "midi": 64,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            64
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 1,
+          "metadata": {
+            "musicxml_event_id": "p0:e1"
+          }
+        },
+        {
+          "start_tick": 48,
+          "duration_tick": 24,
+          "midi": 66,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            66
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": "start",
+          "tie_types": [
+            "start"
+          ],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 1,
+          "metadata": {
+            "musicxml_event_id": "p0:e2"
+          }
+        },
+        {
+          "start_tick": 72,
+          "duration_tick": 24,
+          "midi": 66,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            66
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": "stop",
+          "tie_types": [
+            "stop"
+          ],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 1,
+          "metadata": {
+            "musicxml_event_id": "p0:e3"
+          }
+        },
+        {
+          "start_tick": 96,
+          "duration_tick": 24,
+          "midi": 69,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            69
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 1,
+          "metadata": {
+            "musicxml_event_id": "p0:e4"
+          }
+        },
+        {
+          "start_tick": 120,
+          "duration_tick": 24,
+          "midi": 71,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            71
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 1,
+          "metadata": {
+            "musicxml_event_id": "p0:e5"
+          }
+        },
+        {
+          "start_tick": 144,
+          "duration_tick": 48,
+          "midi": 66,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            66
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p0:e6"
+          }
+        },
+        {
+          "start_tick": 192,
+          "duration_tick": 24,
+          "midi": 69,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            69
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": "start",
+          "tie_types": [
+            "start"
+          ],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p0:e7"
+          }
+        },
+        {
+          "start_tick": 216,
+          "duration_tick": 72,
+          "midi": 69,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            69
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": "stop",
+          "tie_types": [
+            "stop"
+          ],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 1,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p0:e8"
+          }
+        }
+      ],
+      "label": "P1 staff 1 voice 1 lane 1",
+      "stem_id": "P1",
+      "staff": 1,
+      "source_voice": "1"
+    },
+    {
+      "voice_id": "P1:staff-2:voice-1:lane-1",
+      "events": [
+        {
+          "start_tick": 0,
+          "duration_tick": 144,
+          "midi": 50,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            50
+          ],
+          "staff": 2,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 1,
+          "measure_number": 1,
+          "metadata": {
+            "musicxml_event_id": "p1:e0"
+          }
+        },
+        {
+          "start_tick": 144,
+          "duration_tick": 144,
+          "midi": 57,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            57
+          ],
+          "staff": 2,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 1,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p1:e1"
+          }
+        }
+      ],
+      "label": "P1 staff 2 voice 1 lane 1",
+      "stem_id": "P1",
+      "staff": 2,
+      "source_voice": "1"
+    },
+    {
+      "voice_id": "Piano:staff-1:voice-1:lane-1",
+      "events": [
+        {
+          "start_tick": 0,
+          "duration_tick": 144,
+          "midi": null,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "rest",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 1,
+          "measure_number": 1,
+          "metadata": {
+            "musicxml_event_id": "p2:e0"
+          }
+        },
+        {
+          "start_tick": 144,
+          "duration_tick": 72,
+          "midi": null,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "rest",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 1,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p2:e1"
+          }
+        },
+        {
+          "start_tick": 216,
+          "duration_tick": 24,
+          "midi": null,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "rest",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p2:e2"
+          }
+        },
+        {
+          "start_tick": 240,
+          "duration_tick": 16,
+          "midi": 74,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            74
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [],
+          "tuplet_actual": 3,
+          "tuplet_normal": 2,
+          "dots": 0,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p2:e3"
+          }
+        },
+        {
+          "start_tick": 256,
+          "duration_tick": 8,
+          "midi": 76,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            76
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": "start",
+          "tie_types": [
+            "start"
+          ],
+          "tuplet_actual": 3,
+          "tuplet_normal": 2,
+          "dots": 0,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p2:e4"
+          }
+        },
+        {
+          "start_tick": 264,
+          "duration_tick": 6,
+          "midi": 76,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            76,
+            78
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": null,
+          "tie_types": [
+            "stop",
+            "start"
+          ],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 0,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p2:e5"
+          }
+        },
+        {
+          "start_tick": 270,
+          "duration_tick": 18,
+          "midi": 78,
+          "voice_id": "1",
+          "confidence": null,
+          "source": "musicxml",
+          "velocity": null,
+          "raw_pitch": null,
+          "stem_id": null,
+          "chord_pitches": [
+            78
+          ],
+          "staff": 1,
+          "source_voice": "1",
+          "tie": "stop",
+          "tie_types": [
+            "stop"
+          ],
+          "tuplet_actual": null,
+          "tuplet_normal": null,
+          "dots": 1,
+          "measure_number": 2,
+          "metadata": {
+            "musicxml_event_id": "p2:e6"
+          }
+        }
+      ],
+      "label": "Piano staff 1 voice 1 lane 1",
+      "stem_id": "Piano",
+      "staff": 1,
+      "source_voice": "1"
+    }
+  ],
+  "tempo_events": [
+    {
+      "start_tick": 0,
+      "bpm": 96.0
+    }
+  ],
+  "source": "musicxml-music21",
+  "warnings": [],
+  "metadata": {
+    "notation_engine": "musescore-midi-import",
+    "score_normalizer": "music21",
+    "musescore_version": "4.7.4",
+    "music21_version": "9.9.2",
+    "musicxml_worker_schema_version": "1.0",
+    "score_ticks_per_quarter": 48,
+    "source_musicxml": "fixtures/high_accuracy/stage56/stage56.musicxml",
+    "parts": [
+      {
+        "part_id": "P1-Staff1",
+        "part_group": "P1",
+        "name": "Piano, Stage A polyphonic part",
+        "instrument": "",
+        "highest_time_quarter": 6.0
+      },
+      {
+        "part_id": "P1-Staff2",
+        "part_group": "P1",
+        "name": "Piano, Stage A polyphonic part",
+        "instrument": "",
+        "highest_time_quarter": 6.0
+      },
+      {
+        "part_id": "Piano",
+        "part_group": "Piano",
+        "name": "Piano",
+        "instrument": "",
+        "highest_time_quarter": 6.0
+      }
+    ],
+    "measures": [
+      {
+        "part_index": 0,
+        "number": 1,
+        "start_tick": 0,
+        "duration_tick": 144,
+        "end_tick": 144,
+        "time_signature": "6/8",
+        "is_pickup": false
+      },
+      {
+        "part_index": 1,
+        "number": 1,
+        "start_tick": 0,
+        "duration_tick": 144,
+        "end_tick": 144,
+        "time_signature": "6/8",
+        "is_pickup": false
+      },
+      {
+        "part_index": 2,
+        "number": 1,
+        "start_tick": 0,
+        "duration_tick": 144,
+        "end_tick": 144,
+        "time_signature": "6/8",
+        "is_pickup": false
+      },
+      {
+        "part_index": 0,
+        "number": 2,
+        "start_tick": 144,
+        "duration_tick": 144,
+        "end_tick": 288,
+        "time_signature": null,
+        "is_pickup": false
+      },
+      {
+        "part_index": 1,
+        "number": 2,
+        "start_tick": 144,
+        "duration_tick": 144,
+        "end_tick": 288,
+        "time_signature": null,
+        "is_pickup": false
+      },
+      {
+        "part_index": 2,
+        "number": 2,
+        "start_tick": 144,
+        "duration_tick": 144,
+        "end_tick": 288,
+        "time_signature": null,
+        "is_pickup": false
+      }
+    ],
+    "timeline_measures": [
+      {
+        "start_tick": 0,
+        "duration_tick": 144,
+        "end_tick": 144,
+        "time_signature": "6/8",
+        "is_pickup": false
+      },
+      {
+        "start_tick": 144,
+        "duration_tick": 144,
+        "end_tick": 288,
+        "time_signature": null,
+        "is_pickup": false
+      }
+    ],
+    "measure_total_ticks": 288,
+    "measure_duration_total_ticks": 288,
+    "time_signature_events": [
+      {
+        "start_tick": 0,
+        "time_signature": "6/8",
+        "numerator": 6,
+        "denominator": 8
+      }
+    ],
+    "key_signature_events": [
+      {
+        "start_tick": 0,
+        "key": "C",
+        "sharps": 0
+      }
+    ],
+    "pickup": {
+      "is_pickup": false,
+      "duration_tick": 144,
+      "measure_number": 1
+    },
+    "alignment_report": {
+      "schema_version": "1.0",
+      "source_musicxml": "fixtures/high_accuracy/stage56/stage56.musicxml",
+      "music21_version": "9.9.2",
+      "source_note_count": 0,
+      "musicxml_event_count": 18,
+      "score_voice_count": 3,
+      "source_to_score": [],
+      "repairs": [],
+      "source_note_policy": "performance_metadata_restores_truncated_or_missing_spans_when supplied"
+    },
+    "chord_policy": "ScoreNote.chord_pitches retains every MusicXML chord pitch; midi is the lowest pitch for backward compatibility",
+    "staff_policy": "Piano staff parts are grouped by the MusicXML parent id and retain staff on ScoreVoice/ScoreNote",
+    "voice_policy": "Overlapping events receive additional lanes and are never deleted, including lanes beyond four",
+    "source_performance_metadata": false
+  }
+}
