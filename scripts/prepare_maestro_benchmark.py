@@ -6,9 +6,10 @@ it.  The archive hash is checked before extraction; selected members and their
 hashes are recorded so a later run cannot silently switch the public data.
 Audio is rendered locally from the selected MIDI, which makes these cases a
 quantizer-isolation subset until a separately licensed performance recording
-is supplied.  The local renderer is a deterministic sine-oscillator fixture;
-it preserves MIDI timing and pitch but does not claim to reproduce piano
-timbre, pedal noise, room acoustics, or the original MAESTRO performance.
+is supplied.  The local renderer is a deterministic harmonic-oscillator
+fixture; it preserves MIDI pitch, timing, and note velocity but does not claim
+to reproduce piano timbre, pedal noise, room acoustics, or the original
+MAESTRO performance.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ if str(SCRIPTS) not in sys.path:
 DEFAULT_URL = "https://storage.googleapis.com/magentadata/datasets/maestro/v3.0.0/maestro-v3.0.0-midi.zip"
 EXPECTED_SHA256 = "70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c"
 DEFAULT_OUTPUT = ROOT / ".cache" / "high-accuracy-benchmarks" / "maestro"
+RENDERER_VERSION = "deterministic_harmonic_oscillator_v1"
 
 
 def _sha256(path: Path) -> str:
@@ -61,7 +63,7 @@ def _midi_tracks(path: Path):
         tick = 0
         program = 0
         channel = 0
-        active: dict[tuple[int, int], list[int]] = {}
+        active: dict[tuple[int, int], list[tuple[int, int]]] = {}
         notes: list[RenderNote] = []
         for message in track:
             tick += int(message.time)
@@ -72,13 +74,21 @@ def _midi_tracks(path: Path):
                 channel = int(message.channel)
             elif message.type == "note_on" and message.velocity > 0:
                 channel = int(message.channel)
-                active.setdefault((channel, int(message.note)), []).append(tick)
+                active.setdefault((channel, int(message.note)), []).append((tick, int(message.velocity)))
             elif message.type in {"note_on", "note_off"}:
                 key = (int(message.channel), int(message.note))
                 if active.get(key):
-                    start = active[key].pop(0)
+                    start, velocity = active[key].pop(0)
                     if tick > start:
-                        notes.append(RenderNote(Fraction(start, midi.ticks_per_beat), Fraction(tick, midi.ticks_per_beat), int(message.note), 80, int(message.channel)))
+                        notes.append(
+                            RenderNote(
+                                Fraction(start, midi.ticks_per_beat),
+                                Fraction(tick, midi.ticks_per_beat),
+                                int(message.note),
+                                velocity,
+                                int(message.channel),
+                            )
+                        )
         if notes:
             tracks.append(RenderTrack(f"maestro track {track_index + 1}", program, tuple(notes), channel))
     return midi, tuple(tracks), tuple(sorted(tempo.items()) or ((Fraction(0), 120.0),))
@@ -128,9 +138,10 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
         "selection_rule": "sorted archive MIDI member names, first ten after hash verification",
         "render_domain": {
             "kind": "local_midi_render",
-            "renderer": "deterministic_sine_oscillator",
-            "preserves": ["MIDI pitch", "MIDI onset and duration", "tempo map"],
+            "renderer": RENDERER_VERSION,
+            "preserves": ["MIDI pitch", "MIDI onset and duration", "MIDI note velocity", "tempo map"],
             "does_not_model": ["piano timbre", "pedal noise", "room acoustics", "original performance nuance"],
+            "velocity_policy": "preserve_source_midi",
             "evaluation_scope": "quantizer_isolation",
             "production_end_to_end": False,
         },

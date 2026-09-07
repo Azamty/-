@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
 
+import mido
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -39,13 +41,14 @@ def test_registry_has_distinct_30_case_reliable_set() -> None:
     assert all(case.get("source_id") in registry["sources"] for case in reliable)
 
 
-def test_two_deterministic_smoke_cases_have_midi_audio_and_beat_annotation(tmp_path: Path) -> None:
+def test_deterministic_smoke_cases_have_midi_audio_and_beat_annotation(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
+    case_ids = ("synthetic-piano-01", "special-triplet", "special-tempo-change")
     for destination in (first, second):
-        generator.generate_case("synthetic-piano-01", destination=destination)
-        generator.generate_case("special-triplet", destination=destination)
-    for case_id in ("synthetic-piano-01", "special-triplet"):
+        for case_id in case_ids:
+            generator.generate_case(case_id, destination=destination)
+    for case_id in case_ids:
         first_root = first / case_id
         second_root = second / case_id
         assert (first_root / f"{case_id}.mid").is_file()
@@ -56,6 +59,62 @@ def test_two_deterministic_smoke_cases_have_midi_audio_and_beat_annotation(tmp_p
         assert _hash(first_root / f"{case_id}.mid") == _hash(second_root / f"{case_id}.mid")
         assert _hash(first_root / f"{case_id}.wav") == _hash(second_root / f"{case_id}.wav")
         assert _hash(first_root / f"{case_id}.beat_grid.json") == _hash(second_root / f"{case_id}.beat_grid.json")
+
+
+def test_generated_downbeat_accents_preserve_pitch_and_timing(tmp_path: Path) -> None:
+    first = generator.generate_case("synthetic-guitar-01", destination=tmp_path / "generated")
+    assert first["velocity_policy"] == {
+        "kind": "deterministic_notated_downbeat_accents",
+        "accent_delta": generator.DOWNBEAT_ACCENT_DELTA,
+        "max_velocity": 112,
+        "pitch_and_timing_unchanged": True,
+    }
+    midi = mido.MidiFile(tmp_path / "generated" / "synthetic-guitar-01" / "synthetic-guitar-01.mid")
+    starts: list[tuple[int, int, int]] = []
+    absolute = 0
+    active: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for message in midi.tracks[1]:
+        absolute += int(message.time)
+        key = (int(message.channel), int(message.note)) if hasattr(message, "note") else None
+        if message.type == "note_on" and message.velocity > 0:
+            active.setdefault(key, []).append((absolute, int(message.velocity)))
+        elif message.type in {"note_off", "note_on"} and key in active and active[key]:
+            start, velocity = active[key].pop(0)
+            starts.append((start, int(message.note), velocity))
+    assert len(starts) == 16
+    bar_ticks = 4 * generator.PPQ
+    downbeats = [velocity for start, _pitch, velocity in starts if start % bar_ticks == 0]
+    other_beats = [velocity for start, _pitch, velocity in starts if start % bar_ticks != 0]
+    assert downbeats and other_beats
+    assert min(downbeats) > max(other_beats)
+
+    source_tracks, _tempo, meter, _key = generator._spec_for("synthetic-guitar-01")
+    source_notes = sorted(
+        (int(note.start * generator.PPQ), int(note.end * generator.PPQ), note.pitch)
+        for track in source_tracks
+        for note in track.notes
+    )
+    assert sorted((start, start + 480, pitch) for start, pitch, _velocity in starts) == source_notes
+    assert first["renderer_version"] == generator.RENDERER_VERSION
+    assert meter == (4, 4)
+
+
+def test_maestro_track_reader_preserves_source_note_velocity(tmp_path: Path) -> None:
+    source = tmp_path / "velocity.mid"
+    midi = mido.MidiFile(ticks_per_beat=480)
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("track_name", name="source", time=0))
+    track.append(mido.Message("note_on", channel=0, note=60, velocity=37, time=0))
+    track.append(mido.Message("note_off", channel=0, note=60, velocity=0, time=240))
+    track.append(mido.Message("note_on", channel=0, note=64, velocity=101, time=120))
+    track.append(mido.Message("note_off", channel=0, note=64, velocity=0, time=240))
+    midi.tracks.append(track)
+    midi.save(source)
+
+    _loaded, tracks, _tempo = maestro._midi_tracks(source)
+
+    assert len(tracks) == 1
+    assert [(note.pitch, note.velocity) for note in tracks[0].notes] == [(60, 37), (64, 101)]
 
 
 def test_batch_runner_recognizes_once_and_shares_immutable_raw_between_pipelines(tmp_path: Path) -> None:

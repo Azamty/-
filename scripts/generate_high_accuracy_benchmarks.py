@@ -4,7 +4,9 @@ The repository deliberately keeps generated audio and MIDI below ``.cache``.
 This script only creates those rebuildable files; it never downloads a corpus
 and never treats a reference MIDI file as a model recognition result.  The
 ``--case-id`` option is useful for a small smoke run before the full benchmark
-is authorized.
+is authorized.  Synthetic fixtures use deterministic notated downbeat
+velocity accents and a modest additive harmonic envelope; pitch and timing are
+unchanged from the fixture recipe.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import random
 import struct
 import sys
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -27,10 +29,12 @@ import mido
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_ROOT = ROOT / ".cache" / "high-accuracy-benchmarks" / "generated"
-GENERATOR_VERSION = "1.0"
+GENERATOR_VERSION = "1.1"
 DEFAULT_SEED = 20260907
 SAMPLE_RATE = 16_000
 PPQ = 480
+DOWNBEAT_ACCENT_DELTA = 24
+RENDERER_VERSION = "deterministic_harmonic_oscillator_v1"
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,37 @@ def _midi_events(tracks: Sequence[RenderTrack], tempo: Sequence[tuple[Fraction, 
     return midi
 
 
+def _harmonic_weights(program: int) -> tuple[tuple[int, float], ...]:
+    """Return a small deterministic additive timbre for one MIDI program."""
+
+    if 24 <= program <= 31:  # nylon/acoustic/electric guitar family
+        return ((1, 1.0), (2, 0.34), (3, 0.16), (4, 0.06))
+    if 32 <= program <= 39:  # bass family
+        return ((1, 1.0), (2, 0.24), (3, 0.08))
+    if 0 <= program <= 7:  # piano family
+        return ((1, 1.0), (2, 0.22), (3, 0.10), (4, 0.04))
+    return ((1, 1.0), (2, 0.28), (3, 0.12), (4, 0.04))
+
+
+def _accent_downbeats(tracks: Sequence[RenderTrack], meter: tuple[int, int]) -> tuple[RenderTrack, ...]:
+    """Raise only notated bar starts while retaining every pitch and boundary."""
+
+    bar_quarters = Fraction(meter[0] * 4, meter[1])
+    accented: list[RenderTrack] = []
+    for track in tracks:
+        notes = tuple(
+            replace(
+                note,
+                velocity=min(112, max(1, int(note.velocity)) + DOWNBEAT_ACCENT_DELTA),
+            )
+            if note.start % bar_quarters == 0
+            else note
+            for note in track.notes
+        )
+        accented.append(replace(track, notes=notes))
+    return tuple(accented)
+
+
 def _render_audio(path: Path, tracks: Sequence[RenderTrack], tempo: Sequence[tuple[Fraction, float]], *, seed: int) -> None:
     notes = [note for track in tracks for note in track.notes]
     if not notes:
@@ -143,6 +178,8 @@ def _render_audio(path: Path, tracks: Sequence[RenderTrack], tempo: Sequence[tup
     # samples audibly distinct while preserving the exact MIDI reference.
     detune = (rng.random() - 0.5) * 0.002
     for track_index, track in enumerate(tracks):
+        weights = _harmonic_weights(track.program)
+        weight_total = sum(weight for _harmonic, weight in weights)
         for note in track.notes:
             start_sec = max(0.0, _tempo_seconds(tempo, note.start))
             end_sec = max(start_sec + 1.0 / SAMPLE_RATE, _tempo_seconds(tempo, note.end))
@@ -150,13 +187,15 @@ def _render_audio(path: Path, tracks: Sequence[RenderTrack], tempo: Sequence[tup
             end_frame = min(frame_count, int(math.ceil(end_sec * SAMPLE_RATE)))
             frequency = _frequency(note.pitch) * (1.0 + detune * (track_index + 1))
             amplitude = 0.12 * (max(1, min(127, note.velocity)) / 127.0) / max(1.0, math.sqrt(len(tracks)))
-            attack = max(1, int(0.008 * SAMPLE_RATE))
-            release = max(1, int(0.018 * SAMPLE_RATE))
+            attack = max(1, int(0.006 * SAMPLE_RATE))
+            release = max(1, int(0.030 * SAMPLE_RATE))
             for frame in range(start_frame, end_frame):
                 local = frame - start_frame
                 remaining = end_frame - frame
                 envelope = min(1.0, local / attack, remaining / release)
-                samples[frame] += amplitude * envelope * math.sin(2.0 * math.pi * frequency * (frame / SAMPLE_RATE))
+                phase = 2.0 * math.pi * frequency * (frame / SAMPLE_RATE)
+                tone = sum(weight * math.sin(harmonic * phase) for harmonic, weight in weights) / weight_total
+                samples[frame] += amplitude * envelope * tone
     peak = max(1.0, max(abs(value) for value in samples) * 1.02)
     pcm = b"".join(struct.pack("<h", max(-32767, min(32767, round(value / peak * 32767)))) for value in samples)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -247,6 +286,7 @@ def _case_ids_from_registry(registry_path: Path) -> list[str]:
 
 def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int = DEFAULT_SEED, overwrite: bool = False) -> dict[str, Any]:
     tracks, tempo, meter, key = _spec_for(case_id)
+    tracks = _accent_downbeats(tracks, meter)
     case_root = (destination / case_id).resolve()
     if case_root.exists() and not overwrite:
         existing = case_root / "case_manifest.json"
@@ -266,11 +306,18 @@ def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int =
     manifest = {
         "schema_version": "1.0",
         "generator_version": GENERATOR_VERSION,
+        "renderer_version": RENDERER_VERSION,
         "case_id": case_id,
         "seed": seed,
         "source_kind": "synthetic",
         "evaluation_scope": "quantizer_isolation_fixture",
         "tracks": [{"name": track.name, "program": track.program, "channel": track.channel, "note_count": len(track.notes)} for track in tracks],
+        "velocity_policy": {
+            "kind": "deterministic_notated_downbeat_accents",
+            "accent_delta": DOWNBEAT_ACCENT_DELTA,
+            "max_velocity": 112,
+            "pitch_and_timing_unchanged": True,
+        },
         "tempo_map": [{"quarter": str(position), "bpm": bpm} for position, bpm in tempo],
         "time_signature": f"{meter[0]}/{meter[1]}",
         "key": key,
