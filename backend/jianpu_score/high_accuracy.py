@@ -16,7 +16,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import threading
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 import xml.etree.ElementTree as ET
 
 
@@ -42,6 +42,14 @@ MUSESCORE_IMPORT_PROFILE_EXPECTED: dict[str, str] = {
     "Septuplets": "false",
     "Nonuplets": "false",
     "HumanPerformance": "true",
+}
+MUSESCORE_VOCAL_IMPORT_PROFILE_PATH = ROOT / "tools" / "musescore-4.7.4" / "midi_import_options_vocal.xml"
+MUSESCORE_VOCAL_IMPORT_PROFILE = "vocal-tempo-preserving-1/32-binary-triplet-tuplets-4-voices"
+MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256 = "B47761C931A649E910E078CAAF57887756D89B529F1379B4E537746DC7653557"
+MUSESCORE_VOCAL_IMPORT_PROFILE_EXPECTED: dict[str, str] = {
+    **MUSESCORE_IMPORT_PROFILE_EXPECTED,
+    "HumanPerformance": "false",
+    "SimplifyDurations": "true",
 }
 # MuseScore Studio shares per-user crashpad state between headless invocations.
 # The importer and the capability probe use this same process-wide lock so no
@@ -102,6 +110,7 @@ def validate_musescore_import_profile(
     profile: str | Path,
     *,
     expected_sha256: str | None = None,
+    expected_options: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Validate the pinned MIDI importer options before invoking MuseScore.
 
@@ -120,15 +129,16 @@ def validate_musescore_import_profile(
         raise ValueError(f"MuseScore MIDI import profile is invalid: {path}: {exc}") from exc
     if root.tag.rsplit("}", 1)[-1] != "MidiOptions":
         raise ValueError(f"MuseScore MIDI import profile has unexpected root: {root.tag!r}")
+    expected = dict(expected_options or MUSESCORE_IMPORT_PROFILE_EXPECTED)
     values = {
         child.tag.rsplit("}", 1)[-1]: (child.text or "").strip().lower()
         for child in root
-        if child.tag.rsplit("}", 1)[-1] in MUSESCORE_IMPORT_PROFILE_EXPECTED
+        if child.tag.rsplit("}", 1)[-1] in expected
     }
     mismatches = {
-        name: {"expected": expected, "actual": values.get(name)}
-        for name, expected in MUSESCORE_IMPORT_PROFILE_EXPECTED.items()
-        if values.get(name) != expected
+        name: {"expected": expected_value, "actual": values.get(name)}
+        for name, expected_value in expected.items()
+        if values.get(name) != expected_value
     }
     # Git may normalize this tracked XML between LF and CRLF on Windows;
     # pin the content hash independently of that transport detail.
@@ -142,7 +152,8 @@ def validate_musescore_import_profile(
         "path": os.fspath(path),
         "sha256": digest,
         "options": values,
-        "tuplets": {name: values[name] == "true" for name in ("Duplets", "Triplets", "Quadruplets", "Quintuplets", "Septuplets", "Nonuplets")},
+        "tuplets": {name: values[name] == "true" for name in ("Duplets", "Triplets", "Quadruplets", "Quintuplets", "Septuplets", "Nonuplets") if name in values},
+        "policy": "vocal-tempo-preserving" if expected.get("HumanPerformance") == "false" else "adaptive-human-performance",
     }
 
 
@@ -268,16 +279,37 @@ def get_high_accuracy_capabilities() -> dict[str, Any]:
         }
         profile_ok = False
         profile_reason = str(exc)
+    try:
+        vocal_profile_details = validate_musescore_import_profile(
+            MUSESCORE_VOCAL_IMPORT_PROFILE_PATH,
+            expected_sha256=MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256,
+            expected_options=MUSESCORE_VOCAL_IMPORT_PROFILE_EXPECTED,
+        )
+        vocal_profile_ok = True
+        vocal_profile_reason = None
+    except ValueError as exc:
+        vocal_profile_details = {
+            "path": os.fspath(MUSESCORE_VOCAL_IMPORT_PROFILE_PATH),
+            "sha256": None,
+            "options": {},
+            "tuplets": {},
+        }
+        vocal_profile_ok = False
+        vocal_profile_reason = str(exc)
     muse_details.update(
         {
             "import_profile": profile_details,
             "import_profile_available": profile_ok,
             "import_profile_reason": profile_reason,
+            "vocal_import_profile": vocal_profile_details,
+            "vocal_import_profile_available": vocal_profile_ok,
+            "vocal_import_profile_reason": vocal_profile_reason,
         }
     )
-    if muse_ok and not profile_ok:
+    if muse_ok and (not profile_ok or not vocal_profile_ok):
         muse_ok = False
-        muse_reason = f"MuseScore import profile is unavailable or invalid: {profile_reason}"
+        reasons = [reason for reason in (profile_reason, vocal_profile_reason) if reason]
+        muse_reason = "MuseScore import profile is unavailable or invalid: " + "; ".join(reasons)
 
     available = beatnet_ok and notation_ok and muse_ok
     return {
@@ -293,5 +325,7 @@ def get_high_accuracy_capabilities() -> dict[str, Any]:
             "score_ticks_per_quarter": 48,
             "musescore_import_profile": MUSESCORE_IMPORT_PROFILE,
             "musescore_import_profile_sha256": MUSESCORE_IMPORT_PROFILE_SHA256,
+            "musescore_vocal_import_profile": MUSESCORE_VOCAL_IMPORT_PROFILE,
+            "musescore_vocal_import_profile_sha256": MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256,
         },
     }

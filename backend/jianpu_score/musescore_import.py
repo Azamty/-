@@ -16,6 +16,10 @@ from .high_accuracy import (
     MUSESCORE_CLI_LOCK,
     MUSESCORE_IMPORT_PROFILE_SHA256,
     MUSESCORE_IMPORT_PROFILE_PATH,
+    MUSESCORE_IMPORT_PROFILE_EXPECTED,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_EXPECTED,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_PATH,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256,
     MUSESCORE_VERSION,
     resolve_musescore,
     validate_musescore_import_profile,
@@ -70,9 +74,22 @@ def convert_performance_midi(
     if not profile.is_file():
         raise MuseScoreImportError(f"MuseScore MIDI import profile does not exist: {profile}")
     try:
+        is_default_profile = profile == DEFAULT_PROFILE.resolve()
+        is_vocal_profile = profile == MUSESCORE_VOCAL_IMPORT_PROFILE_PATH.resolve()
         validate_musescore_import_profile(
             profile,
-            expected_sha256=MUSESCORE_IMPORT_PROFILE_SHA256 if profile == DEFAULT_PROFILE.resolve() else None,
+            expected_sha256=(
+                MUSESCORE_IMPORT_PROFILE_SHA256
+                if is_default_profile
+                else MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256
+                if is_vocal_profile
+                else None
+            ),
+            expected_options=(
+                MUSESCORE_IMPORT_PROFILE_EXPECTED
+                if not is_vocal_profile
+                else MUSESCORE_VOCAL_IMPORT_PROFILE_EXPECTED
+            ),
         )
     except ValueError as exc:
         raise MuseScoreImportError(str(exc)) from exc

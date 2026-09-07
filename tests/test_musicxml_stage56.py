@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import mido
 from pathlib import Path
 import subprocess
 import sys
@@ -33,17 +34,26 @@ from backend.jianpu_score.quantize import score_to_jianpu
 from backend.jianpu_score.high_accuracy import (
     MUSESCORE_IMPORT_PROFILE_EXPECTED,
     MUSESCORE_IMPORT_PROFILE_SHA256,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_EXPECTED,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_PATH,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256,
     resolve_musescore,
     resolve_notation_python,
     validate_musescore_import_profile,
 )
+from backend.jianpu_score.musicxml_standardize import run_musicxml_worker
 from scripts.musicxml_score_worker import _duration_details
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "fixtures" / "high_accuracy" / "beat_grid_fixture.json"
 PROFILE = ROOT / "tools" / "musescore-4.7.4" / "midi_import_options.xml"
-EXTERNAL_READY = resolve_musescore() is not None and resolve_notation_python().is_file() and PROFILE.is_file()
+EXTERNAL_READY = (
+    resolve_musescore() is not None
+    and resolve_notation_python().is_file()
+    and PROFILE.is_file()
+    and MUSESCORE_VOCAL_IMPORT_PROFILE_PATH.is_file()
+)
 
 
 def test_musescore_profile_pins_exact_48_tpq_tuplet_policy() -> None:
@@ -58,6 +68,20 @@ def test_musescore_profile_pins_exact_48_tpq_tuplet_policy() -> None:
         "Septuplets": False,
         "Nonuplets": False,
     }
+
+
+def test_musescore_vocal_profile_pins_tempo_preserving_policy() -> None:
+    details = validate_musescore_import_profile(
+        MUSESCORE_VOCAL_IMPORT_PROFILE_PATH,
+        expected_sha256=MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256,
+        expected_options=MUSESCORE_VOCAL_IMPORT_PROFILE_EXPECTED,
+    )
+
+    assert details["policy"] == "vocal-tempo-preserving"
+    assert details["options"]["HumanPerformance"] == "false"
+    assert details["options"]["SimplifyDurations"] == "true"
+    assert details["tuplets"]["Triplets"] is True
+    assert details["tuplets"]["Quintuplets"] is False
 
 
 @pytest.mark.parametrize("boundary", ["start", "stop", "continue", None])
@@ -857,6 +881,65 @@ def test_drum_performance_is_explicitly_midi_only(tmp_path: Path) -> None:
             tmp_path / "drums.musicxml",
             performance_metadata={"is_drum": True, "drum_jianpu_policy": "midi_only"},
         )
+
+
+@pytest.mark.skipif(not EXTERNAL_READY, reason="pinned MuseScore and notation environment are unavailable")
+def test_vocal_profile_preserves_sparse_performance_positions(tmp_path: Path) -> None:
+    """HumanPerformance reflows a sparse line; the vocal profile preserves its beat map."""
+
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    conductor = mido.MidiTrack()
+    conductor.append(mido.MetaMessage("time_signature", numerator=2, denominator=4, time=0))
+    conductor.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(60), time=0))
+    conductor.append(mido.MetaMessage("end_of_track", time=0))
+    midi.tracks.append(conductor)
+    notes = [
+        (1140, 1589, 53),
+        (1590, 1990, 65),
+        (1990, 2073, 63),
+        (2073, 2291, 62),
+        (2291, 2356, 57),
+        (2356, 2434, 58),
+        (2434, 2596, 60),
+        (2596, 2694, 62),
+    ]
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("track_name", name="vocal", time=0))
+    previous = 0
+    for start, end, pitch in notes:
+        track.append(mido.Message("note_on", note=pitch, velocity=80, time=start - previous))
+        track.append(mido.Message("note_off", note=pitch, velocity=0, time=end - start))
+        previous = end
+    midi.tracks.append(track)
+    midi_path = tmp_path / "sparse-vocal.performance.mid"
+    midi.save(midi_path)
+
+    outputs: dict[str, list[float]] = {}
+    for label, profile in (
+        ("human", PROFILE),
+        ("vocal", MUSESCORE_VOCAL_IMPORT_PROFILE_PATH),
+    ):
+        musicxml = tmp_path / f"{label}.musicxml"
+        convert_performance_midi(
+            midi_path,
+            musicxml,
+            instrument_id=f"sparse-{label}",
+            profile_path=profile,
+        )
+        payload = run_musicxml_worker(musicxml)
+        outputs[label] = [
+            event.offset_quarter
+            for part in payload.parts
+            for event in part.events
+            if event.pitches
+        ]
+
+    # 1140/480 = 2.375.  Human-performance mode starts on a new inferred
+    # quarter, while the vocal profile keeps the performance onset and lets
+    # the normalizer use the production tempo map later.
+    assert outputs["vocal"][0] == pytest.approx(2.375)
+    assert outputs["human"][0] != pytest.approx(2.375)
+    assert outputs["human"][0] == pytest.approx(2.0)
 
 
 @pytest.mark.skipif(not EXTERNAL_READY, reason="pinned MuseScore and notation environment are unavailable")

@@ -11,7 +11,7 @@
 .\scripts\check_toolchain.ps1
 ```
 
-BeatNet 依赖放在独立的 `.venv-model-beatnet`，MusicXML 标准化 worker 使用独立的 `.venv-notation`（Python 3.10、`music21==9.9.2`）。MuseScore 4.7.4 的固定版本文件和校验记录放在忽略的本地目录 `tools\musescore-4.7.4` 与 `.cache\packages`；能力检查会报告可执行文件、版本、导入 profile、profile SHA-256 和 MusicXML 输出是否可用。当前固定 profile 的 SHA-256 为 `86742B91922F921F725A1A5810572AB458EB7FB7AAC46FC683C92352B837C9FF`，最短导入单位是 1/32，开启二连音、三连音、四连音及 human performance，关闭 5:4、7:4、9:8 连音。48 TPQ 只接受能精确表示的二进制时值和 3:2 三连音；其它连音由标准化器明确失败，不能静默舍入。能力检查会拒绝偏离该 profile 的文件。MuseScore CLI 调用使用 `--factory-settings --test-mode -M ... -o ...`，同一服务进程内串行执行以避开 MuseScore crashpad 并发崩溃。
+BeatNet 依赖放在独立的 `.venv-model-beatnet`，MusicXML 标准化 worker 使用独立的 `.venv-notation`（Python 3.10、`music21==9.9.2`）。MuseScore 4.7.4 的固定版本文件和校验记录放在忽略的本地目录 `tools\musescore-4.7.4` 与 `.cache\packages`；能力检查会报告可执行文件、版本、两个导入 profile、profile SHA-256 和 MusicXML 输出是否可用。器乐默认 profile 的 SHA-256 为 `86742B91922F921F725A1A5810572AB458EB7FB7AAC46FC683C92352B837C9FF`，最短导入单位是 1/32，开启二连音、三连音、四连音及 human performance，关闭 5:4、7:4、9:8 连音。GAME 人声使用固定的 `tools\musescore-4.7.4\midi_import_options_vocal.xml`，SHA-256 为 `B47761C931A649E910E078CAAF57887756D89B529F1379B4E537746DC7653557`；它关闭 human-performance 的重新分段并开启 `SimplifyDurations`，保留稀疏歌声的性能起音，再交由生产 tempo map 播放。两套 profile 都只搜索能由48 TPQ精确表示的二进制时值和3:2三连音；其它连音由标准化器明确失败，不能静默舍入。能力检查会拒绝偏离 profile 的文件。MuseScore CLI 调用使用 `--factory-settings --test-mode -M ... -o ...`，同一服务进程内串行执行以避开 MuseScore crashpad 并发崩溃。
 
 MuseScore 也可以直接启动检查安装（项目解包目录或系统安装目录二选一）：
 

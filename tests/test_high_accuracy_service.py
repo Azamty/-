@@ -10,6 +10,8 @@ import pytest
 from backend.jianpu_score import high_accuracy_service as service_module
 from backend.jianpu_score.domain import MusicAnalysis, NoteEvent, Score
 from backend.jianpu_score.high_accuracy import (
+    MUSESCORE_IMPORT_PROFILE_PATH,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_PATH,
     resolve_musescore,
     resolve_notation_python,
 )
@@ -85,6 +87,16 @@ def _valid_build_kwargs(tmp_path: Path, *, is_drum: bool = False) -> dict:
 
 def _manifest(path: Path) -> dict:
     return json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+
+
+def test_service_selects_tempo_preserving_profile_for_game_variant() -> None:
+    service = service_module.HighAccuracyArtifactService()
+
+    vocal_profile, _vocal_name, _vocal_sha = service._profile_for_variant("game-cleaned")
+    source_profile, _source_name, _source_sha = service._profile_for_variant("instrument-part")
+
+    assert vocal_profile == MUSESCORE_VOCAL_IMPORT_PROFILE_PATH
+    assert source_profile == MUSESCORE_IMPORT_PROFILE_PATH
 
 
 def test_drum_build_is_midi_only_and_does_not_call_notation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

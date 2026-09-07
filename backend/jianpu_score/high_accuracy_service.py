@@ -29,8 +29,12 @@ from .domain import MusicAnalysis, NoteEvent, Score
 from .high_accuracy import (
     BEATNET_VERSION,
     MUSESCORE_IMPORT_PROFILE,
+    MUSESCORE_IMPORT_PROFILE_PATH,
     MUSESCORE_IMPORT_PROFILE_SHA256,
     MUSESCORE_VERSION,
+    MUSESCORE_VOCAL_IMPORT_PROFILE,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_PATH,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256,
 )
 from .musescore_import import MusicXMLArtifact, MuseScoreImportError, convert_performance_midi
 from .musicxml_standardize import MusicXMLStandardizationError, standardize_musicxml
@@ -476,6 +480,8 @@ def _manifest_base(
     is_drum: bool,
     status: str,
     jianpu_status: str,
+    musescore_import_profile: str = MUSESCORE_IMPORT_PROFILE,
+    musescore_import_profile_sha256: str = MUSESCORE_IMPORT_PROFILE_SHA256,
 ) -> dict[str, Any]:
     return {
         "schema_version": SERVICE_SCHEMA_VERSION,
@@ -490,8 +496,8 @@ def _manifest_base(
         "beat_engine": BEAT_ENGINE,
         "beatnet_version": BEATNET_VERSION,
         "musescore_version": MUSESCORE_VERSION,
-        "musescore_import_profile": MUSESCORE_IMPORT_PROFILE,
-        "musescore_import_profile_sha256": MUSESCORE_IMPORT_PROFILE_SHA256,
+        "musescore_import_profile": musescore_import_profile,
+        "musescore_import_profile_sha256": musescore_import_profile_sha256,
         "score_ticks_per_quarter": SCORE_TICKS_PER_QUARTER,
         "stages": {},
         "artifacts": [],
@@ -514,6 +520,31 @@ class HighAccuracyArtifactService:
         self.notation_python = notation_python
         self.timeout_sec = timeout_sec
 
+    def _profile_for_variant(self, variant: str) -> tuple[Path | None, str, str]:
+        """Select the fixed importer profile for this source variant.
+
+        GAME is a monophonic vocal recognizer.  MuseScore's human-performance
+        importer re-estimates its sparse timing and can collapse a complete
+        vocal line into half its duration.  The vocal profile disables that
+        re-estimation and simplifies durations to the exact 48 TPQ grid.  An
+        explicitly supplied profile remains authoritative for fixture and
+        operator overrides.
+        """
+
+        if self.profile_path is not None:
+            explicit = Path(self.profile_path).expanduser().resolve()
+            if explicit == MUSESCORE_VOCAL_IMPORT_PROFILE_PATH.resolve():
+                return explicit, MUSESCORE_VOCAL_IMPORT_PROFILE, MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256
+            return explicit, MUSESCORE_IMPORT_PROFILE, MUSESCORE_IMPORT_PROFILE_SHA256
+        variant_text = str(variant).casefold()
+        if any(marker in variant_text for marker in ("vocal", "voice", "game")):
+            return (
+                MUSESCORE_VOCAL_IMPORT_PROFILE_PATH,
+                MUSESCORE_VOCAL_IMPORT_PROFILE,
+                MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256,
+            )
+        return MUSESCORE_IMPORT_PROFILE_PATH, MUSESCORE_IMPORT_PROFILE, MUSESCORE_IMPORT_PROFILE_SHA256
+
     def build(
         self,
         *,
@@ -533,6 +564,7 @@ class HighAccuracyArtifactService:
         safe_instrument = _safe_component(instrument, fallback="instrument")
         safe_variant = _safe_component(variant, fallback="source")
         safe_title = str(title).strip() or instrument
+        selected_profile, selected_profile_name, selected_profile_sha256 = self._profile_for_variant(variant)
         destination = _prepare_output_dir(
             output_dir,
             overwrite=overwrite,
@@ -548,6 +580,8 @@ class HighAccuracyArtifactService:
             is_drum=is_drum,
             status="running",
             jianpu_status="pending",
+            musescore_import_profile=selected_profile_name,
+            musescore_import_profile_sha256=selected_profile_sha256,
         )
         artifacts: tuple[ServiceArtifact, ...] = ()
         performance_metadata: dict[str, Any] = {}
@@ -618,8 +652,8 @@ class HighAccuracyArtifactService:
                 "beat_engine": BEAT_ENGINE,
                 "beatnet_version": BEATNET_VERSION,
                 "musescore_version": MUSESCORE_VERSION,
-                "musescore_import_profile": MUSESCORE_IMPORT_PROFILE,
-                "musescore_import_profile_sha256": MUSESCORE_IMPORT_PROFILE_SHA256,
+                "musescore_import_profile": selected_profile_name,
+                "musescore_import_profile_sha256": selected_profile_sha256,
                 "score_ticks_per_quarter": SCORE_TICKS_PER_QUARTER,
             }
             # Keep the complete Unicode title in JSON while recording the
@@ -669,7 +703,7 @@ class HighAccuracyArtifactService:
                     musicxml_path,
                     instrument_id=instrument,
                     musescore_path=self.musescore_path,
-                    profile_path=self.profile_path,
+                    profile_path=selected_profile,
                     timeout_sec=self.timeout_sec,
                     overwrite=overwrite,
                 )

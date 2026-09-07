@@ -10,6 +10,8 @@ from backend.jianpu_score.high_accuracy import (
     MUSESCORE_RELEASE_URL,
     MUSESCORE_IMPORT_PROFILE,
     MUSESCORE_IMPORT_PROFILE_SHA256,
+    MUSESCORE_VOCAL_IMPORT_PROFILE,
+    MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256,
     get_high_accuracy_capabilities,
 )
 
@@ -56,7 +58,10 @@ def test_high_accuracy_toolchain_contract_is_pinned() -> None:
     assert capabilities["runtime"]["score_ticks_per_quarter"] == 48
     assert capabilities["runtime"]["musescore_import_profile"] == MUSESCORE_IMPORT_PROFILE
     assert capabilities["runtime"]["musescore_import_profile_sha256"] == MUSESCORE_IMPORT_PROFILE_SHA256
+    assert capabilities["runtime"]["musescore_vocal_import_profile"] == MUSESCORE_VOCAL_IMPORT_PROFILE
+    assert capabilities["runtime"]["musescore_vocal_import_profile_sha256"] == MUSESCORE_VOCAL_IMPORT_PROFILE_SHA256
     assert capabilities["musescore"]["import_profile_available"] is True
+    assert capabilities["musescore"]["vocal_import_profile_available"] is True
 
 
 def test_high_accuracy_capability_does_not_claim_ready_when_a_tool_is_missing(monkeypatch) -> None:
