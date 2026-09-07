@@ -28,6 +28,7 @@ from backend.jianpu_score.musicxml_standardize import (
 )
 from backend.jianpu_score.musescore_import import MuseScoreImportError, convert_performance_midi
 import backend.jianpu_score.musescore_import as musescore_import
+from backend.jianpu_score.quantize import score_to_jianpu
 from backend.jianpu_score.high_accuracy import (
     MUSESCORE_IMPORT_PROFILE_EXPECTED,
     MUSESCORE_IMPORT_PROFILE_SHA256,
@@ -185,6 +186,136 @@ def test_score_normalizer_preserves_notation_fields_and_more_than_four_voices() 
     assert report["score_voice_count"] == 5
     assert score.metadata["measure_total_ticks"] == score.total_ticks
     assert score.metadata["measure_duration_total_ticks"] == score.total_ticks
+
+
+def test_score_normalizer_rejoins_tie_fragments_exposed_in_different_music21_voices() -> None:
+    payload = _manual_payload()
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="tie-start",
+            kind="note",
+            offset_quarter=0,
+            duration_quarter=1,
+            pitches=[60],
+            tie="start",
+            tie_types=["start"],
+            voice="2",
+        ),
+        WorkerEvent(
+            event_id="voice-two-rest",
+            kind="rest",
+            offset_quarter=1,
+            duration_quarter=3,
+            voice="2",
+        ),
+        WorkerEvent(
+            event_id="tie-stop",
+            kind="note",
+            offset_quarter=1,
+            duration_quarter=0.25,
+            pitches=[60],
+            tie="stop",
+            tie_types=["stop"],
+            voice="1",
+        ),
+        WorkerEvent(
+            event_id="voice-one-rest",
+            kind="rest",
+            offset_quarter=0,
+            duration_quarter=4,
+            voice="1",
+        ),
+    ]
+
+    score, report = standardize_musicxml_payload(payload)
+
+    tied = [
+        (voice.voice_id, event)
+        for voice in score.voices
+        for event in voice.events
+        if event.midi == 60 and event.tie_types
+    ]
+    assert [(event.tie, event.start_tick, event.end_tick) for _voice, event in tied] == [
+        ("start", 0, 48),
+        ("stop", 48, 60),
+    ]
+    assert len({voice_id for voice_id, _event in tied}) == 1
+    repairs = [item for item in report["repairs"] if item.get("reason") == "tie_chain_voice_reassigned"]
+    assert repairs == [
+        {
+            "reason": "tie_chain_voice_reassigned",
+            "musicxml_event_id": "tie-stop",
+            "source_voice": "1",
+            "source_staff": 1,
+            "target_voice": "2",
+            "target_staff": 1,
+            "pitches": [60],
+        }
+    ]
+    assert report["tie_voice_repairs"] == repairs
+    assert "tie fragments were normalized" in " ".join(score.warnings)
+    jianpu = score_to_jianpu(score)
+    assert "~" in jianpu
+
+
+def test_score_normalizer_keeps_a_normal_cross_measure_tie_in_one_voice() -> None:
+    payload = _manual_payload()
+    payload.highest_time_quarter = 8
+    payload.parts[0].highest_time_quarter = 8
+    measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=4,
+            end_quarter=4,
+            time_signature="4/4",
+        ),
+        WorkerMeasure(
+            part_index=0,
+            number=2,
+            start_quarter=4,
+            duration_quarter=4,
+            end_quarter=8,
+            time_signature=None,
+        ),
+    ]
+    payload.measures = measures
+    payload.parts[0].measures = measures
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="tie-start",
+            kind="note",
+            offset_quarter=3.5,
+            duration_quarter=0.5,
+            pitches=[60],
+            tie="start",
+            tie_types=["start"],
+            voice="1",
+        ),
+        WorkerEvent(
+            event_id="tie-stop",
+            kind="note",
+            offset_quarter=4,
+            duration_quarter=1,
+            pitches=[60],
+            tie="stop",
+            tie_types=["stop"],
+            voice="1",
+        ),
+        WorkerEvent(
+            event_id="rest",
+            kind="rest",
+            offset_quarter=5,
+            duration_quarter=3,
+            voice="1",
+        ),
+    ]
+
+    score, report = standardize_musicxml_payload(payload)
+
+    assert report["tie_voice_repairs"] == []
+    assert "~" in score_to_jianpu(score)
 
 
 def test_score_normalizer_restores_same_pitch_overlap_into_another_voice() -> None:

@@ -391,7 +391,183 @@ def _worker_raw_events(payload: WorkerPayload) -> tuple[list[_RawEvent], list[di
                     metadata={"musicxml_event_id": item.event_id},
                 )
             )
+    diagnostics.extend(_normalize_tied_event_voices(events))
     return events, diagnostics
+
+
+def _normalize_tied_event_voices(events: list[_RawEvent]) -> list[dict[str, Any]]:
+    """Keep each MusicXML tie chain in one serializable ScoreVoice.
+
+    music21 can expose a legal MusicXML tie with different ``Voice`` context
+    on either side of a barline.  The source MusicXML still identifies the
+    same pitch and exact adjacent times, so this is safe to normalize when
+    that successor is unique.  Ambiguous same-pitch candidates are left
+    untouched and remain an explicit serializer error rather than being
+    guessed.  Mixed chords are split by target voice so untied/new pitches do
+    not inherit another pitch's tie repair.
+    """
+
+    def slot_tie(event: _RawEvent, pitch_index: int) -> str | None:
+        return event.tie_types[pitch_index] if pitch_index < len(event.tie_types) else event.tie
+
+    slots = [
+        (event.event_id, pitch_index)
+        for event in events
+        for pitch_index, _pitch in enumerate(event.pitches)
+    ]
+    by_same_staff: dict[tuple[str, int, int, int], list[tuple[str, int]]] = {}
+    by_any_staff: dict[tuple[str, int, int], list[tuple[str, int]]] = {}
+    slot_values: dict[tuple[str, int], tuple[_RawEvent, int, int]] = {}
+    for event in events:
+        for pitch_index, pitch in enumerate(event.pitches):
+            key = (event.event_id, pitch_index)
+            slot_values[key] = (event, pitch_index, pitch)
+            by_same_staff.setdefault((event.part_group, event.staff, pitch, event.start_tick), []).append(key)
+            by_any_staff.setdefault((event.part_group, pitch, event.start_tick), []).append(key)
+
+    def candidate(
+        source_key: tuple[str, int],
+    ) -> tuple[tuple[str, int] | None, str | None]:
+        event, pitch_index, pitch = slot_values[source_key]
+        if slot_tie(event, pitch_index) not in {"start", "continue"}:
+            return None, None
+
+        def valid(keys: list[tuple[str, int]]) -> list[tuple[str, int]]:
+            return [
+                key
+                for key in keys
+                if key != source_key
+                and slot_tie(slot_values[key][0], slot_values[key][1]) in {"stop", "continue"}
+            ]
+
+        same_staff = valid(by_same_staff.get((event.part_group, event.staff, pitch, event.end_tick), []))
+        if len(same_staff) > 1:
+            same_voice = [key for key in same_staff if slot_values[key][0].voice == event.voice]
+            same_staff = same_voice if len(same_voice) == 1 else []
+        if len(same_staff) == 1:
+            return same_staff[0], "same_staff"
+        if same_staff:
+            return None, None
+
+        cross_staff = valid(by_any_staff.get((event.part_group, pitch, event.end_tick), []))
+        if len(cross_staff) > 1:
+            same_voice = [key for key in cross_staff if slot_values[key][0].voice == event.voice]
+            cross_staff = same_voice if len(same_voice) == 1 else []
+        if len(cross_staff) == 1:
+            return cross_staff[0], "cross_staff"
+        return None, None
+
+    successors: dict[tuple[str, int], tuple[tuple[str, int], str]] = {}
+    for source_key in slots:
+        target_key, scope = candidate(source_key)
+        if target_key is not None and scope is not None:
+            successors[source_key] = (target_key, scope)
+    predecessors: dict[tuple[str, int], tuple[tuple[str, int], str]] = {}
+    ambiguous: set[tuple[str, int]] = set()
+    for source_key, (target_key, scope) in successors.items():
+        previous = predecessors.get(target_key)
+        if previous is not None and previous[0] != source_key:
+            ambiguous.add(target_key)
+        else:
+            predecessors[target_key] = (source_key, scope)
+    for target_key in ambiguous:
+        predecessors.pop(target_key, None)
+
+    root_cache: dict[tuple[str, int], tuple[str, int, str]] = {}
+
+    def root_for(slot_key: tuple[str, int], seen: set[tuple[str, int]] | None = None) -> tuple[str, int, str]:
+        cached = root_cache.get(slot_key)
+        if cached is not None:
+            return cached
+        seen = set() if seen is None else seen
+        if slot_key in seen:
+            event, _pitch_index, _pitch = slot_values[slot_key]
+            result = (event.voice, event.staff, "ambiguous_cycle")
+            root_cache[slot_key] = result
+            return result
+        seen.add(slot_key)
+        predecessor = predecessors.get(slot_key)
+        if predecessor is None:
+            event, _pitch_index, _pitch = slot_values[slot_key]
+            result = (event.voice, event.staff, "root")
+        else:
+            result = root_for(predecessor[0], seen)
+        root_cache[slot_key] = result
+        return result
+
+    repairs: list[dict[str, Any]] = []
+    normalized: list[_RawEvent] = []
+    for event in events:
+        if not event.pitches:
+            normalized.append(event)
+            continue
+        groups: dict[tuple[str, int], list[tuple[int, str | None]]] = {}
+        for pitch_index, pitch in enumerate(event.pitches):
+            tie = slot_tie(event, pitch_index)
+            target = (event.voice, event.staff)
+            if tie in {"stop", "continue"} and (event.event_id, pitch_index) in predecessors:
+                root_voice, root_staff, _reason = root_for((event.event_id, pitch_index))
+                target = (root_voice, root_staff)
+            groups.setdefault(target, []).append((pitch, tie))
+        original_target = (event.voice, event.staff)
+        ordered_groups = sorted(
+            groups.items(),
+            key=lambda item: (item[0] != original_target, item[0][1], item[0][0]),
+        )
+        for group_index, ((target_voice, target_staff), values) in enumerate(ordered_groups):
+            pitches = [pitch for pitch, _tie in values]
+            tie_types = [tie for _pitch, tie in values]
+            if len(pitches) == 1:
+                kind = "note"
+            else:
+                kind = "chord"
+            if not event.tie_types and event.tie is None:
+                tie_types = []
+            present_ties = [value for value in tie_types if value is not None]
+            tie = (
+                present_ties[0]
+                if present_ties and len(present_ties) == len(tie_types) and all(value == present_ties[0] for value in present_ties)
+                else None
+            )
+            changed = (target_voice, target_staff) != original_target
+            metadata = dict(event.metadata)
+            if changed:
+                repair = {
+                    "reason": "tie_chain_voice_reassigned" if len(ordered_groups) == 1 else "tie_chain_event_split",
+                    "musicxml_event_id": event.event_id,
+                    "source_voice": event.voice,
+                    "source_staff": event.staff,
+                    "target_voice": target_voice,
+                    "target_staff": target_staff,
+                    "pitches": pitches,
+                }
+                repairs.append(repair)
+                metadata["tie_voice_repair"] = repair
+            event_id = event.event_id
+            if group_index and len(ordered_groups) > 1:
+                event_id = f"{event.event_id}:tie-voice-{target_staff}-{target_voice}"
+            normalized.append(
+                _RawEvent(
+                    event_id=event_id,
+                    part_group=event.part_group,
+                    part_id=event.part_id,
+                    staff=target_staff,
+                    voice=target_voice,
+                    start_tick=event.start_tick,
+                    end_tick=event.end_tick,
+                    pitches=pitches,
+                    kind=kind,
+                    tie=tie,
+                    tie_types=tie_types,
+                    tuplet_actual=event.tuplet_actual,
+                    tuplet_normal=event.tuplet_normal,
+                    dots=event.dots,
+                    measure_number=event.measure_number,
+                    metadata=metadata,
+                )
+            )
+    events[:] = normalized
+    return repairs
 
 
 def _tie_at(event: _RawEvent, pitch_index: int) -> str | None:
@@ -1400,14 +1576,21 @@ def standardize_musicxml_payload(
         "score_voice_count": len(voices),
         "source_to_score": alignment,
         "repairs": diagnostics + lane_reasons,
+        "tie_voice_repairs": [
+            item
+            for item in diagnostics
+            if item.get("reason") in {"tie_chain_voice_reassigned", "tie_chain_event_split"}
+        ],
         "source_note_policy": "performance metadata is used only for auditable source-to-MusicXML alignment; XML pitch/timing remains authoritative",
         "alignment_tick_semantics": "source_to_score_movement_* = final Score tick - source performance tick; musicxml_to_score_movement_* = final Score tick - MusicXML tick",
         "score_grid_precision_policy": "48 TPQ accepts exact 1/32, dotted, and supported triplet values; other fractional values are rejected explicitly",
         "conductor_reconciliation": conductor["reconciliation"],
     }
     warnings: list[str] = []
-    if diagnostics:
+    if any(item.get("reason") == "grace_event_not_representable_at_48_tpq" for item in diagnostics):
         warnings.append("MusicXML contained grace events that cannot be represented at positive 48 TPQ duration")
+    if any(item.get("reason") in {"tie_chain_voice_reassigned", "tie_chain_event_split"} for item in diagnostics):
+        warnings.append("MusicXML tie fragments were normalized into serializable ScoreVoice lanes")
     if lane_reasons:
         warnings.append("Overlapping MusicXML events were preserved in additional ScoreVoice lanes")
     if any(item.get("reason") not in {"matched_musicxml_event", "matched_musicxml_tie_chain"} for item in alignment):
@@ -1448,6 +1631,11 @@ def standardize_musicxml_payload(
         "staff_policy": "Piano staff parts are grouped by the MusicXML parent id and retain staff on ScoreVoice/ScoreNote",
         "voice_policy": "Overlapping events receive additional lanes and are never deleted, including lanes beyond four",
         "source_performance_metadata": bool(source_notes),
+        "tie_voice_repairs": [
+            item
+            for item in diagnostics
+            if item.get("reason") in {"tie_chain_voice_reassigned", "tie_chain_event_split"}
+        ],
     }
     score = Score(
         title=sanitize_title(title or payload.title),
