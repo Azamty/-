@@ -66,6 +66,7 @@ def test_generated_downbeat_accents_preserve_pitch_and_timing(tmp_path: Path) ->
     assert first["velocity_policy"] == {
         "kind": "deterministic_notated_downbeat_accents",
         "accent_delta": generator.DOWNBEAT_ACCENT_DELTA,
+        "accent_delta_by_program_family": {"guitar": generator.GUITAR_ACCENT_DELTA},
         "max_velocity": 112,
         "pitch_and_timing_unchanged": True,
     }

@@ -65,7 +65,7 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
   --new-result-root .\artifacts\review\high-accuracy-benchmark\new
 ```
 
-MAESTRO 10 条目前只登记官方入口、CC BY-NC-SA 4.0、MIDI archive SHA-256 和选取规则，状态是 `not_downloaded`；它没有被下载或冒充本地结果。待审查后按清单中的官方下载地址取得 archive，校验 `70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c`，再记录实际 archive 字节数、选中文件 hash，并从 MIDI 渲染音频。该本地音频是确定性的谐波振荡器渲染，保留 MIDI 音高、时值、起音、力度和 tempo map；它不代表真实钢琴音色、踏板噪声、房间声学或原始演奏细节，manifest 会把这些限制写入 `render_domain`。合成 fixture 会按拍号在记谱 downbeat 提高 MIDI velocity，音高和时序保持不变，以便原曲 BeatNet 有可解释的小节重音；这仍是本地合成域，不能冒充真实表演录音。PJS 的拍点文件由同源 MIDI 透明推导，报告会保留这一限制，不把它描述成独立人工 beat 标注。
+MAESTRO 10 条目前只登记官方入口、CC BY-NC-SA 4.0、MIDI archive SHA-256 和选取规则，状态是 `not_downloaded`；它没有被下载或冒充本地结果。待审查后按清单中的官方下载地址取得 archive，校验 `70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c`，再记录实际 archive 字节数、选中文件 hash，并从 MIDI 渲染音频。该本地音频是确定性的谐波振荡器渲染，保留 MIDI 音高、时值、起音、力度和 tempo map；它不代表真实钢琴音色、踏板噪声、房间声学或原始演奏细节，manifest 会把这些限制写入 `render_domain`。合成 fixture 会按拍号在记谱 downbeat 提高 MIDI velocity，音高和时序保持不变，以便原曲 BeatNet 有可解释的小节重音；guitar 采用较小的 downbeat 增量来保持 MuScriptor 对基音的稳定识别，其他音色使用更明显的增量。这仍是本地合成域，不能冒充真实表演录音。PJS 的拍点文件由同源 MIDI 透明推导，报告会保留这一限制，不把它描述成独立人工 beat 标注。
 
 校验和选取官方 MIDI 的命令是：
 

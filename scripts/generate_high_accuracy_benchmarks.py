@@ -34,6 +34,7 @@ DEFAULT_SEED = 20260907
 SAMPLE_RATE = 16_000
 PPQ = 480
 DOWNBEAT_ACCENT_DELTA = 24
+GUITAR_ACCENT_DELTA = 4
 RENDERER_VERSION = "deterministic_harmonic_oscillator_v1"
 
 
@@ -138,12 +139,15 @@ def _harmonic_weights(program: int) -> tuple[tuple[int, float], ...]:
     """Return a small deterministic additive timbre for one MIDI program."""
 
     if 24 <= program <= 31:  # nylon/acoustic/electric guitar family
-        return ((1, 1.0), (2, 0.34), (3, 0.16), (4, 0.06))
+        # MuScriptor is reliably responsive to the fixture's original
+        # fundamental-only guitar profile; keep that model-compatible profile
+        # while piano/bass use the modest partials below.
+        return ((1, 1.0),)
     if 32 <= program <= 39:  # bass family
-        return ((1, 1.0), (2, 0.24), (3, 0.08))
+        return ((1, 1.0), (2, 0.08), (3, 0.025))
     if 0 <= program <= 7:  # piano family
-        return ((1, 1.0), (2, 0.22), (3, 0.10), (4, 0.04))
-    return ((1, 1.0), (2, 0.28), (3, 0.12), (4, 0.04))
+        return ((1, 1.0), (2, 0.08), (3, 0.03), (4, 0.01))
+    return ((1, 1.0), (2, 0.09), (3, 0.03), (4, 0.01))
 
 
 def _accent_downbeats(tracks: Sequence[RenderTrack], meter: tuple[int, int]) -> tuple[RenderTrack, ...]:
@@ -152,10 +156,11 @@ def _accent_downbeats(tracks: Sequence[RenderTrack], meter: tuple[int, int]) -> 
     bar_quarters = Fraction(meter[0] * 4, meter[1])
     accented: list[RenderTrack] = []
     for track in tracks:
+        accent_delta = GUITAR_ACCENT_DELTA if 24 <= track.program <= 31 else DOWNBEAT_ACCENT_DELTA
         notes = tuple(
             replace(
                 note,
-                velocity=min(112, max(1, int(note.velocity)) + DOWNBEAT_ACCENT_DELTA),
+                velocity=min(112, max(1, int(note.velocity)) + accent_delta),
             )
             if note.start % bar_quarters == 0
             else note
@@ -187,8 +192,9 @@ def _render_audio(path: Path, tracks: Sequence[RenderTrack], tempo: Sequence[tup
             end_frame = min(frame_count, int(math.ceil(end_sec * SAMPLE_RATE)))
             frequency = _frequency(note.pitch) * (1.0 + detune * (track_index + 1))
             amplitude = 0.12 * (max(1, min(127, note.velocity)) / 127.0) / max(1.0, math.sqrt(len(tracks)))
-            attack = max(1, int(0.006 * SAMPLE_RATE))
-            release = max(1, int(0.030 * SAMPLE_RATE))
+            attack_sec, release_sec = ((0.008, 0.018) if 24 <= track.program <= 31 else (0.006, 0.030))
+            attack = max(1, int(attack_sec * SAMPLE_RATE))
+            release = max(1, int(release_sec * SAMPLE_RATE))
             for frame in range(start_frame, end_frame):
                 local = frame - start_frame
                 remaining = end_frame - frame
@@ -315,6 +321,7 @@ def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int =
         "velocity_policy": {
             "kind": "deterministic_notated_downbeat_accents",
             "accent_delta": DOWNBEAT_ACCENT_DELTA,
+            "accent_delta_by_program_family": {"guitar": GUITAR_ACCENT_DELTA},
             "max_velocity": 112,
             "pitch_and_timing_unchanged": True,
         },
