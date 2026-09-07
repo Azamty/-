@@ -397,3 +397,30 @@ def test_ccmusic_beat_grid_has_exact_bar_downbeats(tmp_path: Path) -> None:
     assert [item["score_quarter"] for item in beats[:3]] == [72, 73, 74]
     assert [item["index"] for item in payload["beat_grid"]["downbeats"]] == [0, 4, 8, 12, 16]
     assert beats[-1]["time_sec"] == 12.0
+
+
+def test_ccmusic_alignment_provenance_separates_latency_diagnostic_from_mix_offset(monkeypatch) -> None:
+    onset = ccmusic.np.zeros(200, dtype=ccmusic.np.float64)
+    onset[100] = 3.0
+    monkeypatch.setattr(ccmusic, "_onset_feature", lambda _path: (onset, 25.0))
+    payload = SimpleNamespace(
+        parts=[
+            SimpleNamespace(
+                events=[
+                    SimpleNamespace(
+                        kind="note",
+                        pitches=[60],
+                        grace=False,
+                        offset_quarter=39.5,
+                        event_id="first",
+                    )
+                ]
+            )
+        ]
+    )
+
+    placement = ccmusic._estimate_vocal_mix_offset(payload, Path("tuned-vocal.wav"))
+
+    assert placement["vocal_mix_offset_sec"] == 25.625
+    assert placement["used_vocal_to_guide_latency"] is False
+    assert placement["latency_application"].endswith("not_applied_to_mix_placement")

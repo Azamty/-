@@ -449,6 +449,7 @@ def _worker_raw_events(payload: WorkerPayload) -> tuple[list[_RawEvent], list[di
                 )
             )
     diagnostics.extend(_normalize_tied_event_voices(events))
+    diagnostics.extend(_normalize_orphan_tuplet_markers(events))
     return events, diagnostics
 
 
@@ -625,6 +626,324 @@ def _normalize_tied_event_voices(events: list[_RawEvent]) -> list[dict[str, Any]
                 )
             )
     events[:] = normalized
+    return repairs
+
+
+def _raw_tuplet_ratio(event: _RawEvent) -> tuple[int, int] | None:
+    if event.tuplet_actual is None and event.tuplet_normal is None:
+        return None
+    if event.tuplet_actual is None or event.tuplet_normal is None:
+        return None
+    return event.tuplet_actual, event.tuplet_normal
+
+
+def _raw_tuplet_context(event: _RawEvent) -> tuple[str, int, tuple[int, int]] | None:
+    ratio = _raw_tuplet_ratio(event)
+    if ratio is None:
+        return None
+    return event.part_group, event.staff, ratio
+
+
+def _raw_duration_is_serializable(event: _RawEvent) -> bool:
+    """Check a raw event after its tuplet marker would be removed."""
+
+    duration = event.end_tick - event.start_tick
+    if duration <= 0:
+        return False
+    view = ScoreNote(
+        start_tick=event.start_tick,
+        duration_tick=duration,
+        midi=min(event.pitches) if event.pitches else None,
+    )
+    return _score_duration_is_serializable(view)
+
+
+def _raw_tuplet_span(
+    events: list[_RawEvent],
+    start: _RawEvent,
+    stop: _RawEvent,
+    *,
+    allow_cross_voice: bool,
+) -> list[_RawEvent] | None:
+    """Return one contiguous explicit tuplet span, or ``None``.
+
+    The serializer cannot represent one explicit bracket across ScoreVoice
+    lanes.  A direct start/end boundary with one contiguous ratio-bearing
+    timeline is the only cross-voice shape accepted here; gaps, overlaps, and
+    ratio changes remain errors for the serializer to report.
+    """
+
+    ratio = _raw_tuplet_ratio(start)
+    if ratio != (3, 2) or _raw_tuplet_ratio(stop) != ratio:
+        return None
+    if start.tuplet_type != "start" or stop.tuplet_type != "stop":
+        return None
+    if start.end_tick > stop.start_tick or (not allow_cross_voice and start.voice != stop.voice):
+        return None
+    if start.voice != stop.voice and not allow_cross_voice:
+        return None
+    context = [
+        event
+        for event in events
+        if event.part_group == start.part_group
+        and event.staff == start.staff
+        and _raw_tuplet_ratio(event) == ratio
+        and event.start_tick >= start.start_tick
+        and event.end_tick <= stop.end_tick
+    ]
+    ordered = sorted(context, key=lambda event: (event.start_tick, event.end_tick, event.event_id))
+    if not ordered or ordered[0] is not start or ordered[-1] is not stop:
+        return None
+    if ordered[-1].end_tick != stop.end_tick:
+        return None
+    if any(previous.end_tick != current.start_tick for previous, current in zip(ordered, ordered[1:])):
+        return None
+    if any(
+        event is not start
+        and event is not stop
+        and event.tuplet_type in {"start", "stop"}
+        for event in ordered
+    ):
+        return None
+    if len({event.voice for event in ordered}) > 1 and not allow_cross_voice:
+        return None
+    return ordered
+
+
+def _raw_tuplet_voice_has_overlap(
+    events: list[_RawEvent],
+    component: list[_RawEvent],
+    *,
+    target_voice: str,
+) -> bool:
+    component_ids = {id(event) for event in component}
+    for event in component:
+        for other in events:
+            if id(other) in component_ids or other.voice != target_voice:
+                continue
+            if other.part_group != event.part_group or other.staff != event.staff:
+                continue
+            if other.start_tick < event.end_tick and event.start_tick < other.end_tick:
+                return True
+    return False
+
+
+def _record_tuplet_marker_repair(
+    event: _RawEvent,
+    *,
+    reason: str,
+    action: str,
+    target_voice: str | None = None,
+    group_start_tick: int | None = None,
+    group_end_tick: int | None = None,
+) -> dict[str, Any]:
+    repair = {
+        "reason": reason,
+        "action": action,
+        "musicxml_event_id": event.event_id,
+        "part_group": event.part_group,
+        "part_id": event.part_id,
+        "staff": event.staff,
+        "voice": event.voice,
+        "start_tick": event.start_tick,
+        "end_tick": event.end_tick,
+        "original_marker": {
+            "tuplet_actual": event.tuplet_actual,
+            "tuplet_normal": event.tuplet_normal,
+            "tuplet_type": event.tuplet_type,
+        },
+        "tuplet_actual": event.tuplet_actual,
+        "tuplet_normal": event.tuplet_normal,
+        "tuplet_type": event.tuplet_type,
+    }
+    if target_voice is not None:
+        repair["target_voice"] = target_voice
+    if group_start_tick is not None:
+        repair["group_start_tick"] = group_start_tick
+    if group_end_tick is not None:
+        repair["group_end_tick"] = group_end_tick
+    return repair
+
+
+def _normalize_orphan_tuplet_markers(events: list[_RawEvent]) -> list[dict[str, Any]]:
+    """Repair only explicit 3:2 markers proven to be import artifacts.
+
+    A tie voice repair can move the first fragment of a MusicXML tuplet into a
+    different ScoreVoice while its stop fragment remains in the source voice.
+    A contiguous bracket is then restored by reassigning the marker fragments
+    to the start voice.  Isolated/incomplete markers are cleared only when
+    their plain 48 TPQ durations are serializable.  Same-voice gaps, nested
+    boundaries, and unsupported ratios are left untouched so the serializer
+    still rejects them.
+    """
+
+    repairs: list[dict[str, Any]] = []
+    contexts: dict[tuple[str, int, tuple[int, int]], list[_RawEvent]] = {}
+    for event in events:
+        context = _raw_tuplet_context(event)
+        if context is not None and context[2] == (3, 2):
+            contexts.setdefault(context, []).append(event)
+
+    # First restore a directly contiguous bracket that was split between
+    # voices.  This preserves the 3:2 timing rather than dropping a marker.
+    for context, group_events in contexts.items():
+        starts = sorted(
+            (event for event in group_events if event.tuplet_type == "start"),
+            key=lambda event: (event.start_tick, event.end_tick, event.event_id),
+        )
+        for start in starts:
+            same_voice_stops = sorted(
+                (
+                    event
+                    for event in group_events
+                    if event.voice == start.voice
+                    and event.tuplet_type == "stop"
+                    and event.start_tick >= start.end_tick
+                ),
+                key=lambda event: (event.start_tick, event.end_tick, event.event_id),
+            )
+            # A same-voice stop is authoritative even if the span is malformed;
+            # do not turn a genuine gap or ratio error into a repair.
+            if same_voice_stops:
+                continue
+            cross_voice_stops = sorted(
+                (
+                    event
+                    for event in group_events
+                    if event.voice != start.voice
+                    and event.tuplet_type == "stop"
+                    and event.start_tick == start.end_tick
+                ),
+                key=lambda event: (event.start_tick, event.end_tick, event.event_id),
+            )
+            if len(cross_voice_stops) != 1:
+                continue
+            stop = cross_voice_stops[0]
+            component = _raw_tuplet_span(events, start, stop, allow_cross_voice=True)
+            if component is None or _raw_tuplet_voice_has_overlap(events, component, target_voice=start.voice):
+                continue
+            for event in component:
+                if event.voice == start.voice:
+                    continue
+                repair = _record_tuplet_marker_repair(
+                    event,
+                    reason="cross_voice_tuplet_marker_reassigned",
+                    action="reassigned_tuplet_fragment_to_start_voice",
+                    target_voice=start.voice,
+                    group_start_tick=start.start_tick,
+                    group_end_tick=stop.end_tick,
+                )
+                event.voice = start.voice
+                event.metadata = dict(event.metadata)
+                event.metadata["tuplet_boundary_repair"] = repair
+                repairs.append(repair)
+
+    # Recompute contexts after voice restoration and identify complete groups.
+    contexts = {}
+    for event in events:
+        context = _raw_tuplet_context(event)
+        if context is not None and context[2] == (3, 2):
+            contexts.setdefault(context, []).append(event)
+    valid_ids: set[int] = set()
+    for group_events in contexts.values():
+        for start in (event for event in group_events if event.tuplet_type == "start"):
+            stops = sorted(
+                (
+                    event
+                    for event in group_events
+                    if event.voice == start.voice
+                    and event.tuplet_type == "stop"
+                    and event.start_tick >= start.end_tick
+                ),
+                key=lambda event: (event.start_tick, event.end_tick, event.event_id),
+            )
+            if not stops:
+                continue
+            component = _raw_tuplet_span(events, start, stops[0], allow_cross_voice=False)
+            if component is not None:
+                valid_ids.update(id(event) for event in component)
+
+    def same_voice_context(event: _RawEvent) -> list[_RawEvent]:
+        return sorted(
+            (
+                candidate
+                for candidate in events
+                if candidate.part_group == event.part_group
+                and candidate.staff == event.staff
+                and candidate.voice == event.voice
+            ),
+            key=lambda candidate: (candidate.start_tick, candidate.end_tick, candidate.event_id),
+        )
+
+    cleared_ids: set[int] = set()
+    for group_events in contexts.values():
+        for event in sorted(group_events, key=lambda value: (value.start_tick, value.end_tick, value.event_id)):
+            if event.tuplet_type not in {"start", "continue", "stop"} or id(event) in valid_ids or id(event) in cleared_ids:
+                continue
+            voice_events = same_voice_context(event)
+            same_voice_group = [candidate for candidate in voice_events if _raw_tuplet_context(candidate) == _raw_tuplet_context(event)]
+            starts = [candidate for candidate in same_voice_group if candidate.tuplet_type == "start"]
+            stops = [candidate for candidate in same_voice_group if candidate.tuplet_type == "stop"]
+            if starts and stops:
+                # This is an incomplete or malformed same-voice bracket; the
+                # true gap/ratio error remains visible to score_to_jianpu.
+                continue
+            if event.tuplet_type == "start" and len(starts) != 1:
+                continue
+            if event.tuplet_type == "stop" and len(stops) != 1:
+                continue
+            if event.tuplet_type == "start" and stops:
+                continue
+            if event.tuplet_type == "stop" and starts:
+                continue
+            if event.tuplet_type == "continue" and (starts or stops):
+                continue
+
+            # A boundary with a conflicting ratio in either voice is evidence
+            # of a real ratio error, not an orphan marker.
+            conflicting = any(
+                candidate.part_group == event.part_group
+                and candidate.staff == event.staff
+                and candidate.tuplet_type in {"start", "stop"}
+                and _raw_tuplet_ratio(candidate) != _raw_tuplet_ratio(event)
+                and (
+                    candidate.voice == event.voice
+                    or candidate.start_tick == event.end_tick
+                    or candidate.end_tick == event.start_tick
+                )
+                for candidate in events
+            )
+            if conflicting:
+                continue
+
+            component: list[_RawEvent] = [event]
+            if event.tuplet_type == "start":
+                index = same_voice_group.index(event)
+                while index + 1 < len(same_voice_group) and same_voice_group[index].end_tick == same_voice_group[index + 1].start_tick:
+                    index += 1
+                    component.append(same_voice_group[index])
+            elif event.tuplet_type == "stop":
+                index = same_voice_group.index(event)
+                while index > 0 and same_voice_group[index - 1].end_tick == same_voice_group[index].start_tick:
+                    index -= 1
+                    component.insert(0, same_voice_group[index])
+            if not all(_raw_duration_is_serializable(candidate) for candidate in component):
+                continue
+            for candidate in component:
+                if id(candidate) in cleared_ids:
+                    continue
+                repair = _record_tuplet_marker_repair(
+                    candidate,
+                    reason="orphan_tuplet_marker_cleared",
+                    action="cleared_incomplete_tuplet_marker",
+                )
+                candidate.tuplet_actual = None
+                candidate.tuplet_normal = None
+                candidate.tuplet_type = None
+                candidate.metadata = dict(candidate.metadata)
+                candidate.metadata["tuplet_boundary_repair"] = repair
+                repairs.append(repair)
+                cleared_ids.add(id(candidate))
     return repairs
 
 
@@ -1883,6 +2202,11 @@ def standardize_musicxml_payload(
         total_ticks=total_ticks,
     )
     notation_grid_repairs = dot_repairs + fine_grid_repairs
+    tuplet_marker_repairs = [
+        item
+        for item in diagnostics
+        if item.get("reason") in {"cross_voice_tuplet_marker_reassigned", "orphan_tuplet_marker_cleared"}
+    ]
 
     measure_metadata: list[dict[str, Any]] = []
     for measure in payload.measures:
@@ -1985,6 +2309,7 @@ def standardize_musicxml_payload(
             item for item in diagnostics if item.get("reason") == "finer_binary_musicxml_value_quantized_to_48_tpq"
         ],
         "notation_grid_repairs": notation_grid_repairs,
+        "tuplet_marker_repairs": tuplet_marker_repairs,
         "score_voice_count": len(voices),
         "source_to_score": alignment,
         "repairs": diagnostics + notation_grid_repairs + lane_reasons,
@@ -2007,6 +2332,8 @@ def standardize_musicxml_payload(
         warnings.append("MusicXML explicit dot hints did not match the final 48 TPQ duration or tuplet context; hints were cleared or recomputed; inspect alignment_report.json")
     if notation_grid_repairs:
         warnings.append("Finer MusicXML fragments required bounded jianpu atom repairs; inspect alignment_report.json")
+    if tuplet_marker_repairs:
+        warnings.append("MusicXML explicit tuplet markers were repaired only for an auditable orphan or cross-voice import artifact; inspect alignment_report.json")
     if any(item.get("reason") in {"tie_chain_voice_reassigned", "tie_chain_event_split"} for item in diagnostics):
         warnings.append("MusicXML tie fragments were normalized into serializable ScoreVoice lanes")
     if lane_reasons:

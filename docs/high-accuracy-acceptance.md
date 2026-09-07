@@ -13,6 +13,8 @@
 
 BeatNet 依赖放在独立的 `.venv-model-beatnet`，MusicXML 标准化 worker 使用独立的 `.venv-notation`（Python 3.10、`music21==9.9.2`）。MuseScore 4.7.4 的固定版本文件和校验记录放在忽略的本地目录 `tools\musescore-4.7.4` 与 `.cache\packages`；能力检查会报告可执行文件、版本、两个导入 profile、profile SHA-256 和 MusicXML 输出是否可用。器乐默认 profile 的 SHA-256 为 `86742B91922F921F725A1A5810572AB458EB7FB7AAC46FC683C92352B837C9FF`，最短导入单位是 1/32，开启二连音、三连音、四连音及 human performance，关闭 5:4、7:4、9:8 连音。GAME 人声使用固定的 `tools\musescore-4.7.4\midi_import_options_vocal.xml`，SHA-256 为 `B47761C931A649E910E078CAAF57887756D89B529F1379B4E537746DC7653557`；它关闭 human-performance 的重新分段并开启 `SimplifyDurations`，保留稀疏歌声的性能起音，再交由生产 tempo map 播放。两套 profile 都只搜索能由48 TPQ精确表示的二进制时值和3:2三连音；其它连音由标准化器明确失败，不能静默舍入。能力检查会拒绝偏离 profile 的文件。MuseScore CLI 调用使用 `--factory-settings --test-mode -M ... -o ...`，同一服务进程内串行执行以避开 MuseScore crashpad 并发崩溃。
 
+MusicXML 标准化器保留同声部的合法 3:2 tuplets；若 tie voice 重分配造成一个连续 bracket 的 start/stop 跨 ScoreVoice，只在无重叠、无 gap、marker ratio 一致且 tick 时值可序列化时把 fragment 归到 start voice，并在 `alignment_report.json` 的 `tuplet_marker_repairs` 中记录原 voice、目标 voice、tick 和原始 marker。孤立 marker 只有在清除后普通 48 TPQ 时值可序列化时才清除；同声部 gap、嵌套或不支持的 ratio 仍会失败。
+
 MuseScore 也可以直接启动检查安装（项目解包目录或系统安装目录二选一）：
 
 ```powershell
@@ -67,7 +69,7 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
 
 MAESTRO 10 条目前只登记官方入口、CC BY-NC-SA 4.0、MIDI archive SHA-256 和选取规则，状态是 `not_downloaded`；它没有被下载或冒充本地结果。待审查后按清单中的官方下载地址取得 archive，校验 `70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c`，再记录实际 archive 字节数、选中文件 hash，并从 MIDI 渲染音频。该本地音频是确定性的谐波振荡器渲染，保留 MIDI 音高、时值、起音、力度和 tempo map；它不代表真实钢琴音色、踏板噪声、房间声学或原始演奏细节，manifest 会把这些限制写入 `render_domain`。合成 fixture 会按拍号在记谱 downbeat 提高 MIDI velocity，音高和时序保持不变，以便原曲 BeatNet 有可解释的小节重音；guitar 采用较小的 downbeat 增量来保持 MuScriptor 对基音的稳定识别，其他音色使用更明显的增量。这仍是本地合成域，不能冒充真实表演录音。PJS 的拍点文件由同源 MIDI 透明推导，报告会保留这一限制，不把它描述成独立人工 beat 标注。
 
-CCMusic demo 使用官方 Zenodo 记录 `https://zenodo.org/records/5676893`（DOI `10.5281/zenodo.5676893`）。准备脚本只接受本地 archive，要求字节数 `302024881`、MD5 `DBDC4A7E019C6B7A1424D99FDD8A7838` 和 SHA-256 `477B5466936EEC40CEF7DFD43205900E3E4A651B8EC671FDCCAFF48910523053` 全部匹配；记录说明其可用于 computational musicology，但没有 SPDX license identifier。它只解包 cpop/Yueding 的五个成员，使用 pinned music21 worker 读取 MusicXML，按 onset correlation 记录 tuned vocal 与 XML guide 的全局延迟，再将 vocal 放入 48 kHz accompaniment，生成五段 12 秒混合音频、裁剪 vocal-score MIDI 和独立于模型输出的 MusicXML beat/downbeat grid。所有生成音频和 MIDI 仍在 `.cache`，不提交到仓库：
+CCMusic demo 使用官方 Zenodo 记录 `https://zenodo.org/records/5676893`（DOI `10.5281/zenodo.5676893`）。准备脚本只接受本地 archive，要求字节数 `302024881`、MD5 `DBDC4A7E019C6B7A1424D99FDD8A7838` 和 SHA-256 `477B5466936EEC40CEF7DFD43205900E3E4A651B8EC671FDCCAFF48910523053` 全部匹配；记录说明其可用于 computational musicology，但没有 SPDX license identifier。它只解包 cpop/Yueding 的五个成员，使用 pinned music21 worker 读取 MusicXML，按 onset correlation 记录 tuned vocal 与 XML guide 的相对延迟，再将 vocal 放入 48 kHz accompaniment，生成五段 12 秒混合音频、裁剪 vocal-score MIDI 和独立于模型输出的 MusicXML beat/downbeat grid。manifest 中的 `vocal_to_guide_shift_sec`（实际约 `-0.44s`）只表示两条源轨的相对延迟诊断，明确不参与混音；`vocal_mix_offset_sec`（实际 `26.345s`）是把 tuned vocal 首个稳定起音锚到 MusicXML 首个音符在完整 accompaniment 时间轴上的绝对放置偏移。所有生成音频和 MIDI 仍在 `.cache`，不提交到仓库：
 
 ```powershell
 & .\.venv\Scripts\python.exe scripts\prepare_ccmusic_benchmark.py `

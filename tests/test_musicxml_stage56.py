@@ -30,7 +30,7 @@ from backend.jianpu_score.musicxml_standardize import (
 )
 from backend.jianpu_score.musescore_import import MuseScoreImportError, convert_performance_midi
 import backend.jianpu_score.musescore_import as musescore_import
-from backend.jianpu_score.quantize import _validate_explicit_ties, score_to_jianpu
+from backend.jianpu_score.quantize import JianpuSerializationError, _validate_explicit_ties, score_to_jianpu
 from backend.jianpu_score.high_accuracy import (
     MUSESCORE_IMPORT_PROFILE_EXPECTED,
     MUSESCORE_IMPORT_PROFILE_SHA256,
@@ -210,6 +210,184 @@ def _manual_payload() -> WorkerPayload:
         time_signature_events=[WorkerTimeSignature(offset_quarter=0, ratio="4/4", numerator=4, denominator=4)],
         key_signature_events=[WorkerKeySignature(offset_quarter=0, key="D", sharps=2)],
     )
+
+
+def _tuplet_marker_payload(events: list[WorkerEvent]) -> WorkerPayload:
+    payload = _manual_payload()
+    payload.highest_time_quarter = 4
+    payload.parts[0].highest_time_quarter = 4
+    payload.parts[0].events = events
+    payload.parts[0].measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=4,
+            end_quarter=4,
+            time_signature="4/4",
+        )
+    ]
+    payload.measures = list(payload.parts[0].measures)
+    return payload
+
+
+def test_score_normalizer_preserves_complete_same_voice_tuplet_markers() -> None:
+    payload = _tuplet_marker_payload(
+        [
+            WorkerEvent(
+                event_id="same-start",
+                kind="note",
+                offset_quarter=0,
+                duration_quarter=1 / 6,
+                pitches=[60],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="start",
+                voice="1",
+            ),
+            WorkerEvent(
+                event_id="same-middle",
+                kind="note",
+                offset_quarter=1 / 6,
+                duration_quarter=1 / 6,
+                pitches=[62],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                voice="1",
+            ),
+            WorkerEvent(
+                event_id="same-stop",
+                kind="note",
+                offset_quarter=1 / 3,
+                duration_quarter=1 / 6,
+                pitches=[64],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="stop",
+                voice="1",
+            ),
+            WorkerEvent(event_id="same-tail", kind="rest", offset_quarter=0.5, duration_quarter=3.5, voice="1"),
+        ]
+    )
+
+    score, report = standardize_musicxml_payload(payload)
+
+    notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
+    assert [(event.start_tick, event.duration_tick, event.tuplet_type) for event in notes] == [
+        (0, 8, "start"),
+        (8, 8, None),
+        (16, 8, "stop"),
+    ]
+    assert report["tuplet_marker_repairs"] == []
+    assert score_to_jianpu(score)
+
+
+@pytest.mark.parametrize("boundary", ["start", "stop"])
+def test_score_normalizer_clears_serializable_isolated_tuplet_boundary(boundary: str) -> None:
+    payload = _tuplet_marker_payload(
+        [
+            WorkerEvent(
+                event_id="orphan",
+                kind="note",
+                offset_quarter=0,
+                duration_quarter=0.25,
+                pitches=[60],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type=boundary,
+                voice="1",
+            ),
+            WorkerEvent(event_id="orphan-tail", kind="rest", offset_quarter=0.25, duration_quarter=3.75, voice="1"),
+        ]
+    )
+
+    score, report = standardize_musicxml_payload(payload)
+
+    note = next(event for voice in score.voices for event in voice.events if event.midi == 60)
+    assert note.tuplet_actual is None
+    assert note.tuplet_normal is None
+    assert note.tuplet_type is None
+    assert [item["reason"] for item in report["tuplet_marker_repairs"]] == ["orphan_tuplet_marker_cleared"]
+    assert report["tuplet_marker_repairs"][0]["original_marker"]["tuplet_type"] == boundary
+    assert score_to_jianpu(score)
+
+
+def test_score_normalizer_rejoins_cross_voice_tuplet_fragment_without_moving_timing() -> None:
+    payload = _tuplet_marker_payload(
+        [
+            WorkerEvent(
+                event_id="cross-start",
+                kind="note",
+                offset_quarter=0,
+                duration_quarter=1 / 6,
+                pitches=[60],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="start",
+                voice="1",
+            ),
+            WorkerEvent(
+                event_id="cross-stop",
+                kind="note",
+                offset_quarter=1 / 6,
+                duration_quarter=1 / 12,
+                pitches=[62],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="stop",
+                voice="2",
+            ),
+            WorkerEvent(event_id="cross-tail", kind="rest", offset_quarter=1 / 4, duration_quarter=3.75, voice="2"),
+        ]
+    )
+
+    score, report = standardize_musicxml_payload(payload)
+
+    notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
+    assert [(event.midi, event.start_tick, event.end_tick) for event in notes] == [(60, 0, 8), (62, 8, 12)]
+    assert len({event.voice_id for event in notes}) == 1
+    repair = report["tuplet_marker_repairs"][0]
+    assert repair["reason"] == "cross_voice_tuplet_marker_reassigned"
+    assert repair["voice"] == "2"
+    assert repair["target_voice"] == "1"
+    assert repair["start_tick"] == 8
+    assert repair["end_tick"] == 12
+    assert score_to_jianpu(score)
+
+
+def test_score_normalizer_does_not_hide_same_voice_tuplet_gap() -> None:
+    payload = _tuplet_marker_payload(
+        [
+            WorkerEvent(
+                event_id="gap-start",
+                kind="note",
+                offset_quarter=0,
+                duration_quarter=1 / 6,
+                pitches=[60],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="start",
+                voice="1",
+            ),
+            WorkerEvent(
+                event_id="gap-stop",
+                kind="note",
+                offset_quarter=0.25,
+                duration_quarter=1 / 12,
+                pitches=[62],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="stop",
+                voice="1",
+            ),
+        ]
+    )
+
+    score, report = standardize_musicxml_payload(payload)
+
+    assert report["tuplet_marker_repairs"] == []
+    with pytest.raises(JianpuSerializationError, match="gap or inconsistent ratio"):
+        score_to_jianpu(score)
 
 
 def test_score_normalizer_preserves_notation_fields_and_more_than_four_voices() -> None:
