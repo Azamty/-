@@ -14,7 +14,7 @@ import hashlib
 import json
 import math
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -167,9 +167,16 @@ def _read_time_points(path: Path | None, *, downbeats: bool = False) -> list[flo
     values: list[float] = []
     if isinstance(payload, Mapping) and isinstance(payload.get("beat_grid"), Mapping):
         payload = payload["beat_grid"]
+    explicit_downbeat_records = bool(downbeats and isinstance(payload, Mapping) and "downbeats" in payload)
     if isinstance(payload, Mapping):
-        records = payload.get("downbeats") if downbeats else payload.get("beats")
-        records = records or payload.get("beats") or payload.get("beat_times") or []
+        if downbeats:
+            # A beat list without explicit downbeat flags is not a downbeat
+            # annotation.  Falling back to every beat would inflate the
+            # downbeat F1 and hide missing bar-position information.
+            has_downbeat_array = "downbeats" in payload
+            records = payload.get("downbeats") if has_downbeat_array else payload.get("beats", [])
+        else:
+            records = payload.get("beats") or payload.get("beat_times") or []
     else:
         records = payload
     if isinstance(records, list):
@@ -179,7 +186,11 @@ def _read_time_points(path: Path | None, *, downbeats: bool = False) -> list[flo
                 if isinstance(item, Mapping)
                 else item
             )
-            if downbeats and isinstance(item, Mapping) and "downbeat" in item and not item.get("downbeat", False):
+            if downbeats and not explicit_downbeat_records and isinstance(item, Mapping) and not item.get("downbeat", False):
+                continue
+            if downbeats and not explicit_downbeat_records and not isinstance(item, Mapping):
+                # Numeric fallback records came from a beat list, not an
+                # explicit downbeat list, and therefore carry no evidence.
                 continue
             try:
                 number = float(value)
@@ -296,6 +307,37 @@ def _mean_metric(cases: Sequence[Mapping[str, Any]], name: str, field: str) -> f
     return sum(values) / len(values) if values else None
 
 
+def _case_id_index(
+    cases: Sequence[Mapping[str, Any]],
+    *,
+    label: str,
+) -> tuple[dict[str, Mapping[str, Any]], list[str], list[str]]:
+    """Index reliable cases while retaining ID integrity diagnostics."""
+
+    all_ids: list[str] = []
+    missing: list[str] = []
+    for index, case in enumerate(cases):
+        value = case.get("id")
+        if value is None or not str(value).strip():
+            missing.append(f"{label}[{index}]")
+            continue
+        all_ids.append(str(value))
+    duplicates = sorted(value for value, count in Counter(all_ids).items() if count > 1)
+    reliable: dict[str, Mapping[str, Any]] = {}
+    for case in cases:
+        value = case.get("id")
+        if value is None or not str(value).strip():
+            continue
+        case_id = str(value)
+        if (
+            case.get("status") == "evaluated"
+            and case.get("evaluation_policy") == "reference_metrics"
+            and case.get("reference_midi_reliable") is True
+        ):
+            reliable.setdefault(case_id, case)
+    return reliable, missing, duplicates
+
+
 def assess_accuracy_claim(
     cases: Sequence[Mapping[str, Any]],
     baseline_cases: Sequence[Mapping[str, Any]] | None,
@@ -309,17 +351,47 @@ def assess_accuracy_claim(
     registry or pretending that unrun cases passed.
     """
 
-    reliable = [
-        case for case in cases
-        if case.get("status") == "evaluated"
-        and case.get("evaluation_policy") == "reference_metrics"
-        and case.get("reference_midi_reliable") is True
-    ]
     reasons: list[str] = []
-    if len(reliable) < minimum_cases:
-        reasons.append(f"可靠的新链路结果只有 {len(reliable)}/{minimum_cases} 个")
+    new_by_id, new_missing, new_duplicates = _case_id_index(cases, label="new")
+    if new_missing:
+        reasons.append(f"新链路存在缺失 case ID：{', '.join(new_missing)}")
+    if new_duplicates:
+        reasons.append(f"新链路存在重复 case ID：{', '.join(new_duplicates)}")
     if any(case.get("crash") is True for case in cases):
         reasons.append("新链路存在崩溃样本")
+
+    baseline_by_id: dict[str, Mapping[str, Any]] = {}
+    baseline_missing: list[str] = []
+    baseline_duplicates: list[str] = []
+    if baseline_cases is None:
+        reasons.append("缺少 baseline 结果")
+    else:
+        baseline_by_id, baseline_missing, baseline_duplicates = _case_id_index(baseline_cases, label="baseline")
+        if baseline_missing:
+            reasons.append(f"baseline 存在缺失 case ID：{', '.join(baseline_missing)}")
+        if baseline_duplicates:
+            reasons.append(f"baseline 存在重复 case ID：{', '.join(baseline_duplicates)}")
+
+    new_ids = set(new_by_id)
+    baseline_ids = set(baseline_by_id)
+    if baseline_cases is None:
+        shared_ids: list[str] = []
+    else:
+        missing_from_baseline = sorted(new_ids - baseline_ids)
+        missing_from_new = sorted(baseline_ids - new_ids)
+        if missing_from_baseline:
+            reasons.append(f"baseline 缺少新链路可靠 case ID：{', '.join(missing_from_baseline)}")
+        if missing_from_new:
+            reasons.append(f"新链路缺少 baseline 可靠 case ID：{', '.join(missing_from_new)}")
+        # Keep the new report's registry order in diagnostics; the set below
+        # is only used for membership, so IDs such as case-10 do not sort
+        # before case-2 merely because they are strings.
+        shared_ids = [case_id for case_id in new_by_id if case_id in baseline_by_id]
+    reliable = [new_by_id[case_id] for case_id in shared_ids]
+    baseline_reliable = [baseline_by_id[case_id] for case_id in shared_ids]
+    if len(shared_ids) < minimum_cases:
+        reasons.append(f"相同可靠 case ID 只有 {len(shared_ids)}/{minimum_cases} 个")
+
     new_beat = _mean_metric(reliable, "beat_f1", "f1")
     new_downbeat = _mean_metric(reliable, "downbeat_f1", "f1")
     if new_beat is None or new_beat < 0.85:
@@ -327,20 +399,12 @@ def assess_accuracy_claim(
     if new_downbeat is None or new_downbeat < 0.75:
         reasons.append(f"重拍 F1 不足 0.75（当前 {new_downbeat if new_downbeat is not None else '缺失'}）")
 
-    baseline_reliable = [
-        case for case in (baseline_cases or [])
-        if case.get("status") == "evaluated"
-        and case.get("evaluation_policy") == "reference_metrics"
-        and case.get("reference_midi_reliable") is True
-    ]
     baseline_rhythm = _mean_metric(baseline_reliable, "rhythm_error", "mean_rhythm_error_quarter")
     new_rhythm = _mean_metric(reliable, "rhythm_error", "mean_rhythm_error_quarter")
     baseline_pitch = _mean_metric(baseline_reliable, "pitch_f1", "f1")
     new_pitch = _mean_metric(reliable, "pitch_f1", "f1")
     baseline_chord = _mean_metric(baseline_reliable, "chord_retention", "retention")
     new_chord = _mean_metric(reliable, "chord_retention", "retention")
-    if len(baseline_reliable) < minimum_cases:
-        reasons.append(f"可靠的 baseline 结果只有 {len(baseline_reliable)}/{minimum_cases} 个")
     if baseline_rhythm is None or new_rhythm is None:
         reasons.append("新链路或 baseline 缺少可比较的四分音符节奏误差")
     elif baseline_rhythm <= 0:
@@ -361,6 +425,9 @@ def assess_accuracy_claim(
         "minimum_cases": minimum_cases,
         "new_reliable_count": len(reliable),
         "baseline_reliable_count": len(baseline_reliable),
+        "new_reliable_total": len(new_by_id),
+        "baseline_reliable_total": len(baseline_by_id),
+        "shared_case_ids": shared_ids,
         "new_mean_beat_f1": new_beat,
         "new_mean_downbeat_f1": new_downbeat,
         "new_mean_rhythm_error_quarter": new_rhythm,

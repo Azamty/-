@@ -39,6 +39,7 @@ from .jianpu_score.models.demucs import (
 )
 from .jianpu_score.quantize import NoNotesError
 from .jianpu_score.render import (
+    natural_svg_sort_key,
     render_score,  # noqa: F401 - legacy monkeypatch/import surface
 )
 from .jianpu_score.vocal_cleanup import VocalCleanupError, clean_vocal_events
@@ -746,9 +747,18 @@ class V2JobService:
         def family_kind(suffix: str) -> str:
             return f"{family}_{suffix}"
 
-        for service_artifact in sorted(result.artifacts, key=lambda item: item.relative_path):
+        def artifact_sort_key(service_artifact: Any) -> tuple[str, int, int, str]:
+            relative = Path(service_artifact.relative_path)
+            parent = relative.parent.as_posix().casefold()
+            if relative.suffix.casefold() == ".svg":
+                category, page, name = natural_svg_sort_key(relative)
+                return parent, category, page, name
+            return parent, 9, 0, relative.as_posix().casefold()
+
+        for service_artifact in sorted(result.artifacts, key=artifact_sort_key):
             path = service_artifact.path.resolve()
             name = path.name.lower()
+            page: int | None = None
             if name.endswith(".performance.mid"):
                 tag, kind, item_label = "performance-midi", family_kind("performance_midi"), f"{label}性能 MIDI"
             elif name.endswith(".performance.metadata.json"):
@@ -776,6 +786,7 @@ class V2JobService:
                 score_ids.append(f"{prefix}-{tag}")
             elif name.endswith(".svg"):
                 page_number += 1
+                page = page_number
                 tag, kind, item_label = f"score-svg-{page_number}", family_kind("score_svg"), f"{label}第 {page_number} 页"
                 score_ids.append(f"{prefix}-{tag}")
             elif name.endswith(".log"):
@@ -792,6 +803,7 @@ class V2JobService:
                 label=item_label,
                 media_type=self._artifact_media_type(path),
                 stem_id=stem_id,
+                page=page,
             )
             artifacts.append(registered)
         manifest_id = public_id("manifest")

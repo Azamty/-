@@ -67,6 +67,31 @@ def _safe_basename(value: str) -> str:
     return name or "score"
 
 
+_SVG_PAGE_SUFFIX = re.compile(r"(?:^|[-_.])(?:page[-_]?)?(\d+)\.svg$", re.IGNORECASE)
+
+
+def natural_svg_sort_key(path: str | Path) -> tuple[int, int, str]:
+    """Return a stable page-aware key for LilyPond and service SVG names.
+
+    LilyPond emits names such as ``score-1.svg`` and ``score-10.svg``.  A
+    normal lexical sort puts page 10 before page 2, which also corrupts the
+    composed long image and the public page numbers.  Numbered pages sort
+    first by their integer suffix; a single unnumbered SVG is kept after any
+    numbered pages and ``*.long.svg`` is kept after that.
+    """
+
+    name = Path(path).name
+    folded = name.casefold()
+    if folded.endswith(".long.svg"):
+        return (2, 0, folded)
+    match = _SVG_PAGE_SUFFIX.search(folded) if folded.endswith(".svg") else None
+    if match:
+        return (0, int(match.group(1)), folded)
+    if folded.endswith(".svg"):
+        return (1, 0, folded)
+    return (3, 0, folded)
+
+
 def render_score(score: Score, output_dir: str | Path, *, basename: str = "score") -> RenderArtifacts:
     """Render a Score and return only artifacts beneath the requested directory."""
 
@@ -116,7 +141,7 @@ def render_score(score: Score, output_dir: str | Path, *, basename: str = "score
     if lilypond.returncode:
         raise RuntimeError(f"LilyPond failed ({lilypond.returncode}): {lilypond.stderr[-4000:]}")
 
-    svg_paths = sorted(destination.glob(f"{safe_name}*.svg"))
+    svg_paths = sorted(destination.glob(f"{safe_name}*.svg"), key=natural_svg_sort_key)
     midi_candidates = sorted(destination.glob(f"{safe_name}*.mid")) + sorted(destination.glob(f"{safe_name}*.midi"))
     if not svg_paths:
         raise RuntimeError("LilyPond completed without SVG artifacts")

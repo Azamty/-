@@ -88,6 +88,20 @@ def test_beat_grid_time_sec_and_downbeat_metrics_are_read_correctly(tmp_path: Pa
     assert benchmark.beat_f1([0.0, 1.0], [0.0, 1.0])["f1"] == 1.0
 
 
+def test_downbeat_reader_does_not_treat_unmarked_beats_as_downbeats(tmp_path: Path) -> None:
+    beat_grid = tmp_path / "beat_grid.json"
+    beat_grid.write_text(
+        json.dumps({"beat_grid": {"beats": [{"time_sec": 0.0}, {"time_sec": 0.5}, {"time_sec": 1.0}]}}),
+        encoding="utf-8",
+    )
+    assert benchmark._read_time_points(beat_grid) == [0.0, 0.5, 1.0]
+    assert benchmark._read_time_points(beat_grid, downbeats=True) == []
+
+    explicit = tmp_path / "explicit.json"
+    explicit.write_text(json.dumps({"downbeats": [{"time_sec": 0.0}, {"time_sec": 2.0}]}), encoding="utf-8")
+    assert benchmark._read_time_points(explicit, downbeats=True) == [0.0, 2.0]
+
+
 def test_manual_only_reference_never_becomes_accuracy_result(tmp_path: Path) -> None:
     case = {
         "id": "manual",
@@ -127,7 +141,31 @@ def test_accuracy_gate_requires_real_baseline_and_accepts_synthetic_passing_fixt
     gate = benchmark.assess_accuracy_claim(new, baseline)
     assert gate["ready"] is True
     assert abs(float(gate["new_mean_rhythm_error_quarter"]) - 0.1) < 1e-9
+    assert gate["shared_case_ids"] == [f"case-{index}" for index in range(30)]
 
     insufficient = benchmark.assess_accuracy_claim(new[:29], baseline)
     assert insufficient["ready"] is False
     assert "30" in insufficient["reason"]
+
+
+def test_accuracy_gate_rejects_disjoint_case_ids_even_when_each_side_has_thirty() -> None:
+    def case(case_id: int) -> dict[str, object]:
+        return {
+            "id": f"case-{case_id}",
+            "status": "evaluated",
+            "crash": False,
+            "evaluation_policy": "reference_metrics",
+            "reference_midi_reliable": True,
+            "metrics": {
+                "pitch_f1": {"f1": 0.9},
+                "chord_retention": {"retention": 0.9},
+                "rhythm_error": {"mean_rhythm_error_quarter": 0.1},
+                "beat_f1": {"f1": 0.9},
+                "downbeat_f1": {"f1": 0.8},
+            },
+        }
+
+    disjoint = benchmark.assess_accuracy_claim([case(index) for index in range(30)], [case(index) for index in range(30, 60)])
+    assert disjoint["ready"] is False
+    assert disjoint["shared_case_ids"] == []
+    assert "相同可靠 case ID" in disjoint["reason"]

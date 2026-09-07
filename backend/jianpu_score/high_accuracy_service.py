@@ -30,7 +30,7 @@ from .high_accuracy import BEATNET_VERSION, MUSESCORE_VERSION
 from .musescore_import import MusicXMLArtifact, MuseScoreImportError, convert_performance_midi
 from .musicxml_standardize import MusicXMLStandardizationError, standardize_musicxml
 from .performance_midi import build_performance_midi
-from .render import RenderArtifacts, render_score
+from .render import RenderArtifacts, natural_svg_sort_key, render_score
 from .svg_long import merge_svg_pages
 
 
@@ -259,7 +259,15 @@ def _artifact(destination: Path, path: Path, *, artifact_id: str, kind: str) -> 
 
 def _collect_artifacts(destination: Path, *, manifest_path: Path) -> tuple[ServiceArtifact, ...]:
     artifacts: list[ServiceArtifact] = []
-    for path in sorted(item for item in destination.rglob("*") if item.is_file()):
+    def sort_key(path: Path) -> tuple[str, int, int, str]:
+        relative = path.relative_to(destination).as_posix()
+        parent = path.parent.relative_to(destination).as_posix().casefold()
+        if path.suffix.casefold() == ".svg":
+            category, page, name = natural_svg_sort_key(path)
+            return parent, category, page, name
+        return parent, 9, 0, relative.casefold()
+
+    for path in sorted((item for item in destination.rglob("*") if item.is_file()), key=sort_key):
         if path.resolve() == manifest_path.resolve() or path.name.endswith(".tmp"):
             continue
         relative = _relative(path, destination)

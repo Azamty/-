@@ -463,6 +463,59 @@ def test_drum_only_export_stays_midi_only_without_notation_service(monkeypatch: 
     assert any(item["artifact_id"] == "v2-selection-r1-midi" for item in result["artifacts"])
 
 
+def test_v2_high_accuracy_registers_natural_page_numbers(tmp_path: Path) -> None:
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture")
+    output_dir = tmp_path / "jobs" / job_id / "output" / "track"
+    output_dir.mkdir(parents=True)
+    paths = []
+    for page in range(12, 0, -1):
+        path = output_dir / f"piano.score-{page}.svg"
+        path.write_text(
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><text>page {page}</text></svg>',
+            encoding="utf-8",
+        )
+        paths.append(path)
+    manifest = output_dir / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    result = HighAccuracyBuildResult(
+        instrument_id="piano",
+        title="钢琴",
+        variant="instrument-part",
+        program=0,
+        is_drum=False,
+        status="completed",
+        jianpu_status="completed",
+        output_dir=output_dir,
+        manifest_path=manifest,
+        artifacts=tuple(
+            ServiceArtifact(
+                artifact_id=path.name,
+                kind="svg",
+                path=path,
+                relative_path=path.relative_to(output_dir).as_posix(),
+                sha256="fixture",
+                bytes=path.stat().st_size,
+            )
+            for path in paths
+        ),
+        performance_metadata={},
+    )
+
+    registered, score_ids = manager.v2._register_high_accuracy_result(
+        job_id,
+        result,
+        prefix="v2-selection-r1-piano",
+        label="钢琴",
+        stem_id="piano",
+        family="instrument",
+    )
+    pages = [item for item in registered if item["kind"] == "instrument_score_svg"]
+    assert [item["page"] for item in pages] == list(range(1, 13))
+    assert [item["filename"] for item in pages] == [f"piano.score-{page}.svg" for page in range(1, 13)]
+    assert score_ids == [f"v2-selection-r1-piano-score-svg-{page}" for page in range(1, 13)]
+
+
 def test_vocal_generation_persists_raw_cleanup_and_service_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     FakeHighAccuracyService.calls = []
     FakeHighAccuracyService.failures = set()
