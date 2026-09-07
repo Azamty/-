@@ -223,6 +223,7 @@ def test_score_normalizer_preserves_notation_fields_and_more_than_four_voices() 
     assert len(score.voices) == 5
     notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
     assert any(event.dots == 1 and event.duration_tick == 72 for event in notes)
+    assert not any(item["reason"].startswith("explicit_dots_") for item in report["notation_grid_repairs"])
     assert any(event.tuplet_actual == 3 and event.tuplet_normal == 2 and event.duration_tick == 16 for event in notes)
     chord = next(event for event in notes if event.chord_pitches == [67, 71, 74])
     assert chord.midi == 67
@@ -603,6 +604,75 @@ def test_non_exact_48_tpq_duration_is_rejected_explicitly() -> None:
     ]
     with pytest.raises(MusicXMLStandardizationError, match="cannot be represented exactly"):
         standardize_musicxml_payload(payload)
+
+
+def test_score_normalizer_clears_inconsistent_dots_before_bounded_fragment_repair() -> None:
+    payload = _manual_payload()
+    payload.highest_time_quarter = 24
+    payload.parts[0].highest_time_quarter = 24
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="logical-start",
+            kind="note",
+            offset_quarter=21,
+            duration_quarter=1,
+            pitches=[72],
+            tie="start",
+            tie_types=["start"],
+        ),
+        WorkerEvent(
+            event_id="rounded-dotted-fragment",
+            kind="note",
+            offset_quarter=22,
+            duration_quarter=0.09375,
+            pitches=[72],
+            tie="stop",
+            tie_types=["stop"],
+            dots=1,
+        ),
+        WorkerEvent(
+            event_id="following-fine-fragment",
+            kind="note",
+            offset_quarter=22.09375,
+            duration_quarter=0.03125,
+            pitches=[72],
+        ),
+    ]
+    payload.parts[0].measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=24,
+            end_quarter=24,
+            time_signature="4/4",
+        )
+    ]
+    payload.measures = list(payload.parts[0].measures)
+
+    score, report = standardize_musicxml_payload(payload)
+
+    notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
+    assert [(event.midi, event.start_tick, event.end_tick, event.dots, event.tie) for event in notes] == [
+        (72, 1008, 1059, 0, None),
+        (72, 1059, 1062, 0, None),
+    ]
+    reasons = [item["reason"] for item in report["notation_grid_repairs"]]
+    assert reasons == [
+        "explicit_dots_cleared_after_duration_validation",
+        "fine_grid_tie_fragment_merged_for_jianpu_atom",
+        "fine_grid_note_shifted_to_jianpu_atom",
+    ]
+    dot_repair = report["notation_grid_repairs"][0]
+    assert dot_repair["musicxml_event_id"] == "rounded-dotted-fragment"
+    assert dot_repair["original_dots"] == 1
+    assert dot_repair["repaired_dots"] == 0
+    assert dot_repair["notated_duration_ticks"] == 4
+    assert "explicit dot hints" in " ".join(score.warnings)
+    assert "bounded jianpu atom repairs" in " ".join(score.warnings)
+    for voice in score.voices:
+        _validate_explicit_ties(voice)
+    assert score_to_jianpu(score)
 
 
 def test_finer_binary_musescore_fragment_is_bounded_to_48_tpq_with_alignment_diagnostic() -> None:

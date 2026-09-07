@@ -1223,6 +1223,117 @@ def _event_musicxml_id(event: ScoreNote) -> str | None:
     return str(value) if value is not None else None
 
 
+def _event_notated_duration(event: ScoreNote) -> Fraction:
+    """Return the duration passed to the serializer for one event.
+
+    Explicit tuplets are encoded with their performed duration on the shared
+    score grid, while the jianpu serializer formats the corresponding nominal
+    duration inside the tuplet bracket.  Dot hints must be checked against
+    that nominal duration rather than the performed duration.
+    """
+
+    duration = Fraction(event.duration_tick)
+    actual = event.tuplet_actual
+    normal = event.tuplet_normal
+    if actual is not None and normal is not None:
+        duration *= Fraction(actual, normal)
+    return duration
+
+
+def _matching_dot_counts(event: ScoreNote) -> list[int]:
+    """Return explicit dot counts that exactly describe an event's duration."""
+
+    duration = _event_notated_duration(event)
+    matches: list[int] = []
+    for dots in range(1, 4):
+        for denominator in (1, 2, 4, 8, 16, 32, 64):
+            base = Fraction(SCORE_QUARTER_TICKS * 4, denominator)
+            dotted = base * Fraction(2 ** (dots + 1) - 1, 2**dots)
+            if duration == dotted:
+                matches.append(dots)
+                break
+    return matches
+
+
+def _score_duration_is_serializable(event: ScoreNote) -> bool:
+    """Whether an event can be emitted with no explicit dot hint.
+
+    This mirrors the serializer's exact duration atoms locally so the fine
+    fragment repair can still run after an invalid MusicXML dot is cleared.
+    It intentionally does not alter serializer validation or accept a
+    fractional tuplet nominal duration.
+    """
+
+    duration = _event_notated_duration(event)
+    if duration.denominator != 1 or duration <= 0:
+        return False
+    atoms = {
+        int(Fraction(SCORE_QUARTER_TICKS * 4, denominator) * Fraction(2 ** (dots + 1) - 1, 2**dots))
+        for denominator in (1, 2, 4, 8, 16, 32, 64)
+        for dots in range(4)
+        if (Fraction(SCORE_QUARTER_TICKS * 4, denominator) * Fraction(2 ** (dots + 1) - 1, 2**dots)).denominator == 1
+    }
+    remaining = int(duration)
+    while remaining:
+        atom = max((value for value in atoms if value <= remaining), default=0)
+        if atom <= 0:
+            return False
+        remaining -= atom
+    return True
+
+
+def _repair_explicit_dots(
+    voices: list[ScoreVoice],
+) -> tuple[list[ScoreVoice], list[dict[str, Any]]]:
+    """Validate MusicXML dot hints after conversion to the 48 TPQ score grid.
+
+    MusicXML duration values are rounded before they become ``ScoreNote``
+    events.  A dot attached to a finer renderer fragment can therefore stop
+    describing the final event, even though the source XML carried a legal
+    dot.  Preserve an exact hint, recompute it when another dotted atom fits,
+    and otherwise clear it while retaining the authoritative timing and ties.
+    """
+
+    repairs: list[dict[str, Any]] = []
+    repaired_voices: list[ScoreVoice] = []
+    for voice in voices:
+        events: list[ScoreNote] = []
+        for event in voice.events:
+            if event.dots <= 0:
+                events.append(event)
+                continue
+            matching = _matching_dot_counts(event)
+            if event.dots in matching:
+                events.append(event)
+                continue
+            repaired_dots = matching[0] if matching else 0
+            action = "recomputed" if repaired_dots else "cleared"
+            reason = f"explicit_dots_{action}_after_duration_validation"
+            repair = {
+                "reason": reason,
+                "action": f"{action}_explicit_dots",
+                "voice_id": voice.voice_id,
+                "musicxml_event_id": _event_musicxml_id(event),
+                "start_tick": event.start_tick,
+                "duration_tick": event.duration_tick,
+                "original_dots": event.dots,
+                "repaired_dots": repaired_dots,
+                "notated_duration_ticks": (
+                    int(_event_notated_duration(event))
+                    if _event_notated_duration(event).denominator == 1
+                    else str(_event_notated_duration(event))
+                ),
+                "tuplet_actual": event.tuplet_actual,
+                "tuplet_normal": event.tuplet_normal,
+            }
+            metadata = dict(event.metadata)
+            metadata["notation_grid_repair"] = repair
+            events.append(event.model_copy(update={"dots": repaired_dots, "metadata": metadata}))
+            repairs.append(repair)
+        repaired_voices.append(voice.model_copy(update={"events": events}))
+    return repaired_voices, repairs
+
+
 def _set_tie_after_merge(event: ScoreNote, merged_pitches: set[int]) -> ScoreNote:
     """Close or clear each surviving tie after a terminal fragment is removed.
 
@@ -1270,7 +1381,18 @@ def _repair_fine_score_events(
         index = 0
         while index < len(events):
             current = events[index]
-            if current.duration_tick >= MIN_JIANPU_ATOM_TICKS:
+            # A rounded renderer fragment can be four ticks even though the
+            # source duration was a dotted 3/32-quarter value.  Once its dot
+            # hint is cleared, let the existing bounded tie repair fold it
+            # into the preceding logical note.  Valid atom durations keep the
+            # normal timing and tie path unchanged.
+            dot_repair = current.metadata.get("notation_grid_repair")
+            requires_fragment_repair = (
+                isinstance(dot_repair, Mapping)
+                and str(dot_repair.get("reason", "")).startswith("explicit_dots_")
+                and not _score_duration_is_serializable(current)
+            )
+            if current.duration_tick >= MIN_JIANPU_ATOM_TICKS and not requires_fragment_repair:
                 index += 1
                 continue
 
@@ -1754,11 +1876,13 @@ def standardize_musicxml_payload(
             )
     if not voices:
         raise MusicXMLStandardizationError("MusicXML contained no printable notes, chords, or rests")
-    voices, notation_grid_repairs = _repair_fine_score_events(
+    voices, dot_repairs = _repair_explicit_dots(voices)
+    voices, fine_grid_repairs = _repair_fine_score_events(
         voices,
         alignment,
         total_ticks=total_ticks,
     )
+    notation_grid_repairs = dot_repairs + fine_grid_repairs
 
     measure_metadata: list[dict[str, Any]] = []
     for measure in payload.measures:
@@ -1879,6 +2003,8 @@ def standardize_musicxml_payload(
         warnings.append("MusicXML contained grace events that cannot be represented at positive 48 TPQ duration")
     if any(item.get("reason") == "finer_binary_musicxml_value_quantized_to_48_tpq" for item in diagnostics):
         warnings.append("Finer binary MusicXML fragments were quantized to the nearest 48 TPQ tick within a 0.5 tick bound; inspect alignment_report.json")
+    if any(str(item.get("reason", "")).startswith("explicit_dots_") for item in notation_grid_repairs):
+        warnings.append("MusicXML explicit dot hints did not match the final 48 TPQ duration or tuplet context; hints were cleared or recomputed; inspect alignment_report.json")
     if notation_grid_repairs:
         warnings.append("Finer MusicXML fragments required bounded jianpu atom repairs; inspect alignment_report.json")
     if any(item.get("reason") in {"tie_chain_voice_reassigned", "tie_chain_event_split"} for item in diagnostics):
