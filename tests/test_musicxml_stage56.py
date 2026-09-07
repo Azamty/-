@@ -182,6 +182,68 @@ def test_score_normalizer_restores_same_pitch_overlap_into_another_voice() -> No
     assert any(item["reason"] == "overlapping_events_allocated_to_additional_score_voice" for item in report["repairs"])
 
 
+def test_alignment_keeps_normal_musicxml_adaptive_timing() -> None:
+    payload = _manual_payload()
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="adaptive",
+            kind="note",
+            offset_quarter=0.0625,
+            duration_quarter=0.5,
+            pitches=[60],
+        )
+    ]
+    score, report = standardize_musicxml_payload(
+        payload,
+        performance_metadata={
+            "notes": [{"index": 0, "midi": 60, "start_tick": 0, "end_tick": 240}]
+        },
+    )
+
+    note = next(event for voice in score.voices for event in voice.events if event.midi == 60)
+    alignment = report["source_to_score"][0]
+    assert (note.start_tick, note.duration_tick) == (3, 24)
+    assert alignment["reason"] == "matched_musicxml_event"
+    assert alignment["source_to_score_movement_start_ticks"] == 3
+    assert alignment["source_to_score_movement_end_ticks"] == 3
+    assert alignment["musicxml_to_score_movement_start_ticks"] == 0
+    assert alignment["musicxml_to_score_movement_end_ticks"] == 0
+
+
+@pytest.mark.parametrize("second_start", [1, 3])
+def test_timeline_measure_invariant_rejects_overlap_or_gap(second_start: int) -> None:
+    payload = _manual_payload()
+    payload.measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=2,
+            end_quarter=2,
+            time_signature="4/4",
+        ),
+        WorkerMeasure(
+            part_index=0,
+            number=2,
+            start_quarter=second_start,
+            duration_quarter=4 - second_start,
+            end_quarter=4,
+            time_signature=None,
+        ),
+    ]
+    with pytest.raises(MusicXMLStandardizationError, match="illegal (overlap|gap)"):
+        standardize_musicxml_payload(payload)
+
+
+def test_non_exact_48_tpq_duration_is_rejected_explicitly() -> None:
+    payload = _manual_payload()
+    payload.parts[0].events = [
+        WorkerEvent(event_id="unsupported-tuplet", kind="note", offset_quarter=0, duration_quarter=0.2, pitches=[60])
+    ]
+    with pytest.raises(MusicXMLStandardizationError, match="cannot be represented exactly"):
+        standardize_musicxml_payload(payload)
+
+
 def test_score_normalizer_retains_pickup_and_meter_key_tempo_changes_in_metadata() -> None:
     payload = _manual_payload()
     payload.highest_time_quarter = 6
@@ -227,7 +289,40 @@ def test_score_normalizer_retains_pickup_and_meter_key_tempo_changes_in_metadata
         (0, "D"),
         (96, "G"),
     ]
+    assert score.metadata["key_signature_events"][0]["sharps"] == 2
     assert score.metadata["measure_total_ticks"] == 288
+
+
+def test_production_conductor_metadata_backfills_initial_values_only() -> None:
+    payload = _manual_payload()
+    payload.time_signature_events = [
+        WorkerTimeSignature(offset_quarter=0, ratio="4/4", numerator=4, denominator=4),
+        WorkerTimeSignature(offset_quarter=2, ratio="3/4", numerator=3, denominator=4),
+    ]
+    payload.key_signature_events = [
+        WorkerKeySignature(offset_quarter=0, key="C", sharps=0),
+        WorkerKeySignature(offset_quarter=2, key="G", sharps=1),
+    ]
+    score, report = standardize_musicxml_payload(
+        payload,
+        performance_metadata={
+            "key": "D",
+            "time_signature": "4/4",
+            "tempo_points": [{"tick": 0, "bpm": 96}],
+        },
+    )
+
+    assert score.key == "D"
+    assert [(item["start_tick"], item["key"]) for item in score.metadata["key_signature_events"]] == [
+        (0, "D"),
+        (96, "G"),
+    ]
+    assert [(item["start_tick"], item["time_signature"]) for item in score.metadata["time_signature_events"]] == [
+        (0, "4/4"),
+        (96, "3/4"),
+    ]
+    assert score.bpm == pytest.approx(96)
+    assert any(item["field"] == "key" for item in report["conductor_reconciliation"])
 
 
 def test_musescore_adapter_reports_missing_pinned_executable_without_fallback(tmp_path: Path) -> None:
@@ -251,26 +346,34 @@ def test_drum_performance_is_explicitly_midi_only(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not EXTERNAL_READY, reason="pinned MuseScore and notation environment are unavailable")
 def test_real_musescore_music21_fixture_preserves_triplet_tie_chord_and_staff(tmp_path: Path) -> None:
-    from scripts.high_accuracy_fixture_smoke import _write_fixture_midi
+    from scripts.generate_stage56_fixture import build_production_fixture
 
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    midi_bytes, performance_metadata = build_production_fixture(payload)
     midi = tmp_path / "stage56.performance.mid"
     musicxml = tmp_path / "stage56.musicxml"
     score_json = tmp_path / "stage56.score.json"
     alignment_json = tmp_path / "stage56.alignment.json"
-    _write_fixture_midi(midi, payload)
+    midi.write_bytes(midi_bytes)
     converted = convert_performance_midi(midi, musicxml, instrument_id="stage56")
     assert converted.musicxml_path == musicxml.resolve()
-    score, report = standardize_musicxml(musicxml, title="Stage 56 fixture")
+    score, report = standardize_musicxml(
+        musicxml,
+        performance_metadata=performance_metadata,
+        title="Stage 56 fixture",
+    )
     artifact = write_standardized_score(
         musicxml,
         score_json,
         alignment_report_path=alignment_json,
+        performance_metadata=performance_metadata,
         title="Stage 56 fixture",
     )
 
     assert musicxml.stat().st_size > 200
     assert score.quarter_ticks == 48
+    assert score.bpm == pytest.approx(96.0)
+    assert score.key == "D"
     assert score.time_signature == "6/8"
     assert score.total_ticks == 288
     assert {voice.staff for voice in score.voices} >= {1, 2}
@@ -286,6 +389,8 @@ def test_real_musescore_music21_fixture_preserves_triplet_tie_chord_and_staff(tm
     assert any(event.chord_pitches == [76, 78] for voice in score.voices for event in voice.events)
     assert any(event.tie_types for voice in score.voices for event in voice.events)
     assert report["musicxml_event_count"] >= 18
+    assert report["source_note_count"] == len(payload["notes"])
+    assert any(item["field"] == "key" for item in report["conductor_reconciliation"])
     assert artifact.score.model_dump(mode="json") == json.loads(score_json.read_text(encoding="utf-8"))
     assert json.loads(alignment_json.read_text(encoding="utf-8"))["schema_version"] == "1.0"
     assert score.metadata["measure_total_ticks"] == score.total_ticks
@@ -293,14 +398,17 @@ def test_real_musescore_music21_fixture_preserves_triplet_tie_chord_and_staff(tm
 
 @pytest.mark.skipif(not EXTERNAL_READY, reason="pinned MuseScore and notation environment are unavailable")
 def test_stage56_cli_smoke_writes_independent_outputs(tmp_path: Path) -> None:
-    from scripts.high_accuracy_fixture_smoke import _write_fixture_midi
+    from scripts.generate_stage56_fixture import build_production_fixture
 
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    midi_bytes, performance_metadata = build_production_fixture(payload)
     midi = tmp_path / "cli.performance.mid"
     musicxml = tmp_path / "cli.musicxml"
     score_json = tmp_path / "cli.score.json"
     alignment_json = tmp_path / "cli.alignment.json"
-    _write_fixture_midi(midi, payload)
+    metadata_json = tmp_path / "cli.performance.metadata.json"
+    midi.write_bytes(midi_bytes)
+    metadata_json.write_text(json.dumps(performance_metadata), encoding="utf-8")
     result = subprocess.run(
         [
             sys.executable,
@@ -313,6 +421,8 @@ def test_stage56_cli_smoke_writes_independent_outputs(tmp_path: Path) -> None:
             str(score_json),
             "--alignment-json",
             str(alignment_json),
+            "--performance-metadata",
+            str(metadata_json),
             "--instrument-id",
             "cli-fixture",
         ],
@@ -320,6 +430,7 @@ def test_stage56_cli_smoke_writes_independent_outputs(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         timeout=120,
         check=False,
     )

@@ -239,10 +239,17 @@ def _part_group(part_id: str) -> str:
     return part_id.split(marker, 1)[0] if marker in part_id else part_id
 
 
-def _quarter_to_tick(value: float) -> int:
+def _quarter_to_tick(value: float, *, context: str = "MusicXML quarter value") -> int:
     if not math.isfinite(value):
         raise MusicXMLStandardizationError(f"non-finite MusicXML quarter position: {value!r}")
-    return int(round(value * SCORE_QUARTER_TICKS))
+    scaled = value * SCORE_QUARTER_TICKS
+    rounded = round(scaled)
+    if abs(scaled - rounded) > 1e-7:
+        raise MusicXMLStandardizationError(
+            f"{context} {value!r} cannot be represented exactly at {SCORE_QUARTER_TICKS} TPQ; "
+            "the notation contains a tuplet or duration outside the supported exact grid"
+        )
+    return int(rounded)
 
 
 def _normalize_worker_key(value: str) -> str:
@@ -343,17 +350,67 @@ def _align_source_notes(
     events: list[_RawEvent],
     source_notes: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Align source performance notes and restore MuseScore truncation.
+    """Align source notes without undoing MuseScore's notation decisions.
 
-    A same-pitch overlap can be emitted by MuseScore as two notes in one voice
-    with the first duration shortened.  When source metadata identifies the
-    original span, the normalizer restores that span before lane allocation;
-    the overlap then becomes an additional ScoreVoice with an explicit reason.
+    Normal matches retain the MusicXML start/end selected by MuseScore.  The
+    only span restoration is the observed same-pitch-overlap case where an
+    XML note ends at the next overlapping source onset, or where such a source
+    note is absent altogether.  Every report movement is ``final Score tick -
+    source performance tick``; the separate MusicXML movement fields make the
+    importer change auditable as well.
     """
 
     report: list[dict[str, Any]] = []
     used: set[tuple[str, int]] = set()
+    overlap_indices: set[int] = set()
+    for left_index, left in enumerate(source_notes):
+        for right_index, right in enumerate(source_notes):
+            if left_index == right_index or left["midi"] != right["midi"]:
+                continue
+            if left["start_tick"] < right["start_tick"] < left["end_tick"]:
+                overlap_indices.add(int(left["source_index"]))
+                overlap_indices.add(int(right["source_index"]))
+
+    def tie_at(event: _RawEvent, pitch_index: int) -> str | None:
+        if pitch_index < len(event.tie_types):
+            return event.tie_types[pitch_index]
+        return event.tie
+
+    def extend_tie_chain(event: _RawEvent, pitch_index: int) -> tuple[list[tuple[_RawEvent, int]], int]:
+        chain: list[tuple[_RawEvent, int]] = [(event, pitch_index)]
+        current = event
+        current_pitch_index = pitch_index
+        while tie_at(current, current_pitch_index) in {"start", "continue"}:
+            candidates: list[tuple[_RawEvent, int]] = []
+            for candidate in events:
+                if candidate.part_group != current.part_group or candidate.staff != current.staff or candidate.voice != current.voice:
+                    continue
+                if candidate.start_tick != current.end_tick:
+                    continue
+                for candidate_pitch_index, pitch in enumerate(candidate.pitches):
+                    if pitch != event.pitches[pitch_index] or (candidate.event_id, candidate_pitch_index) in used:
+                        continue
+                    if tie_at(candidate, candidate_pitch_index) in {"stop", "continue"}:
+                        candidates.append((candidate, candidate_pitch_index))
+            if not candidates:
+                break
+            next_event, next_pitch_index = min(candidates, key=lambda value: (value[0].end_tick, value[0].event_id, value[1]))
+            used.add((next_event.event_id, next_pitch_index))
+            chain.append((next_event, next_pitch_index))
+            current = next_event
+            current_pitch_index = next_pitch_index
+        return chain, chain[-1][0].end_tick
+
     for source in source_notes:
+        source_index = int(source["source_index"])
+        source_overlaps = source_index in overlap_indices
+        overlap_starts = [
+            other["start_tick"]
+            for other in source_notes
+            if other["midi"] == source["midi"]
+            and other["start_tick"] > source["start_tick"]
+            and other["start_tick"] < source["end_tick"]
+        ]
         candidates: list[tuple[float, _RawEvent, int]] = []
         for event in events:
             for pitch_index, pitch in enumerate(event.pitches):
@@ -367,35 +424,69 @@ def _align_source_notes(
             used.add((event.event_id, pitch_index))
             original_start = event.start_tick
             original_end = event.end_tick
+            tie_chain, alignment_end = extend_tie_chain(event, pitch_index)
+            original_chain_end = tie_chain[-1][0].end_tick
             reason = "matched_musicxml_event"
-            if len(event.pitches) == 1:
-                if event.start_tick != source["start_tick"]:
-                    event.start_tick = source["start_tick"]
-                if event.end_tick != source["end_tick"]:
-                    if event.end_tick < source["end_tick"]:
-                        reason = "musescore_truncated_source_span_restored"
-                    else:
-                        reason = "musescore_duration_changed_source_span_recorded"
-                    event.end_tick = max(event.start_tick + 1, source["end_tick"])
+            # A regular adaptive-quantized match is deliberately untouched.
+            # Restore only a single-pitch event cut off at the next overlapping
+            # source onset; this is the exact failure observed in the phase 4
+            # same-pitch probe.
+            if (
+                source_overlaps
+                and all(len(item[0].pitches) == 1 for item in tie_chain)
+                and alignment_end < source["end_tick"]
+                and any(alignment_end <= start for start in overlap_starts)
+            ):
+                tie_chain[-1][0].end_tick = max(tie_chain[-1][0].start_tick + 1, source["end_tick"])
+                alignment_end = tie_chain[-1][0].end_tick
+                reason = "musescore_truncated_source_span_restored"
+            elif len(tie_chain) > 1:
+                reason = "matched_musicxml_tie_chain"
             report.append(
                 {
-                    "source_index": source["source_index"],
+                    "source_index": source_index,
                     "source_midi": source["midi"],
                     "source_start_tick_480": source["start_tick_480"],
                     "source_end_tick_480": source["end_tick_480"],
+                    "source_start_tick": source["start_tick"],
+                    "source_end_tick": source["end_tick"],
                     "musicxml_event_id": event.event_id,
+                    "musicxml_event_ids": [item[0].event_id for item in tie_chain],
                     "musicxml_start_tick": original_start,
                     "musicxml_end_tick": original_end,
+                    "musicxml_chain_end_tick": original_chain_end,
                     "score_start_tick": event.start_tick,
-                    "score_end_tick": event.end_tick,
-                    "movement_start_ticks": event.start_tick - original_start,
-                    "movement_end_ticks": event.end_tick - original_end,
+                    "score_end_tick": alignment_end,
+                    "source_to_score_movement_start_ticks": event.start_tick - source["start_tick"],
+                    "source_to_score_movement_end_ticks": alignment_end - source["end_tick"],
+                    "musicxml_to_score_movement_start_ticks": event.start_tick - original_start,
+                    "musicxml_to_score_movement_end_ticks": alignment_end - original_chain_end,
                     "reason": reason,
                 }
             )
         else:
+            if not source_overlaps:
+                report.append(
+                    {
+                        "source_index": source_index,
+                        "source_midi": source["midi"],
+                        "source_start_tick_480": source["start_tick_480"],
+                        "source_end_tick_480": source["end_tick_480"],
+                        "source_start_tick": source["start_tick"],
+                        "source_end_tick": source["end_tick"],
+                        "musicxml_event_id": None,
+                        "score_start_tick": None,
+                        "score_end_tick": None,
+                        "source_to_score_movement_start_ticks": None,
+                        "source_to_score_movement_end_ticks": None,
+                        "musicxml_to_score_movement_start_ticks": None,
+                        "musicxml_to_score_movement_end_ticks": None,
+                        "reason": "missing_from_musicxml_not_restored",
+                    }
+                )
+                continue
             restored = _RawEvent(
-                event_id=f"restored-source-{source['source_index']}",
+                event_id=f"restored-source-{source_index}",
                 part_group="restored-source",
                 part_id="restored-source",
                 staff=1,
@@ -415,15 +506,19 @@ def _align_source_notes(
             events.append(restored)
             report.append(
                 {
-                    "source_index": source["source_index"],
+                    "source_index": source_index,
                     "source_midi": source["midi"],
                     "source_start_tick_480": source["start_tick_480"],
                     "source_end_tick_480": source["end_tick_480"],
+                    "source_start_tick": source["start_tick"],
+                    "source_end_tick": source["end_tick"],
                     "musicxml_event_id": None,
                     "score_start_tick": restored.start_tick,
                     "score_end_tick": restored.end_tick,
-                    "movement_start_ticks": 0,
-                    "movement_end_ticks": 0,
+                    "source_to_score_movement_start_ticks": 0,
+                    "source_to_score_movement_end_ticks": 0,
+                    "musicxml_to_score_movement_start_ticks": None,
+                    "musicxml_to_score_movement_end_ticks": None,
                     "reason": "missing_from_musicxml_restored_from_performance_metadata",
                 }
             )
@@ -538,6 +633,233 @@ def _dedupe_events(values: Iterable[Mapping[str, Any]], key: tuple[str, ...]) ->
     return result
 
 
+def _validate_timeline_measures(measures: list[dict[str, Any]], total_ticks: int) -> None:
+    if not measures:
+        raise MusicXMLStandardizationError("MusicXML contained no measure timeline")
+    ordered = sorted(measures, key=lambda value: (value["start_tick"], value["end_tick"]))
+    previous_end = 0
+    for index, measure in enumerate(ordered):
+        start = int(measure["start_tick"])
+        duration = int(measure["duration_tick"])
+        end = int(measure["end_tick"])
+        if duration <= 0 or end <= start or end != start + duration:
+            raise MusicXMLStandardizationError(
+                f"invalid timeline measure {index}: start={start}, duration={duration}, end={end}"
+            )
+        if index == 0 and start != 0:
+            raise MusicXMLStandardizationError(f"measure timeline starts at {start}, expected score tick 0")
+        if index and start != previous_end:
+            relation = "overlap" if start < previous_end else "gap"
+            raise MusicXMLStandardizationError(
+                f"measure timeline has an illegal {relation} between ticks {previous_end} and {start}"
+            )
+        previous_end = end
+    if previous_end != total_ticks:
+        raise MusicXMLStandardizationError(
+            f"measure timeline ends at {previous_end}, expected Score total_ticks {total_ticks}"
+        )
+
+
+def _source_tempo_records(performance_metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if not performance_metadata:
+        return []
+    points = performance_metadata.get("tempo_points", [])
+    result: list[dict[str, Any]] = []
+    if isinstance(points, list):
+        for point in points:
+            if not isinstance(point, Mapping):
+                continue
+            try:
+                tick = int(point["tick"])
+                bpm = float(point["bpm"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if tick < 0 or not math.isfinite(bpm) or bpm <= 0:
+                continue
+            result.append({"offset_quarter": tick / PERFORMANCE_QUARTER_TICKS, "bpm": bpm})
+    if not result:
+        try:
+            bpm = float(performance_metadata["bpm"])
+        except (KeyError, TypeError, ValueError):
+            bpm = 0.0
+        if math.isfinite(bpm) and bpm > 0:
+            result.append({"offset_quarter": 0.0, "bpm": bpm})
+    return _dedupe_events(sorted(result, key=lambda value: value["offset_quarter"]), ("offset_quarter",))
+
+
+def _source_key_signature(performance_metadata: Mapping[str, Any] | None) -> str | None:
+    if not performance_metadata or not isinstance(performance_metadata.get("key"), str):
+        return None
+    return _normalize_worker_key(str(performance_metadata["key"]))
+
+
+def _key_sharps(value: str) -> int:
+    return {
+        "C": 0,
+        "G": 1,
+        "D": 2,
+        "A": 3,
+        "E": 4,
+        "B": 5,
+        "F#": 6,
+        "C#": 7,
+        "F": -1,
+        "Bb": -2,
+        "Eb": -3,
+        "Ab": -4,
+        "Db": -5,
+        "Gb": -6,
+        "Cb": -7,
+    }.get(value.removesuffix("m"), 0)
+
+
+def _source_time_signature(performance_metadata: Mapping[str, Any] | None) -> tuple[str, int, int] | None:
+    if not performance_metadata or not isinstance(performance_metadata.get("time_signature"), str):
+        return None
+    ratio = _normalize_worker_meter(str(performance_metadata["time_signature"]))
+    numerator, denominator = (int(value) for value in ratio.split("/", 1))
+    return ratio, numerator, denominator
+
+
+def _reconcile_conductor_metadata(
+    payload: WorkerPayload,
+    performance_metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge production conductor metadata without replacing later XML changes."""
+
+    xml_tempo = _dedupe_events(
+        (
+            {"offset_quarter": item.offset_quarter, "bpm": item.bpm}
+            for item in payload.tempo_events
+        ),
+        ("offset_quarter",),
+    )
+    xml_tempo = sorted(xml_tempo, key=lambda value: float(value["offset_quarter"]))
+    source_tempo = _source_tempo_records(performance_metadata)
+    tempo_values = list(xml_tempo)
+    reconciliation: list[dict[str, Any]] = []
+    for source in source_tempo:
+        offset = float(source["offset_quarter"])
+        matching = next(
+            (item for item in tempo_values if abs(float(item["offset_quarter"]) - offset) <= 1e-9),
+            None,
+        )
+        if matching is None:
+            tempo_values.append(dict(source))
+            reconciliation.append(
+                {
+                    "field": "tempo",
+                    "offset_quarter": offset,
+                    "musicxml_value": None,
+                    "production_value": source["bpm"],
+                    "final_value": source["bpm"],
+                    "reason": "production_metadata_backfilled_missing_tempo",
+                }
+            )
+        elif offset == 0.0 and abs(float(matching["bpm"]) - float(source["bpm"])) > 0.01:
+            tempo_values = [item for item in tempo_values if abs(float(item["offset_quarter"])) > 1e-9]
+            tempo_values.append(dict(source))
+            reconciliation.append(
+                {
+                    "field": "tempo",
+                    "offset_quarter": offset,
+                    "musicxml_value": matching["bpm"],
+                    "production_value": source["bpm"],
+                    "final_value": source["bpm"],
+                    "reason": "production_metadata_replaced_changed_initial_tempo",
+                }
+            )
+    if not tempo_values:
+        tempo_values = [{"offset_quarter": 0.0, "bpm": 120.0}]
+    tempo_values = sorted(tempo_values, key=lambda value: float(value["offset_quarter"]))
+
+    xml_time = _dedupe_events(
+        (
+            {
+                "offset_quarter": item.offset_quarter,
+                "ratio": item.ratio,
+                "numerator": item.numerator,
+                "denominator": item.denominator,
+            }
+            for item in payload.time_signature_events
+        ),
+        ("offset_quarter", "ratio"),
+    )
+    source_time = _source_time_signature(performance_metadata)
+    time_events = list(xml_time)
+    if source_time is not None:
+        ratio, numerator, denominator = source_time
+        xml_initial = next((item for item in time_events if abs(float(item["offset_quarter"])) <= 1e-9), None)
+        if xml_initial is None or xml_initial["ratio"] != ratio:
+            if xml_initial is not None:
+                time_events = [item for item in time_events if abs(float(item["offset_quarter"])) > 1e-9]
+            time_events.append(
+                {
+                    "offset_quarter": 0.0,
+                    "ratio": ratio,
+                    "numerator": numerator,
+                    "denominator": denominator,
+                }
+            )
+            reconciliation.append(
+                {
+                    "field": "time_signature",
+                    "offset_quarter": 0.0,
+                    "musicxml_value": xml_initial["ratio"] if xml_initial else None,
+                    "production_value": ratio,
+                    "final_value": ratio,
+                    "reason": "production_metadata_backfilled_changed_initial_time_signature",
+                }
+            )
+    time_events = sorted(time_events, key=lambda value: float(value["offset_quarter"]))
+    if not time_events:
+        time_events = [{"offset_quarter": 0.0, "ratio": "4/4", "numerator": 4, "denominator": 4}]
+
+    xml_key = _dedupe_events(
+        (
+            {"offset_quarter": item.offset_quarter, "key": item.key, "sharps": item.sharps}
+            for item in payload.key_signature_events
+        ),
+        ("offset_quarter", "key"),
+    )
+    source_key = _source_key_signature(performance_metadata)
+    key_events = list(xml_key)
+    if source_key is not None:
+        xml_initial = next((item for item in key_events if abs(float(item["offset_quarter"])) <= 1e-9), None)
+        if xml_initial is None or _normalize_worker_key(str(xml_initial["key"])) != source_key:
+            if xml_initial is not None:
+                key_events = [item for item in key_events if abs(float(item["offset_quarter"])) > 1e-9]
+            key_events.append(
+                {
+                    "offset_quarter": 0.0,
+                    "key": source_key,
+                    "sharps": int(performance_metadata.get("key_sharps", _key_sharps(source_key))) if performance_metadata else _key_sharps(source_key),
+                }
+            )
+            reconciliation.append(
+                {
+                    "field": "key",
+                    "offset_quarter": 0.0,
+                    "musicxml_value": xml_initial["key"] if xml_initial else None,
+                    "production_value": source_key,
+                    "final_value": source_key,
+                    "reason": "production_metadata_backfilled_changed_initial_key",
+                }
+            )
+    key_events = sorted(key_events, key=lambda value: float(value["offset_quarter"]))
+    if not key_events:
+        key_events = [{"offset_quarter": 0.0, "key": "C", "sharps": 0}]
+
+    return {
+        "tempo_values": tempo_values,
+        "time_events": time_events,
+        "key_events": key_events,
+        "key": _normalize_worker_key(str(key_events[0]["key"])),
+        "time_signature": _normalize_worker_meter(str(time_events[0]["ratio"])),
+        "reconciliation": reconciliation,
+    }
+
+
 def standardize_musicxml_payload(
     payload: WorkerPayload,
     *,
@@ -546,21 +868,10 @@ def standardize_musicxml_payload(
 ) -> tuple[Score, dict[str, Any]]:
     """Convert validated worker data to a 48 TPQ Score and alignment report."""
 
-    if not payload.time_signature_events:
-        time_signature = "4/4"
-    else:
-        time_signature = _normalize_worker_meter(payload.time_signature_events[0].ratio)
-    if payload.key_signature_events:
-        key = _normalize_worker_key(payload.key_signature_events[0].key)
-    else:
-        key = "C"
-    tempo_values = _dedupe_events(
-        ({"offset_quarter": item.offset_quarter, "bpm": item.bpm} for item in payload.tempo_events),
-        ("offset_quarter",),
-    )
-    tempo_values = sorted(tempo_values, key=lambda value: float(value["offset_quarter"]))
-    if not tempo_values:
-        tempo_values = [{"offset_quarter": 0.0, "bpm": 120.0}]
+    conductor = _reconcile_conductor_metadata(payload, performance_metadata)
+    key = conductor["key"]
+    time_signature = conductor["time_signature"]
+    tempo_values = conductor["tempo_values"]
     tempo_events = [
         TempoEvent(start_tick=max(0, _quarter_to_tick(float(item["offset_quarter"]))), bpm=float(item["bpm"]))
         for item in tempo_values
@@ -643,8 +954,9 @@ def standardize_musicxml_payload(
             }
             for item in measure_metadata
         ),
-        ("start_tick", "duration_tick", "end_tick", "time_signature", "is_pickup"),
+        ("start_tick", "duration_tick", "end_tick", "is_pickup"),
     )
+    _validate_timeline_measures(timeline_measures, total_ticks)
     time_signature_events = [
         {
             "start_tick": _quarter_to_tick(item["offset_quarter"]),
@@ -652,25 +964,11 @@ def standardize_musicxml_payload(
             "numerator": item["numerator"],
             "denominator": item["denominator"],
         }
-        for item in _dedupe_events(
-            (
-                {
-                    "offset_quarter": item.offset_quarter,
-                    "ratio": item.ratio,
-                    "numerator": item.numerator,
-                    "denominator": item.denominator,
-                }
-                for item in payload.time_signature_events
-            ),
-            ("offset_quarter", "ratio"),
-        )
+        for item in conductor["time_events"]
     ]
     key_signature_events = [
         {"start_tick": _quarter_to_tick(item["offset_quarter"]), "key": _normalize_worker_key(item["key"]), "sharps": item["sharps"]}
-        for item in _dedupe_events(
-            ({"offset_quarter": item.offset_quarter, "key": item.key, "sharps": item.sharps} for item in payload.key_signature_events),
-            ("offset_quarter", "key"),
-        )
+        for item in conductor["key_events"]
     ]
     report: dict[str, Any] = {
         "schema_version": "1.0",
@@ -681,14 +979,17 @@ def standardize_musicxml_payload(
         "score_voice_count": len(voices),
         "source_to_score": alignment,
         "repairs": diagnostics + lane_reasons,
-        "source_note_policy": "performance_metadata_restores_truncated_or_missing_spans_when supplied",
+        "source_note_policy": "performance metadata restores only proven same-pitch overlap truncation or omission when supplied",
+        "alignment_tick_semantics": "source_to_score_movement_* = final Score tick - source performance tick; musicxml_to_score_movement_* = final Score tick - MusicXML tick",
+        "score_grid_precision_policy": "48 TPQ accepts exact 1/32, dotted, and supported triplet values; other fractional values are rejected explicitly",
+        "conductor_reconciliation": conductor["reconciliation"],
     }
     warnings: list[str] = []
     if diagnostics:
         warnings.append("MusicXML contained grace events that cannot be represented at positive 48 TPQ duration")
     if lane_reasons:
         warnings.append("Overlapping MusicXML events were preserved in additional ScoreVoice lanes")
-    if any(item.get("reason") != "matched_musicxml_event" for item in alignment):
+    if any(item.get("reason") not in {"matched_musicxml_event", "matched_musicxml_tie_chain"} for item in alignment):
         warnings.append("Source performance alignment changed or restored note spans; inspect alignment_report.json")
     metadata: dict[str, Any] = {
         "notation_engine": "musescore-midi-import",
@@ -697,6 +998,7 @@ def standardize_musicxml_payload(
         "music21_version": payload.music21_version,
         "musicxml_worker_schema_version": payload.schema_version,
         "score_ticks_per_quarter": SCORE_QUARTER_TICKS,
+        "score_grid_precision_policy": "exact 48 TPQ; unsupported fractional MusicXML durations are rejected",
         "source_musicxml": payload.source_path,
         "parts": [
             {
@@ -714,6 +1016,7 @@ def standardize_musicxml_payload(
         "measure_duration_total_ticks": sum(item["duration_tick"] for item in timeline_measures),
         "time_signature_events": time_signature_events,
         "key_signature_events": key_signature_events,
+        "conductor_reconciliation": conductor["reconciliation"],
         "pickup": {
             "is_pickup": payload.pickup.is_pickup,
             "duration_tick": _quarter_to_tick(payload.pickup.duration_quarter),
