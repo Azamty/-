@@ -29,7 +29,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_OUTPUT = ROOT / ".cache" / "high-accuracy-benchmarks" / "runs"
 RUNNER_SCHEMA_VERSION = "1.1"
-PRODUCTION_RECOGNIZER_VERSION = "1.0"
+PRODUCTION_RECOGNIZER_VERSION = "1.1"
+MUSCRIPTOR_BENCHMARK_SEED = 20260907
 
 Adapter = Callable[[Mapping[str, Any], Mapping[str, Any], Path], Mapping[str, Any]]
 
@@ -315,6 +316,8 @@ class ProductionRecognizer:
             "version": PRODUCTION_RECOGNIZER_VERSION,
             "demucs_model": self.demucs_model or "htdemucs",
             "beat_route": "original_mix_once",
+            "muscriptor_decode": "greedy_float32_deterministic",
+            "muscriptor_seed": MUSCRIPTOR_BENCHMARK_SEED,
         }
 
     def __init__(self, *, timeout_sec: float = 1800.0, demucs_model: str | None = None) -> None:

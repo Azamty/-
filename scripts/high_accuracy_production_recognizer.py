@@ -29,6 +29,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 MUSCRIPTOR_PYTHON = ROOT / ".venv-model-muscriptor" / "Scripts" / "python.exe"
 MUSCRIPTOR_SCRIPT = ROOT / "scripts" / "run_muscriptor_job.py"
+MUSCRIPTOR_BENCHMARK_SEED = 20260907
+PRODUCTION_RECOGNIZER_VERSION = "1.1"
 if os.fspath(ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(ROOT))
 
@@ -66,6 +68,8 @@ def _run_muscriptor(audio: Path, destination: Path) -> tuple[list[dict[str, Any]
         os.fspath(model_root),
         "--progress",
         os.fspath(progress),
+        "--seed",
+        str(MUSCRIPTOR_BENCHMARK_SEED),
     ]
     model = _cached_muscriptor_model()
     if model is not None:
@@ -119,12 +123,19 @@ def _run_muscriptor(audio: Path, destination: Path) -> tuple[list[dict[str, Any]
         )
     if not notes:
         raise RuntimeError("MuScriptor returned no note events")
+    reproducibility = None
+    metadata = recognition.get("metadata")
+    if isinstance(metadata, Mapping):
+        value = metadata.get("reproducibility")
+        if isinstance(value, Mapping):
+            reproducibility = dict(value)
     return notes, {
         "engine": "muscriptor",
         "model": recognition.get("model", "medium"),
         "worker": os.fspath(MUSCRIPTOR_SCRIPT),
         "recognition_relative": recognition_path.relative_to(destination).as_posix(),
         "route_input": "original_mix",
+        "reproducibility": reproducibility,
     }
 
 
@@ -244,7 +255,7 @@ def recognize(
     }
     payload: dict[str, Any] = {
         "schema_version": "1.0",
-        "recognizer_version": "1.0",
+        "recognizer_version": PRODUCTION_RECOGNIZER_VERSION,
         "source": "production_audio_model",
         "model_output": True,
         "source_kind": source_kind,

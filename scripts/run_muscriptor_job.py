@@ -12,6 +12,7 @@ from collections import Counter
 import json
 import os
 from pathlib import Path
+import random
 import sys
 import tempfile
 from typing import Any
@@ -20,6 +21,40 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 if os.fspath(ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(ROOT))
+DEFAULT_BENCHMARK_SEED = 20260907
+
+
+def _configure_reproducibility(seed: int) -> dict[str, Any]:
+    """Make the greedy model route repeatable across benchmark invocations."""
+
+    random.seed(seed)
+    try:
+        import numpy as np
+    except ImportError:
+        numpy_available = False
+    else:
+        np.random.seed(seed)
+        numpy_available = True
+    import torch
+
+    torch.manual_seed(seed)
+    cuda_available = bool(torch.cuda.is_available())
+    if cuda_available:
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    return {
+        "seed": seed,
+        "decoder": "greedy",
+        "sampling": False,
+        "numpy_seeded": numpy_available,
+        "torch_deterministic_algorithms": True,
+        "cuda_deterministic_flags": cuda_available,
+        "autocast": "disabled_float32",
+    }
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -118,6 +153,7 @@ def main() -> int:
     parser.add_argument("--progress", type=Path, required=True)
     parser.add_argument("--model", default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=DEFAULT_BENCHMARK_SEED)
     args = parser.parse_args()
     if not args.audio.is_file():
         raise SystemExit(f"audio file not found: {args.audio}")
@@ -130,7 +166,12 @@ def main() -> int:
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("MuScriptor CUDA is unavailable")
+    reproducibility = _configure_reproducibility(args.seed)
     model = TranscriptionModel.load_model(args.model or _local_model_path(), device=args.device)
+    # The package enables fp16 autocast on CUDA even when the checkpoint is
+    # loaded as float32.  Disabling that private context avoids marginal CUDA
+    # reduction differences changing a greedy token at a tied logit boundary.
+    model._model.autocast.enabled = False
     raw_events: list[Any] = []
     last_progress = {"completed": 0, "total": 0}
     for event in model.transcribe(args.audio, instruments=None, prelude_forcing=True):
@@ -161,6 +202,7 @@ def main() -> int:
             "velocity_policy": "playback_default",
             "note_event_velocity": None,
             "time_basis": "source_seconds",
+            "reproducibility": reproducibility,
         },
     }
     _write_json(args.output / "recognition.json", recognition)
