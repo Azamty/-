@@ -2,22 +2,34 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from datetime import datetime, timezone
 import json
 import math
 import os
-from pathlib import Path
 import re
 import uuid
-from typing import Any, Mapping, Sequence
 import zipfile
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from .jianpu_score.analysis import analyze_audio, load_audio, probe_audio
 from .jianpu_score.beat_grid import beat_grid_onsets_from_notes
-from .jianpu_score.domain import MusicAnalysis, NoteEvent, normalize_key, normalize_time_signature
+from .jianpu_score.domain import (
+    MusicAnalysis,
+    NoteEvent,
+    normalize_key,
+    normalize_time_signature,
+)
+from .jianpu_score.high_accuracy import BEATNET_VERSION, MUSESCORE_VERSION
+from .jianpu_score.high_accuracy_service import (
+    HighAccuracyArtifactService,
+    HighAccuracyBuildResult,
+    HighAccuracyServiceError,
+)
 from .jianpu_score.models.adapter import EngineResult, run_engine
 from .jianpu_score.models.demucs import (
     DEFAULT_DEMUCS_MODEL,
@@ -25,20 +37,28 @@ from .jianpu_score.models.demucs import (
     normalize_demucs_model,
     separate_htdemucs,
 )
-from .jianpu_score.quantize import NoNotesError, quantize_events
-from .jianpu_score.render import render_score, write_score_json
-from .jianpu_score.svg_long import merge_svg_pages
+from .jianpu_score.quantize import NoNotesError
+from .jianpu_score.render import (
+    render_score,  # noqa: F401 - legacy monkeypatch/import surface
+)
+from .jianpu_score.vocal_cleanup import VocalCleanupError, clean_vocal_events
 from .muscriptor_v2 import (
     instrument_label_zh,
     stable_track_id,
     write_unquantized_midi,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_PYTHON = ROOT / ".venv-model-muscriptor" / "Scripts" / "python.exe"
 V2_SOURCE_KINDS = frozenset({"instrumental", "vocal"})
 V2_SOURCE_LABELS = {"instrumental": "伴奏/纯音乐", "vocal": "人声"}
+HIGH_ACCURACY_V2_METADATA = {
+    "notation_engine": "musescore-midi-import",
+    "beat_engine": "beatnet",
+    "beatnet_version": BEATNET_VERSION,
+    "musescore_version": MUSESCORE_VERSION,
+    "score_ticks_per_quarter": 48,
+}
 
 
 def _analysis_suggestion(analysis: MusicAnalysis) -> dict[str, Any]:
@@ -176,6 +196,7 @@ class V2JobService:
                 "selection": None,
                 "selection_history": [],
                 "score_refusal": None,
+                **deepcopy(HIGH_ACCURACY_V2_METADATA),
             },
         }
         self.manager._write(state)
@@ -310,6 +331,13 @@ class V2JobService:
                 "bpm_override": bpm,
                 "key_override": key,
                 "time_signature_override": time_signature,
+                # Keep the effective values above for API compatibility, but
+                # persist whether the user actually supplied each override.
+                # The high-accuracy pipeline uses these flags to preserve the
+                # detected BeatNet source when a value was left untouched.
+                "bpm_override_explicit": bpm_override is not None,
+                "key_override_explicit": key_override is not None,
+                "time_signature_override_explicit": time_signature_override is not None,
                 "created_at": _utc_now(),
             }
             v2 = dict(state.get("v2", {}))
@@ -355,6 +383,11 @@ class V2JobService:
             "selection_revision": v2.get("selection_revision", 0),
             "selection": deepcopy(v2.get("selection")),
             "score_refusal": deepcopy(v2.get("score_refusal")),
+            "metadata": {
+                key: v2.get(key)
+                for key in HIGH_ACCURACY_V2_METADATA
+                if v2.get(key) is not None
+            },
         }
 
     def run(self, job_id: str) -> None:
@@ -499,6 +532,7 @@ class V2JobService:
             v2 = dict(state.get("v2", {}))
             v2.update(
                 {
+                    **HIGH_ACCURACY_V2_METADATA,
                     "stage": "selection_ready",
                     "tracks": tracks,
                     "notes": notes,
@@ -529,6 +563,7 @@ class V2JobService:
                     "artifacts": artifacts,
                     "progress": 1.0,
                     "summary": {
+                        **HIGH_ACCURACY_V2_METADATA,
                         "source_kind": "instrumental",
                         "route": {"engine": "muscriptor", "use_demucs": False},
                         "note_count": len(notes),
@@ -608,6 +643,227 @@ class V2JobService:
             return MusicAnalysis.model_validate(value)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError("人声原音分析结果无效，请重新分离") from exc
+
+    @staticmethod
+    def _analysis_has_beatnet(analysis: MusicAnalysis | None) -> bool:
+        if analysis is None:
+            return False
+        metadata = analysis.metadata
+        grid = metadata.get("beat_grid")
+        return bool(
+            metadata.get("beat_engine") == "beatnet"
+            and metadata.get("beatnet_version") == BEATNET_VERSION
+            and isinstance(grid, Mapping)
+            and grid.get("beats")
+            and len(analysis.beat_times) >= 2
+        )
+
+    @staticmethod
+    def _event_payload(events: Sequence[NoteEvent], **extra: Any) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0",
+            **extra,
+            "event_count": len(events),
+            "events": [event.model_dump(mode="json") for event in events],
+        }
+
+    def _register_high_accuracy_result(
+        self,
+        job_id: str,
+        result: HighAccuracyBuildResult,
+        *,
+        prefix: str,
+        label: str,
+        stem_id: str,
+        family: str,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Register every service file with stable V2 IDs.
+
+        The service manifest is intentionally registered separately because it
+        cannot include its own hash without becoming self-referential.
+        ``family`` controls the public artifact kinds while the service keeps
+        its own generic manifest kinds.
+        """
+
+        if family not in {"vocal", "instrument", "main_melody"}:
+            raise ValueError(f"unsupported high-accuracy artifact family: {family}")
+        job_dir = self.manager._safe_job_dir(job_id)
+        artifacts: list[dict[str, Any]] = []
+        score_ids: list[str] = []
+        page_number = 0
+        used_ids: set[str] = set()
+
+        def public_id(tag: str) -> str:
+            candidate = f"{prefix}-{tag}"
+            suffix = 2
+            while candidate in used_ids:
+                candidate = f"{prefix}-{tag}-{suffix}"
+                suffix += 1
+            used_ids.add(candidate)
+            return candidate
+
+        def family_kind(suffix: str) -> str:
+            return f"{family}_{suffix}"
+
+        for service_artifact in sorted(result.artifacts, key=lambda item: item.relative_path):
+            path = service_artifact.path.resolve()
+            name = path.name.lower()
+            if name.endswith(".performance.mid"):
+                tag, kind, item_label = "performance-midi", family_kind("performance_midi"), f"{label}性能 MIDI"
+            elif name.endswith(".performance.metadata.json"):
+                tag, kind, item_label = "performance-metadata", family_kind("performance_metadata"), f"{label}性能 MIDI 元数据"
+            elif name.endswith(".selected.mid"):
+                tag, kind, item_label = "selected-midi", family_kind("selected_midi"), f"{label}选中 MIDI"
+            elif name.endswith((".score.mid", ".score.midi")):
+                tag, kind, item_label = "score-midi", family_kind("score_midi"), f"{label}最终 Score MIDI"
+                score_ids.append(f"{prefix}-{tag}")
+            elif name.endswith(".notated.musicxml"):
+                tag, kind, item_label = "musicxml", family_kind("musicxml"), f"{label} MusicXML"
+            elif name.endswith(".alignment_report.json"):
+                tag, kind, item_label = "alignment-report", family_kind("alignment_report"), f"{label}对齐报告"
+            elif name.endswith(".score.json"):
+                tag, kind, item_label = "score-json", family_kind("score_json"), f"{label}分谱数据"
+                score_ids.append(f"{prefix}-{tag}")
+            elif name.endswith(".note-events.json"):
+                tag, kind, item_label = "service-note-events", family_kind("note_events"), f"{label}服务输入音符"
+            elif name.endswith(".score.jly"):
+                tag, kind, item_label = "jianpu-source", family_kind("jianpu_source"), f"{label}简谱源文本"
+            elif name.endswith(".score.ly"):
+                tag, kind, item_label = "lilypond-source", family_kind("lilypond_source"), f"{label} LilyPond 源文本"
+            elif name.endswith(".long.svg"):
+                tag, kind, item_label = "score-svg-long", family_kind("score_svg_long"), f"下载长图 SVG · {label}"
+                score_ids.append(f"{prefix}-{tag}")
+            elif name.endswith(".svg"):
+                page_number += 1
+                tag, kind, item_label = f"score-svg-{page_number}", family_kind("score_svg"), f"{label}第 {page_number} 页"
+                score_ids.append(f"{prefix}-{tag}")
+            elif name.endswith(".log"):
+                tag, kind, item_label = f"service-log-{len(artifacts) + 1}", "high_accuracy_log", f"{label}高精度处理日志"
+            else:
+                safe_name = re.sub(r"[^a-z0-9_.-]+", "-", service_artifact.relative_path.lower()).strip("-") or "file"
+                tag, kind, item_label = f"service-{safe_name}", "high_accuracy_support", f"{label}高精度辅助文件"
+            artifact_id = public_id(tag)
+            registered = self.manager._register(
+                job_dir,
+                path,
+                artifact_id=artifact_id,
+                kind=kind,
+                label=item_label,
+                media_type=self._artifact_media_type(path),
+                stem_id=stem_id,
+            )
+            artifacts.append(registered)
+        manifest_id = public_id("manifest")
+        artifacts.append(
+            self.manager._register(
+                job_dir,
+                result.manifest_path,
+                artifact_id=manifest_id,
+                kind="high_accuracy_manifest",
+                label=f"{label}高精度处理清单",
+                media_type="application/json",
+                stem_id=stem_id,
+            )
+        )
+        return artifacts, score_ids
+
+    def _register_high_accuracy_failure(
+        self,
+        job_id: str,
+        error: HighAccuracyServiceError,
+        *,
+        prefix: str,
+        label: str,
+        stem_id: str,
+    ) -> list[dict[str, Any]]:
+        job_dir = self.manager._safe_job_dir(job_id)
+        registered: list[dict[str, Any]] = []
+        for suffix, path, kind, item_label in (
+            ("manifest", error.manifest_path, "high_accuracy_manifest", f"{label}失败清单"),
+            ("failure-log", error.log_path, "high_accuracy_log", f"{label}失败日志"),
+        ):
+            if path is None or not path.is_file():
+                continue
+            registered.append(
+                self.manager._register(
+                    job_dir,
+                    path,
+                    artifact_id=f"{prefix}-{suffix}",
+                    kind=kind,
+                    label=item_label,
+                    media_type=self._artifact_media_type(path),
+                    stem_id=stem_id,
+                )
+            )
+        return registered
+
+    @staticmethod
+    def _artifact_media_type(path: Path) -> str:
+        suffix = path.name.lower()
+        if suffix.endswith(".mid"):
+            return "audio/midi"
+        if suffix.endswith(".musicxml"):
+            return "application/vnd.recordare.musicxml+xml"
+        if suffix.endswith(".svg"):
+            return "image/svg+xml"
+        if suffix.endswith(".json"):
+            return "application/json"
+        if suffix.endswith((".jly", ".ly", ".log")):
+            return "text/plain; charset=utf-8"
+        return "application/octet-stream"
+
+    def _persist_generation_state(
+        self,
+        job_id: str,
+        *,
+        artifacts: Sequence[Mapping[str, Any]],
+        generation: Mapping[str, Any],
+    ) -> None:
+        with self.manager._lock:
+            state = self.manager._read(job_id)
+            v2 = dict(state.get("v2", {}))
+            v2["generation"] = deepcopy(dict(generation))
+            v2.update(HIGH_ACCURACY_V2_METADATA)
+            state["v2"] = v2
+            state["artifacts"] = [dict(item) for item in artifacts]
+            state["updated_at"] = _utc_now()
+            self.manager._write(state)
+
+    @staticmethod
+    def _analysis_for_events(
+        base_analysis: MusicAnalysis,
+        events: Sequence[NoteEvent],
+        *,
+        bpm: float,
+        key: str,
+        time_signature: str,
+        bpm_manual: bool,
+        key_manual: bool,
+        time_signature_manual: bool,
+        metadata_extra: Mapping[str, Any] | None = None,
+    ) -> MusicAnalysis:
+        duration = max((event.end_sec for event in events), default=0.1)
+        metadata = V2JobService._selection_analysis_metadata(
+            base_analysis,
+            bpm=bpm,
+            key=key,
+            time_signature=time_signature,
+            bpm_manual=bpm_manual,
+            key_manual=key_manual,
+            time_signature_manual=time_signature_manual,
+        )
+        if metadata_extra:
+            metadata.update(deepcopy(dict(metadata_extra)))
+        return base_analysis.model_copy(
+            update={
+                "duration_sec": max(float(base_analysis.duration_sec), duration, 0.1),
+                "bpm": float(bpm),
+                "key": normalize_key(key),
+                "time_signature": normalize_time_signature(time_signature),
+                "note_events": list(events),
+                "metadata": metadata,
+            }
+        )
 
     def _persisted_instrumental_analysis(self, job_id: str, state: Mapping[str, Any]) -> MusicAnalysis | None:
         """Load the full BeatNet analysis retained during MuScriptor decode.
@@ -745,6 +1001,7 @@ class V2JobService:
             v2 = dict(state.get("v2", {}))
             v2.update(
                 {
+                    **HIGH_ACCURACY_V2_METADATA,
                     "stage": "vocal_ready",
                     "route": self._vocal_route(model),
                     "analysis": analysis_suggestion,
@@ -763,6 +1020,7 @@ class V2JobService:
                     "artifacts": artifacts,
                     "progress": 1.0,
                     "summary": {
+                        **HIGH_ACCURACY_V2_METADATA,
                         "source_kind": "vocal",
                         "route": self._vocal_route(model),
                         "stage": "vocal_ready",
@@ -776,25 +1034,27 @@ class V2JobService:
         self.manager._log(job_id, f"V2 vocal_ready: Demucs vocals {stats['duration_sec']:.3f}s")
 
     def _run_vocal_generation(self, job_id: str) -> None:
-        """Run GAME on the persisted vocals stem and render the main melody."""
+        """Run GAME, conservatively clean its monophonic output, then use 9A."""
 
         state = self.manager._read(job_id)
         options = dict(state.get("options", {}))
         model = self._vocal_model(state)
         vocal_path = self._prepared_vocal_path(job_id, state)
-        analysis = self._prepared_analysis(job_id, state)
+        original_analysis = self._prepared_analysis(job_id, state)
+        if not self._analysis_has_beatnet(original_analysis):
+            raise ValueError("人声原曲的 BeatNet 拍点分析缺失或版本不匹配，无法生成高精度简谱")
         self.manager._set_phase(job_id, "recognizing")
         result: EngineResult = run_engine(
             "game",
             os.fspath(vocal_path),
-            analysis=analysis,
+            analysis=original_analysis,
             stem_id="vocals",
             language="mixed",
             trusted_internal=True,
         )
         if not result.events:
             raise ValueError("GAME 未在人声分离结果中识别到有效音符，请重试或更换音频。")
-        events = [
+        raw_events = tuple(
             event.model_copy(
                 update={
                     "stem_id": "vocals",
@@ -807,52 +1067,203 @@ class V2JobService:
                 }
             )
             for event in result.events
+        )
+        output = self._output_dir(job_id)
+        attempt = int(state.get("attempt", 1))
+        generation_root = output / "vocal-generation" / f"attempt-{attempt:04d}"
+        if generation_root.is_symlink() or (generation_root.exists() and generation_root.resolve().parent != output / "vocal-generation"):
+            raise ValueError("invalid V2 vocal generation output path")
+        generation_root.mkdir(parents=True, exist_ok=True)
+        raw_path = generation_root / "game.raw.note-events.json"
+        _safe_json(
+            raw_path,
+            self._event_payload(
+                raw_events,
+                engine=result.engine,
+                model=result.model,
+                source_artifact_id="v2-vocals-audio",
+                immutable=True,
+            ),
+        )
+        job_dir = self.manager._safe_job_dir(job_id)
+        prior_artifacts = [
+            item for item in state.get("artifacts", [])
+            if str(item.get("artifact_id")) in {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis", "v2-beat-grid"}
         ]
-        analysis = analysis.model_copy(
+        raw_artifacts = [
+            *prior_artifacts,
+            self.manager._register(job_dir, raw_path, artifact_id="v2-vocal-game-raw-notes", kind="vocal_raw_notes", label="GAME 原始音符（保留）", media_type="application/json", stem_id="vocals"),
+        ]
+        self._persist_generation_state(
+            job_id,
+            artifacts=raw_artifacts,
+            generation={
+                "stage": "raw_events_persisted",
+                "engine": "game",
+                "model": result.model,
+                "input_artifact_id": "v2-vocals-audio",
+                "input_relative": vocal_path.relative_to(job_dir).as_posix(),
+                "raw_relative": raw_path.relative_to(job_dir).as_posix(),
+                "analysis_reused_from_original": True,
+                "raw_count": len(raw_events),
+            },
+        )
+        self.manager._set_phase(job_id, "quantizing")
+        try:
+            cleanup = clean_vocal_events(
+                raw_events,
+                bpm=original_analysis.bpm,
+                beat_context={
+                    "bpm": original_analysis.bpm,
+                    "beat_times": list(original_analysis.beat_times),
+                    "beat_grid": deepcopy(original_analysis.metadata.get("beat_grid", {})),
+                },
+            )
+        except (VocalCleanupError, TypeError, ValueError) as exc:
+            report = getattr(exc, "report", None)
+            if isinstance(report, Mapping):
+                failure_report_path = generation_root / "vocal-cleanup.failure.json"
+                _safe_json(failure_report_path, dict(report))
+                failure_artifacts = [
+                    *raw_artifacts,
+                    self.manager._register(job_dir, failure_report_path, artifact_id="v2-vocal-game-cleanup-failure", kind="vocal_cleanup_report", label="人声清理失败报告", media_type="application/json", stem_id="vocals"),
+                ]
+                self._persist_generation_state(
+                    job_id,
+                    artifacts=failure_artifacts,
+                    generation={"stage": "cleanup", "status": "failed", "failure": {"stage": "vocal_cleanup", "cause": str(exc)}, "raw_count": len(raw_events)},
+                )
+                self.manager._update(
+                    job_id,
+                    status="failed",
+                    phase="failed",
+                    finished_at=_utc_now(),
+                    error={"code": "vocal_cleanup_failed", "message": str(exc), "stage": "vocal_cleanup"},
+                )
+            else:
+                self._persist_generation_state(
+                    job_id,
+                    artifacts=raw_artifacts,
+                    generation={"stage": "cleanup", "status": "failed", "failure": {"stage": "vocal_cleanup", "cause": str(exc)}, "raw_count": len(raw_events)},
+                )
+                self.manager._update(
+                    job_id,
+                    status="failed",
+                    phase="failed",
+                    finished_at=_utc_now(),
+                    error={"code": "vocal_cleanup_failed", "message": str(exc), "stage": "vocal_cleanup"},
+                )
+            # The failure state and diagnostic report are already durable.  Do
+            # not re-raise here: the generic queue worker would replace the
+            # structured vocal_cleanup_failed error with a less useful
+            # ValueError payload.
+            return
+        cleaned_events = tuple(cleanup.events)
+        cleaned_path = generation_root / "game.cleaned.note-events.json"
+        cleanup_report_path = generation_root / "game.cleanup.report.json"
+        _safe_json(cleaned_path, self._event_payload(cleaned_events, source_raw=raw_path.name, immutable=True))
+        _safe_json(cleanup_report_path, cleanup.report)
+        generation_artifacts = [
+            *raw_artifacts,
+            self.manager._register(job_dir, cleaned_path, artifact_id="v2-vocal-game-cleaned-notes", kind="vocal_cleaned_notes", label="GAME 清理后人声音符", media_type="application/json", stem_id="vocals"),
+            self.manager._register(job_dir, cleanup_report_path, artifact_id="v2-vocal-game-cleanup-report", kind="vocal_cleanup_report", label="人声清理报告", media_type="application/json", stem_id="vocals"),
+        ]
+        generation = {
+            "stage": "cleanup_completed",
+            "engine": "game",
+            "model": result.model,
+            "input_artifact_id": "v2-vocals-audio",
+            "input_relative": vocal_path.relative_to(job_dir).as_posix(),
+            "raw_relative": raw_path.relative_to(job_dir).as_posix(),
+            "cleaned_relative": cleaned_path.relative_to(job_dir).as_posix(),
+            "cleanup_report_relative": cleanup_report_path.relative_to(job_dir).as_posix(),
+            "analysis_reused_from_original": True,
+            "raw_count": len(raw_events),
+            "cleaned_count": len(cleaned_events),
+            "cleanup_schema_version": cleanup.report.get("schema_version"),
+        }
+        self._persist_generation_state(job_id, artifacts=generation_artifacts, generation=generation)
+        generation_analysis = original_analysis.model_copy(
             update={
-                "note_events": events,
+                "note_events": list(cleaned_events),
                 "metadata": {
-                    **analysis.metadata,
+                    **original_analysis.metadata,
                     "engine": "game",
                     "source_kind": "vocal",
                     "source_stems": ["vocals"],
                     "prepared_audio": {"vocals": os.fspath(vocal_path)},
                     "analysis_reused_from_original": True,
                     "engine_details": {"vocals": {**result.metadata, "adapter": "game"}},
+                    "vocal_cleanup": cleanup.report,
                 },
-                "warnings": [*analysis.warnings, *result.warnings],
+                "warnings": [*original_analysis.warnings, *result.warnings],
             }
         )
-        self.manager._set_phase(job_id, "quantizing")
-        score = quantize_events(events, analysis, mode="monophonic", title=options.get("title") or "人声主旋律")
-        score = score.model_copy(
-            update={
-                "source": "vocals",
-                "metadata": {
-                    **score.metadata,
-                    "source_audio": os.fspath(self.manager.input_path(job_id)),
-                    "prepared_audio": {"vocals": os.fspath(vocal_path)},
-                    "engine": "game",
-                    "analysis_reused_from_original": True,
-                    "velocity_policy": "preserve_none",
-                },
-            }
+        analysis_path = generation_root / "analysis.cleaned.json"
+        _safe_json(analysis_path, generation_analysis.model_dump(mode="json"))
+        generation_artifacts.append(
+            self.manager._register(job_dir, analysis_path, artifact_id="v2-vocal-analysis-cleaned", kind="analysis_full_json", label="清理后高精度分析", media_type="application/json", stem_id="vocals")
         )
-        output = self._output_dir(job_id)
-        (output / "analysis.json").write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
-        write_score_json(score, output / "score.json")
+        service_dir = generation_root / "high-accuracy"
         self.manager._set_phase(job_id, "rendering")
-        render_artifacts = render_score(score, output, basename="score")
-        self.manager._set_phase(job_id, "packaging")
-        generation_artifacts = self.manager._package_artifacts(job_id, score, analysis, render_artifacts)
-        prior_artifacts = [
-            item for item in state.get("artifacts", [])
-            if str(item.get("artifact_id")) in {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis", "v2-beat-grid"}
-        ]
-        artifacts = [*prior_artifacts, *generation_artifacts]
-        for artifact in artifacts:
-            if artifact.get("kind") in {"score_svg", "score_json", "jianpu_source", "lilypond_source", "midi", "stem_svg", "stem_midi"}:
-                artifact["label"] = "人声主旋律" + (f"（{artifact['label']}）" if artifact.get("label") else "")
+        service = HighAccuracyArtifactService()
+        try:
+            build = service.build(
+                instrument_id="vocals",
+                title=str(options.get("title") or "人声主旋律"),
+                program=0,
+                is_drum=False,
+                events=cleaned_events,
+                analysis=generation_analysis,
+                output_dir=service_dir,
+                variant="game-cleaned",
+                overwrite=False,
+            )
+        except HighAccuracyServiceError as exc:
+            failure_artifacts = [*generation_artifacts, *self._register_high_accuracy_failure(job_id, exc, prefix="v2-vocal-high-accuracy", label="人声高精度处理", stem_id="vocals")]
+            failed_generation = {**generation, "stage": exc.stage, "status": "failed", "failure": {"instrument_id": exc.instrument_id, "stage": exc.stage, "cause": exc.cause}}
+            self._persist_generation_state(job_id, artifacts=failure_artifacts, generation=failed_generation)
+            self.manager._update(
+                job_id,
+                status="failed",
+                phase="failed",
+                finished_at=_utc_now(),
+                error={"code": "high_accuracy_failed", "message": str(exc), "instrument_id": exc.instrument_id, "stage": exc.stage},
+            )
+            # The service failure manifest and structured task error are
+            # already persisted.  Returning keeps the stage/instrument fields
+            # visible to the V2 API instead of letting the queue worker
+            # rewrite them as a generic exception.
+            return
+        except Exception as exc:  # noqa: BLE001 - persist a structured service failure
+            failed_generation = {**generation, "stage": "service", "status": "failed", "failure": {"instrument_id": "vocals", "stage": "service", "cause": str(exc)}}
+            self._persist_generation_state(job_id, artifacts=generation_artifacts, generation=failed_generation)
+            self.manager._update(
+                job_id,
+                status="failed",
+                phase="failed",
+                finished_at=_utc_now(),
+                error={"code": "high_accuracy_failed", "message": str(exc), "instrument_id": "vocals", "stage": "service"},
+            )
+            return
+        service_artifacts, score_ids = self._register_high_accuracy_result(
+            job_id,
+            build,
+            prefix="v2-vocal-high-accuracy",
+            label="人声主旋律",
+            stem_id="vocals",
+            family="vocal",
+        )
+        artifacts = [*generation_artifacts, *service_artifacts]
+        generation = {
+            **generation,
+            "stage": "completed",
+            "status": "completed",
+            "service_variant": build.variant,
+            "service_relative": service_dir.relative_to(job_dir).as_posix(),
+            "manifest_relative": build.manifest_path.relative_to(job_dir).as_posix(),
+            "score_artifact_ids": score_ids,
+        }
         separation = dict((state.get("v2") or {}).get("separation") or {})
         separation["model"] = model
         separation.setdefault("model_info", self._vocal_model_info(model))
@@ -861,15 +1272,11 @@ class V2JobService:
             current_v2 = dict(current.get("v2", {}))
             current_v2.update(
                 {
+                    **HIGH_ACCURACY_V2_METADATA,
                     "stage": "vocal_complete",
                     "route": self._vocal_route(model),
-                    "analysis": _analysis_suggestion(analysis),
-                    "generation": {
-                        "engine": "game",
-                        "input_artifact_id": "v2-vocals-audio",
-                        "input_relative": vocal_path.relative_to(self.manager._safe_job_dir(job_id)).as_posix(),
-                        "analysis_reused_from_original": True,
-                    },
+                    "analysis": _analysis_suggestion(generation_analysis),
+                    "generation": generation,
                     "separation": separation,
                     "progress_detail": {"status": "completed", "engine": "game", "stem": "vocals", "model": model, "separation_model": model},
                 }
@@ -883,24 +1290,23 @@ class V2JobService:
                     "error": None,
                     "artifacts": artifacts,
                     "progress": 1.0,
-                    "warnings": list(dict.fromkeys([*analysis.warnings, *score.warnings, *separation.get("warnings", [])])),
+                    "warnings": list(dict.fromkeys([*generation_analysis.warnings, *separation.get("warnings", [])])),
                     "summary": {
+                        **HIGH_ACCURACY_V2_METADATA,
                         "source_kind": "vocal",
                         "route": self._vocal_route(model),
                         "stage": "completed",
-                        "note_count": len(analysis.note_events),
-                        "voice_count": len(score.voices),
-                        "total_ticks": score.total_ticks,
-                        "bpm": score.bpm,
-                        "key": score.key,
-                        "time_signature": score.time_signature,
-                        "generation": current_v2["generation"],
+                        "note_count": len(generation_analysis.note_events),
+                        "raw_note_count": len(raw_events),
+                        "cleanup_report": cleanup.report,
+                        "score_artifact_ids": score_ids,
+                        "generation": generation,
                     },
                     "updated_at": _utc_now(),
                 }
             )
             self.manager._write(current)
-        self.manager._log(job_id, f"V2 vocal completed from vocals stem: {len(analysis.note_events)} notes, {len(artifacts)} artifacts")
+        self.manager._log(job_id, f"V2 vocal completed from vocals stem: {len(cleaned_events)} cleaned notes, {len(artifacts)} artifacts")
 
     def _run_instrumental_export(self, job_id: str) -> None:
         state = self.manager._read(job_id)
@@ -914,11 +1320,14 @@ class V2JobService:
         track_by_id = {str(track.get("track_id")): track for track in tracks}
         selected_tracks = [track_by_id[track_id] for track_id in selected_ids if track_id in track_by_id]
         base_analysis = self._persisted_instrumental_analysis(job_id, state)
-        bpm = float(selection.get("bpm_override") or (base_analysis.bpm if base_analysis else 120.0))
+        bpm = float(selection.get("bpm_override") if selection.get("bpm_override") is not None else (base_analysis.bpm if base_analysis else 120.0))
         key = normalize_key(str(selection.get("key_override") or (base_analysis.key if base_analysis else "C")))
         time_signature = normalize_time_signature(
             str(selection.get("time_signature_override") or (base_analysis.time_signature if base_analysis else "4/4"))
         )
+        bpm_manual = bool(selection.get("bpm_override_explicit", False))
+        key_manual = bool(selection.get("key_override_explicit", False))
+        time_signature_manual = bool(selection.get("time_signature_override_explicit", False))
         notes_with_ids: list[dict[str, Any]] = []
         for note in notes:
             track_key = (str(note.get("instrument_group")), int(note.get("program", 0)), bool(note.get("is_drum", False)))
@@ -950,46 +1359,65 @@ class V2JobService:
             )
         ]
         score_artifact_ids: list[str] = []
+        track_failures: list[dict[str, Any]] = []
+        successful_pitched: list[dict[str, Any]] = []
         for track in selected_tracks:
             track_id = str(track["track_id"])
+            label = str(track.get("label_zh") or instrument_label_zh(str(track.get("instrument_group"))))
             track_notes = [note for note in notes_with_ids if note.get("track_id") == track_id]
-            track_midi = write_unquantized_midi(
-                track_notes,
-                output / f"{track_id}.mid",
-                title=f"{title} {track.get('label_zh') or instrument_label_zh(str(track.get('instrument_group')))}",
-                bpm=bpm,
-            )
-            artifacts.append(
-                self.manager._register(
-                    job_dir,
-                    track_midi,
-                    artifact_id=f"v2-selection-r{revision}-{track_id}-midi",
-                    kind="instrument_midi",
-                    label=f"{track.get('label_zh') or instrument_label_zh(str(track.get('instrument_group')))} MIDI",
-                    media_type="audio/midi",
-                    stem_id=track_id,
+            try:
+                track_midi = write_unquantized_midi(
+                    track_notes,
+                    output / f"{track_id}.mid",
+                    title=f"{title} {label}",
+                    bpm=bpm,
                 )
-            )
+                artifacts.append(
+                    self.manager._register(
+                        job_dir,
+                        track_midi,
+                        artifact_id=f"v2-selection-r{revision}-{track_id}-midi",
+                        kind="instrument_preview_midi",
+                        label=f"{label}试听 MIDI",
+                        media_type="audio/midi",
+                        stem_id=track_id,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve one-track continuation
+                track_failures.append({"track_id": track_id, "label": label, "stage": "preview_midi", "error": str(exc)})
+                continue
             if bool(track.get("is_drum")):
                 continue
-            rendered = self._render_track_score(
-                job_id,
-                output,
-                track,
-                track_notes,
-                title,
-                bpm=bpm,
-                key=key,
-                time_signature=time_signature,
-                base_analysis=base_analysis,
-            )
-            score_artifact_ids.extend(item["artifact_id"] for item in rendered)
+            try:
+                rendered = self._render_track_score(
+                    job_id,
+                    output,
+                    track,
+                    track_notes,
+                    title,
+                    bpm=bpm,
+                    key=key,
+                    time_signature=time_signature,
+                    base_analysis=base_analysis,
+                    bpm_manual=bpm_manual,
+                    key_manual=key_manual,
+                    time_signature_manual=time_signature_manual,
+                )
+            except HighAccuracyServiceError as exc:
+                track_failures.append({"track_id": track_id, "label": label, "stage": exc.stage, "error": exc.cause})
+                artifacts.extend(list(getattr(exc, "v2_artifacts", [])))
+                continue
+            except Exception as exc:  # noqa: BLE001 - preserve one-track continuation
+                track_failures.append({"track_id": track_id, "label": label, "stage": "service", "error": str(exc)})
+                continue
+            score_artifact_ids.extend(item["artifact_id"] for item in rendered if item.get("kind", "").endswith(("score_json", "score_midi", "score_svg", "score_svg_long")))
             artifacts.extend(rendered)
+            successful_pitched.append(track)
 
         merged_artifacts: list[dict[str, Any]] = []
         merge_requested = bool(selection.get("merge_main_melody", False))
-        if merge_requested and selected_pitched:
-            merged_notes = self._main_melody_notes(notes_with_ids, selected_set)
+        if merge_requested and successful_pitched:
+            merged_notes = self._main_melody_notes(notes_with_ids, {str(track["track_id"]) for track in successful_pitched})
             merged_track = {
                 "track_id": "main-melody",
                 "label_zh": "主旋律（合并）",
@@ -997,21 +1425,30 @@ class V2JobService:
                 "program": 0,
                 "is_drum": False,
             }
-            merged_artifacts = self._render_track_score(
-                job_id,
-                output,
-                merged_track,
-                merged_notes,
-                title,
-                basename="main-melody",
-                label_override="主旋律（合并）",
-                bpm=bpm,
-                key=key,
-                time_signature=time_signature,
-                base_analysis=base_analysis,
-            )
-            artifacts.extend(merged_artifacts)
-            score_artifact_ids.extend(item["artifact_id"] for item in merged_artifacts)
+            try:
+                merged_artifacts = self._render_track_score(
+                    job_id,
+                    output,
+                    merged_track,
+                    merged_notes,
+                    title,
+                    basename="main-melody",
+                    label_override="主旋律（合并）",
+                    bpm=bpm,
+                    key=key,
+                    time_signature=time_signature,
+                    base_analysis=base_analysis,
+                    bpm_manual=bpm_manual,
+                    key_manual=key_manual,
+                    time_signature_manual=time_signature_manual,
+                )
+                artifacts.extend(merged_artifacts)
+                score_artifact_ids.extend(item["artifact_id"] for item in merged_artifacts if item.get("kind", "").endswith(("score_json", "score_midi", "score_svg", "score_svg_long")))
+            except HighAccuracyServiceError as exc:
+                track_failures.append({"track_id": "main-melody", "label": "主旋律（合并）", "stage": exc.stage, "error": exc.cause})
+                artifacts.extend(list(getattr(exc, "v2_artifacts", [])))
+            except Exception as exc:  # noqa: BLE001 - preserve main-melody continuation
+                track_failures.append({"track_id": "main-melody", "label": "主旋律（合并）", "stage": "service", "error": str(exc)})
 
         score_refusal: dict[str, str] | None = None
         warnings: list[str] = []
@@ -1021,13 +1458,18 @@ class V2JobService:
                 "message": "未选择有音高乐器，简谱已拒绝；仍可下载选中 MIDI 并试听鼓组。",
             }
             warnings.append(score_refusal["message"])
-        if merge_requested and selected_pitched:
+        elif not successful_pitched:
+            score_refusal = {
+                "code": "all_pitched_tracks_failed",
+                "message": "所有选中的有音高乐器均未完成高精度谱面生成。",
+            }
+            warnings.append(score_refusal["message"])
+        if track_failures:
+            warnings.append(f"有 {len(track_failures)} 个乐器或产物阶段失败，详见任务结果中的 track_failures。")
+        if merge_requested and successful_pitched:
             warnings.append("主旋律合并为单声部，结果会丢失和声；该产物不称为总谱。")
 
-        page_artifacts = [
-            item for item in artifacts
-            if item.get("kind") in {"instrument_score_svg", "main_melody_svg"}
-        ]
+        page_artifacts = [item for item in artifacts if item.get("kind") in {"instrument_score_svg", "main_melody_score_svg"}]
         selection_zip_id: str | None = None
         if page_artifacts:
             selection_zip_id = f"v2-selection-r{revision}-svg-zip"
@@ -1049,27 +1491,32 @@ class V2JobService:
                 )
             )
 
+        overrides = {
+            "bpm": bpm,
+            "key": key,
+            "time_signature": time_signature,
+            "bpm_manual": bpm_manual,
+            "key_manual": key_manual,
+            "time_signature_manual": time_signature_manual,
+            "sources": {
+                "bpm": "manual" if bpm_manual else "beatnet",
+                "key": "manual" if key_manual else "analysis",
+                "time_signature": "manual" if time_signature_manual else "beatnet",
+            },
+        }
         selection_record = {
             "schema_version": "2.0",
             "revision": revision,
             "selected_track_ids": selected_ids,
             "selected_tracks": selected_tracks,
             "merge_main_melody": merge_requested,
-            "overrides": {
-                "bpm": bpm,
-                "key": key,
-                "time_signature": time_signature,
-            },
+            "overrides": overrides,
             "score_refusal": score_refusal,
+            "track_failures": track_failures,
             "score_artifact_ids": score_artifact_ids,
             "midi_artifact_id": f"v2-selection-r{revision}-midi",
             "svg_zip_artifact_id": selection_zip_id,
-            "metadata": {
-                "time_basis": "source_seconds",
-                "velocity_policy": "playback_default",
-                "note_event_velocity": None,
-                "full_decode_reused": True,
-            },
+            "metadata": {**HIGH_ACCURACY_V2_METADATA, "time_basis": "source_seconds", "velocity_policy": "playback_default", "note_event_velocity": None, "full_decode_reused": True},
         }
         selection_json = output / "selection.json"
         _safe_json(selection_json, selection_record)
@@ -1086,37 +1533,39 @@ class V2JobService:
         with self.manager._lock:
             current = self.manager._read(job_id)
             current_v2 = dict(current.get("v2", {}))
-            current_v2["score_refusal"] = score_refusal
-            current_v2["progress_detail"] = {"status": "completed", "revision": revision}
+            current_v2.update({**HIGH_ACCURACY_V2_METADATA, "score_refusal": score_refusal, "track_failures": track_failures, "progress_detail": {"status": "completed" if not score_refusal or score_refusal.get("code") == "no_pitched_tracks" else "failed", "revision": revision}})
+            previous = [item for item in current.get("artifacts", []) if not str(item.get("artifact_id", "")).startswith(f"v2-selection-r{revision}-")]
             current.update(
                 {
-                    "status": "completed",
-                    "phase": "completed",
+                    "status": "failed" if score_refusal and score_refusal.get("code") == "all_pitched_tracks_failed" else "completed",
+                    "phase": "failed" if score_refusal and score_refusal.get("code") == "all_pitched_tracks_failed" else "completed",
                     "finished_at": _utc_now(),
-                    "error": None,
+                    "error": ({"code": "high_accuracy_all_tracks_failed", "message": score_refusal["message"], "track_failures": track_failures} if score_refusal and score_refusal.get("code") == "all_pitched_tracks_failed" else None),
                     "progress": 1.0,
                     "warnings": warnings,
-                    "artifacts": [*current.get("artifacts", []), *artifacts],
+                    "artifacts": [*previous, *artifacts],
                     "summary": {
+                        **HIGH_ACCURACY_V2_METADATA,
                         "source_kind": "instrumental",
                         "route": {"engine": "muscriptor", "use_demucs": False},
                         "selection_revision": revision,
                         "selected_track_ids": selected_ids,
                         "selected_pitched_track_ids": [str(track["track_id"]) for track in selected_pitched],
+                        "successful_pitched_track_ids": [str(track["track_id"]) for track in successful_pitched],
                         "drum_track_ids": [str(track["track_id"]) for track in selected_tracks if bool(track.get("is_drum"))],
                         "score_refusal": score_refusal,
+                        "track_failures": track_failures,
                         "merge_main_melody": merge_requested,
-                        "overrides": {
-                            "bpm": bpm,
-                            "key": key,
-                            "time_signature": time_signature,
-                        },
+                        "overrides": overrides,
                     },
                     "v2": {**current_v2, "stage": "export"},
                     "updated_at": _utc_now(),
                 }
             )
             self.manager._write(current)
+        # The explicit failed state and per-track diagnostics have already
+        # been persisted above.  Returning prevents the generic worker from
+        # replacing ``high_accuracy_all_tracks_failed`` with ``runtime_error``.
         self.manager._log(job_id, f"V2 selection revision {revision} completed: {len(artifacts)} new artifacts")
 
     def _render_track_score(
@@ -1133,155 +1582,140 @@ class V2JobService:
         key: str = "C",
         time_signature: str = "4/4",
         base_analysis: MusicAnalysis | None = None,
+        bpm_manual: bool = False,
+        key_manual: bool = False,
+        time_signature_manual: bool = False,
     ) -> list[dict[str, Any]]:
         track_id = str(track.get("track_id"))
         label = label_override or str(track.get("label_zh") or instrument_label_zh(str(track.get("instrument_group"))))
         if not notes:
             raise NoNotesError(f"NoNotes: selected track {track_id} has no events")
-        duration = max(float(note["end_sec"]) for note in notes)
         events = [
             NoteEvent(
                 start_sec=float(note["start_sec"]),
                 end_sec=float(note["end_sec"]),
                 midi=int(note["pitch"]),
-                confidence=None,
-                voice_id=f"{track_id}:voice-0",
-                source="muscriptor",
-                velocity=None,
+                confidence=float(note["confidence"]) if note.get("confidence") is not None else None,
+                voice_id=str(note.get("voice_id") or f"{track_id}:voice-0"),
+                source="muscriptor-main-melody" if track_id == "main-melody" else "muscriptor",
+                velocity=int(note["velocity"]) if note.get("velocity") not in {None, 0} else None,
                 stem_id=track_id,
                 metadata={
                     "instrument_group": str(track.get("instrument_group", "unknown")),
                     "program": int(track.get("program", 0)),
+                    "track_id": track_id,
                     "playback_default": 80,
                 },
             )
             for note in notes
         ]
         if base_analysis is None:
-            analysis = MusicAnalysis(
-                sample_rate=16000,
-                duration_sec=max(duration, 0.1),
-                bpm=bpm,
-                key=key,
-                time_signature=time_signature,
-                note_events=events,
-                metadata={
-                    "engine": "muscriptor",
-                    "source_kind": "instrumental",
-                    "time_basis": "source_seconds",
-                    "velocity_policy": "playback_default",
-                },
-            )
-        else:
-            analysis = base_analysis.model_copy(
-                update={
-                    "duration_sec": max(float(base_analysis.duration_sec), duration, 0.1),
-                    "bpm": bpm,
-                    "key": key,
-                    "time_signature": time_signature,
-                    "note_events": events,
-                    "metadata": self._selection_analysis_metadata(base_analysis, bpm=bpm, time_signature=time_signature),
-                }
-            )
-        score_title = f"{title} {label}分谱"
-        score = quantize_events(events, analysis, mode="monophonic" if track_id == "main-melody" else "polyphonic", title=score_title)
-        score = score.model_copy(
-            update={
-                "metadata": {
-                    **score.metadata,
-                    "instrument_group": str(track.get("instrument_group", "unknown")),
-                    "program": int(track.get("program", 0)),
-                    "track_id": track_id,
-                    "selection_score_kind": "main_melody" if track_id == "main-melody" else "instrument_part",
-                    "harmony_loss": track_id == "main-melody",
-                    "velocity_policy": "playback_default",
-                }
-            }
+            raise ValueError("高精度乐器分谱必须使用已持久化的 BeatNet 分析")
+        analysis = self._analysis_for_events(
+            base_analysis,
+            events,
+            bpm=bpm,
+            key=key,
+            time_signature=time_signature,
+            bpm_manual=bpm_manual,
+            key_manual=key_manual,
+            time_signature_manual=time_signature_manual,
+            metadata_extra={
+                "instrument_group": str(track.get("instrument_group", "unknown")),
+                "program": int(track.get("program", 0)),
+                "track_id": track_id,
+                "selection_score_kind": "main_melody" if track_id == "main-melody" else "instrument_part",
+                "harmony_loss": track_id == "main-melody",
+                "velocity_policy": "preserve_note_velocity",
+            },
         )
-        track_dir = output / ("main-melody" if track_id == "main-melody" else track_id)
-        track_dir.mkdir(parents=True, exist_ok=True)
-        render = render_score(score, track_dir, basename=basename or "score")
-        write_score_json(score, track_dir / "score.json")
-        job_dir = self.manager._safe_job_dir(job_id)
+        score_title = f"{title} {label}分谱"
         prefix = f"v2-selection-r{self._revision_from_path(output)}-{track_id}"
-        artifacts: list[dict[str, Any]] = []
-        long_path = merge_svg_pages(render.svg_paths, track_dir / "score-long.svg")
-        long_kind = "instrument_score_svg_long" if track_id != "main-melody" else "main_melody_svg_long"
-        long_label = f"下载长图 SVG · {label}分谱" if track_id != "main-melody" else "下载长图 SVG · 主旋律（合并）"
-        artifacts.append(
-            self.manager._register(
-                job_dir,
-                long_path,
-                artifact_id=f"{prefix}-svg-long",
-                kind=long_kind,
-                label=long_label,
-                media_type="image/svg+xml",
+        family = "main_melody" if track_id == "main-melody" else "instrument"
+        service_dir = output / ("main-melody" if track_id == "main-melody" else track_id) / "high-accuracy"
+        try:
+            result = HighAccuracyArtifactService().build(
+                instrument_id=track_id,
+                title=score_title,
+                program=int(track.get("program", 0)),
+                is_drum=False,
+                events=events,
+                analysis=analysis,
+                output_dir=service_dir,
+                variant="main-melody" if track_id == "main-melody" else "instrument-part",
+                overwrite=True,
+            )
+        except HighAccuracyServiceError as exc:
+            failure_artifacts = self._register_high_accuracy_failure(
+                job_id,
+                exc,
+                prefix=prefix,
+                label=label,
                 stem_id=track_id,
             )
+            exc.v2_artifacts = failure_artifacts
+            raise
+        artifacts, _score_ids = self._register_high_accuracy_result(
+            job_id,
+            result,
+            prefix=prefix,
+            label=label,
+            stem_id=track_id,
+            family=family,
         )
-        for index, path_text in enumerate(render.svg_paths, start=1):
-            path = Path(path_text).resolve()
-            artifacts.append(
-                self.manager._register(
-                    job_dir,
-                    path,
-                    artifact_id=f"{prefix}-svg-{index}",
-                    kind="instrument_score_svg" if track_id != "main-melody" else "main_melody_svg",
-                    label=f"{label}分谱第 {index} 页" if track_id != "main-melody" else "主旋律（合并）第 {index} 页",
-                    media_type="image/svg+xml",
-                    stem_id=track_id,
-                    page=index,
-                )
-            )
-        for path, suffix, kind, media_type, item_label in (
-            (track_dir / "score.json", "json", "instrument_score_json", "application/json", f"{label}分谱数据"),
-            (track_dir / "score.jly", "jly", "instrument_jianpu_source", "text/plain; charset=utf-8", f"{label}分谱源文本"),
-            (track_dir / "score.ly", "ly", "instrument_lilypond_source", "text/plain; charset=utf-8", f"{label}分谱 LilyPond"),
-        ):
-            if path.is_file():
-                artifacts.append(
-                    self.manager._register(
-                        job_dir,
-                        path,
-                        artifact_id=f"{prefix}-{suffix}",
-                        kind=kind if track_id != "main-melody" else f"main_melody_{suffix}",
-                        label=item_label,
-                        media_type=media_type,
-                        stem_id=track_id,
-                    )
-                )
         return artifacts
 
     @staticmethod
-    def _selection_analysis_metadata(base_analysis: MusicAnalysis, *, bpm: float, time_signature: str) -> dict[str, Any]:
-        metadata = dict(base_analysis.metadata)
+    def _selection_analysis_metadata(
+        base_analysis: MusicAnalysis,
+        *,
+        bpm: float,
+        key: str | None = None,
+        time_signature: str,
+        bpm_manual: bool = False,
+        key_manual: bool = False,
+        time_signature_manual: bool = False,
+    ) -> dict[str, Any]:
+        """Apply effective selection values while preserving their sources."""
+
+        metadata = deepcopy(dict(base_analysis.metadata))
         beat_grid = metadata.get("beat_grid")
         if isinstance(beat_grid, Mapping):
-            # Keep the detected beat phase/local shape, but make the selected
-            # BPM authoritative by scaling fractional beat positions.  This is
-            # the durable equivalent of the UI's manual BPM override.
             updated_grid = deepcopy(dict(beat_grid))
-            tempo = deepcopy(dict(updated_grid.get("tempo") or {}))
-            detected = float(base_analysis.bpm)
-            tempo["selected_bpm"] = float(bpm)
-            tempo["manual_bpm"] = float(bpm)
-            tempo["manual_scale"] = float(bpm) / detected if detected > 0 else 1.0
-            tempo["selection_reason"] = "用户选择 BPM 优先；导出保留 BeatNet 首拍与局部拍点"
-            updated_grid["tempo"] = tempo
-            mapping = deepcopy(dict(updated_grid.get("mapping") or {}))
-            mapping["manual_bpm_scale"] = tempo["manual_scale"]
-            updated_grid["mapping"] = mapping
-            meter = deepcopy(dict(updated_grid.get("time_signature") or {}))
-            meter["selected"] = time_signature
-            meter["source"] = "manual"
-            updated_grid["time_signature"] = meter
+            if bpm_manual:
+                # Keep the detected beat phase/local shape, but scale score
+                # beat positions only when the user explicitly changed BPM.
+                tempo = deepcopy(dict(updated_grid.get("tempo") or {}))
+                detected = float(base_analysis.bpm)
+                scale = float(bpm) / detected if detected > 0 else 1.0
+                tempo["selected_bpm"] = float(bpm)
+                tempo["manual_bpm"] = float(bpm)
+                tempo["manual_scale"] = scale
+                tempo["selection_reason"] = "用户选择 BPM 优先；导出保留 BeatNet 首拍与局部拍点"
+                updated_grid["tempo"] = tempo
+                mapping = deepcopy(dict(updated_grid.get("mapping") or {}))
+                mapping["manual_bpm_scale"] = scale
+                updated_grid["mapping"] = mapping
+            if time_signature_manual:
+                meter = deepcopy(dict(updated_grid.get("time_signature") or {}))
+                meter["selected"] = time_signature
+                meter["source"] = "manual"
+                updated_grid["time_signature"] = meter
             metadata["beat_grid"] = updated_grid
+        selected_key = normalize_key(key or base_analysis.key)
         metadata.update(
             {
-                "manual_bpm_override": True,
-                "manual_time_signature_override": True,
+                "manual_bpm_override": bool(bpm_manual),
+                "manual_key_override": bool(key_manual),
+                "manual_time_signature_override": bool(time_signature_manual),
                 "selected_bpm": float(bpm),
+                "selected_key": selected_key,
                 "selected_time_signature": time_signature,
+                "override_sources": {
+                    "bpm": "manual" if bpm_manual else metadata.get("beat_source", "beatnet"),
+                    "key": "manual" if key_manual else metadata.get("key_source", "analysis"),
+                    "time_signature": "manual" if time_signature_manual else metadata.get("time_signature_source", "beatnet"),
+                },
             }
         )
         return metadata

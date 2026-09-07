@@ -1,0 +1,334 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, ClassVar
+
+import pytest
+
+from backend.jianpu_score.domain import MusicAnalysis, NoteEvent
+from backend.jianpu_score.high_accuracy import (
+    resolve_musescore,
+    resolve_notation_python,
+)
+from backend.jianpu_score.high_accuracy_service import (
+    SERVICE_SCHEMA_VERSION,
+    HighAccuracyBuildResult,
+    ServiceArtifact,
+)
+from backend.jianpu_score.models.adapter import EngineResult
+from backend.jianpu_score.render import JIANPU, LILYPOND
+from backend.job_manager import JobManager
+from backend.muscriptor_v2 import stable_track_id
+
+ROOT = Path(__file__).resolve().parents[1]
+PROFILE = ROOT / "tools" / "musescore-4.7.4" / "midi_import_options.xml"
+REAL_READY = (
+    resolve_musescore() is not None
+    and resolve_notation_python().is_file()
+    and PROFILE.is_file()
+    and JIANPU.is_file()
+    and LILYPOND.is_file()
+)
+
+
+class FakeHighAccuracyService:
+    calls: ClassVar[list[dict[str, Any]]] = []
+    failures: ClassVar[set[str]] = set()
+
+    def build(self, **kwargs: Any) -> HighAccuracyBuildResult:
+        instrument_id = str(kwargs["instrument_id"])
+        output_dir = Path(kwargs["output_dir"]).resolve()
+        variant = str(kwargs["variant"])
+        self.calls.append({"instrument_id": instrument_id, "variant": variant, "is_drum": bool(kwargs["is_drum"])})
+        if instrument_id in self.failures:
+            raise RuntimeError(f"fixture failure for {instrument_id}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        safe = instrument_id.replace("-", "_")
+        names = [
+            f"{safe}.{variant}.note-events.json",
+            f"{safe}.{variant}.performance.mid",
+            f"{safe}.{variant}.performance.metadata.json",
+            f"{safe}.{variant}.notated.musicxml",
+            f"{safe}.score.json",
+            f"{safe}.alignment_report.json",
+            f"{safe}.score.jly",
+            f"{safe}.score.ly",
+            f"{safe}.score-1.svg",
+            f"{safe}.score.long.svg",
+            f"{safe}.score.mid",
+        ]
+        paths: list[Path] = []
+        for name in names:
+            path = output_dir / name
+            path.write_text("{}" if path.suffix == ".json" else "fixture", encoding="utf-8")
+            paths.append(path)
+        manifest = output_dir / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": SERVICE_SCHEMA_VERSION,
+                    "instrument_id": instrument_id,
+                    "variant": variant,
+                    "status": "completed",
+                }
+            ),
+            encoding="utf-8",
+        )
+        artifacts = tuple(
+            ServiceArtifact(
+                artifact_id=path.name,
+                kind="fixture",
+                path=path,
+                relative_path=path.relative_to(output_dir).as_posix(),
+                sha256="fixture",
+                bytes=path.stat().st_size,
+            )
+            for path in paths
+        )
+        return HighAccuracyBuildResult(
+            instrument_id=instrument_id,
+            title=str(kwargs["title"]),
+            variant=variant,
+            program=int(kwargs["program"]),
+            is_drum=bool(kwargs["is_drum"]),
+            status="completed",
+            jianpu_status="completed",
+            output_dir=output_dir,
+            manifest_path=manifest,
+            artifacts=artifacts,
+            performance_metadata={"note_count": len(tuple(kwargs["events"]))},
+        )
+
+
+def _analysis() -> MusicAnalysis:
+    beat_times = [0.0, 0.5, 1.0, 1.5]
+    return MusicAnalysis(
+        sample_rate=16_000,
+        duration_sec=2.0,
+        bpm=120,
+        key="C",
+        time_signature="4/4",
+        beat_times=beat_times,
+        metadata={
+            "beat_engine": "beatnet",
+            "beatnet_version": "1.1.3",
+            "beat_source": "beatnet",
+            "beat_grid": {"beats": [{"index": i, "time_sec": value, "downbeat": i == 0} for i, value in enumerate(beat_times)]},
+        },
+    )
+
+
+def _instrumental_fixture(manager: JobManager, tmp_path: Path, *, two_tracks: bool = False) -> tuple[str, str, list[str]]:
+    job_id, input_path = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture")
+    input_path.write_bytes(b"fixture")
+    track_specs = [("acoustic_guitar", 24), ("violin", 40)] if two_tracks else [("acoustic_guitar", 24)]
+    tracks = [
+        {
+            "track_id": stable_track_id(group, program, False),
+            "instrument_group": group,
+            "program": program,
+            "is_drum": False,
+            "label_zh": group,
+        }
+        for group, program in track_specs
+    ]
+    notes = [
+        {"instrument_group": group, "program": program, "is_drum": False, "pitch": 60 + index, "start_sec": 0.1, "end_sec": 0.4, "velocity": None}
+        for index, (group, program) in enumerate(track_specs)
+    ]
+    analysis = _analysis()
+    manager._update(
+        job_id,
+        status="selection_ready",
+        phase="selection_ready",
+        progress=1.0,
+        v2={
+            "stage": "selection_ready",
+            "source_kind": "instrumental",
+            "tracks": tracks,
+            "notes": notes,
+            "analysis": {"bpm": 120, "key": "C", "time_signature": "4/4"},
+            "selection_revision": 0,
+            "selection": None,
+            "selection_history": [],
+            "score_refusal": None,
+        },
+    )
+    analysis_path = tmp_path / "jobs" / job_id / "output" / "analysis.json"
+    analysis_path.parent.mkdir(parents=True, exist_ok=True)
+    analysis_path.write_text(analysis.model_dump_json(), encoding="utf-8")
+    state = manager._read(job_id)
+    state["v2"]["analysis_relative"] = "output/analysis.json"
+    manager._write(state)
+    ids = [str(item["track_id"]) for item in tracks]
+    return job_id, str(input_path), ids
+
+
+def test_instrumental_export_registers_service_outputs_and_preserves_override_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path)
+    manager.select_v2(job_id, ids)
+    state = manager._read(job_id)
+    state.update({"status": "running", "phase": "rendering"})
+    manager._write(state)
+
+    manager.v2._run_instrumental_export(job_id)
+
+    result = manager._read(job_id)
+    assert result["status"] == "completed"
+    assert FakeHighAccuracyService.calls == [{"instrument_id": ids[0], "variant": "instrument-part", "is_drum": False}]
+    kinds = {item["kind"] for item in result["artifacts"]}
+    assert {"instrument_score_midi", "instrument_performance_midi", "instrument_musicxml", "instrument_score_json", "high_accuracy_manifest"} <= kinds
+    assert result["summary"]["overrides"]["sources"]["bpm"] == "beatnet"
+    assert result["summary"]["overrides"]["bpm_manual"] is False
+    assert any(item["kind"] == "instrument_preview_midi" for item in result["artifacts"])
+    assert not any(item["kind"] == "instrument_midi" for item in result["artifacts"])
+
+
+def test_instrumental_partial_failure_keeps_success_and_records_stage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path, two_tracks=True)
+    FakeHighAccuracyService.failures = {ids[0]}
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
+    manager.select_v2(job_id, ids)
+    manager._run_job(job_id)
+
+    result = manager._read(job_id)
+    failures = result["v2"]["track_failures"]
+    assert result["status"] == "completed"
+    assert failures[0]["track_id"] == ids[0]
+    assert failures[0]["stage"] == "service"
+    assert ids[1] in result["summary"]["successful_pitched_track_ids"]
+    assert any(item["artifact_id"].startswith(f"v2-selection-r1-{ids[1]}-") for item in result["artifacts"])
+
+
+def test_instrumental_all_pitched_failure_is_explicit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path)
+    FakeHighAccuracyService.failures = {ids[0]}
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
+    manager.select_v2(job_id, ids)
+    manager._run_job(job_id)
+    result = manager._read(job_id)
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "high_accuracy_all_tracks_failed"
+    assert result["v2"]["score_refusal"]["code"] == "all_pitched_tracks_failed"
+
+
+def test_drum_only_export_stays_midi_only_without_notation_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    FakeHighAccuracyService.calls = []
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
+    manager = JobManager(tmp_path / "jobs")
+    job_id, input_path = manager.create_v2_job(original_name="drums.wav", source_kind="instrumental", title="drums")
+    input_path.write_bytes(b"fixture")
+    track_id = stable_track_id("drums", 128, True)
+    manager._update(
+        job_id,
+        status="selection_ready",
+        phase="selection_ready",
+        progress=1.0,
+        v2={
+            "stage": "selection_ready",
+            "source_kind": "instrumental",
+            "tracks": [{"track_id": track_id, "instrument_group": "drums", "program": 128, "is_drum": True, "label_zh": "鼓组"}],
+            "notes": [{"instrument_group": "drums", "program": 128, "is_drum": True, "pitch": 36, "start_sec": 0.1, "end_sec": 0.2}],
+            "analysis": {"bpm": 120, "key": "C", "time_signature": "4/4"},
+            "selection_revision": 0,
+            "selection": None,
+            "selection_history": [],
+            "score_refusal": None,
+        },
+    )
+    manager.select_v2(job_id, [track_id])
+    state = manager._read(job_id)
+    state.update({"status": "running", "phase": "rendering"})
+    manager._write(state)
+
+    manager.v2._run_instrumental_export(job_id)
+
+    result = manager._read(job_id)
+    assert result["status"] == "completed"
+    assert result["v2"]["score_refusal"]["code"] == "no_pitched_tracks"
+    assert FakeHighAccuracyService.calls == []
+    assert any(item["artifact_id"] == "v2-selection-r1-midi" for item in result["artifacts"])
+
+
+def test_vocal_generation_persists_raw_cleanup_and_service_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
+    manager = JobManager(tmp_path / "jobs")
+    job_id, input_path = manager.create_v2_job(original_name="voice.wav", source_kind="vocal", title="voice")
+    input_path.write_bytes(b"fixture")
+    job_dir = tmp_path / "jobs" / job_id
+    vocal_path = job_dir / "output" / "vocal-prep" / "vocals.wav"
+    vocal_path.parent.mkdir(parents=True, exist_ok=True)
+    vocal_path.write_bytes(b"stem")
+    analysis = _analysis()
+    analysis_path = job_dir / "output" / "vocal-prep" / "original-analysis.json"
+    analysis_path.write_text(analysis.model_dump_json(), encoding="utf-8")
+    state = manager._read(job_id)
+    state.update(
+        {
+            "status": "running",
+            "phase": "recognizing",
+            "v2": {
+                **state["v2"],
+                "stage": "vocal_generate",
+                "separation": {
+                    "prepared_vocals_relative": "output/vocal-prep/vocals.wav",
+                    "analysis_relative": "output/vocal-prep/original-analysis.json",
+                },
+            },
+        }
+    )
+    manager._write(state)
+    raw = [
+        NoteEvent(start_sec=0.0, end_sec=0.20, midi=60, raw_pitch=60.02, source="game"),
+        NoteEvent(start_sec=0.205, end_sec=0.50, midi=60, raw_pitch=59.98, source="game"),
+    ]
+    monkeypatch.setattr(
+        "backend.v2_job_manager.run_engine",
+        lambda *_args, **_kwargs: EngineResult(events=raw, engine="game", model="GAME"),
+    )
+
+    manager.v2._run_vocal_generation(job_id)
+
+    result = manager._read(job_id)
+    assert result["status"] == "completed"
+    assert FakeHighAccuracyService.calls == [{"instrument_id": "vocals", "variant": "game-cleaned", "is_drum": False}]
+    artifact_ids = {item["artifact_id"] for item in result["artifacts"]}
+    assert {"v2-vocal-game-raw-notes", "v2-vocal-game-cleaned-notes", "v2-vocal-game-cleanup-report", "v2-vocal-analysis-cleaned"} <= artifact_ids
+    assert any(item["kind"] == "vocal_score_midi" for item in result["artifacts"])
+    assert result["v2"]["generation"]["analysis_reused_from_original"] is True
+    assert result["summary"]["raw_note_count"] == 2
+    assert result["summary"]["note_count"] == 1
+
+
+@pytest.mark.skipif(not REAL_READY, reason="pinned high-accuracy toolchain is unavailable")
+def test_v2_instrumental_real_musescore_stage56_class_bundle(tmp_path: Path) -> None:
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path)
+    state = manager._read(job_id)
+    state["v2"]["notes"][0].update({"start_sec": 0.0, "end_sec": 0.5})
+    manager._write(state)
+    manager.select_v2(job_id, ids)
+    state = manager._read(job_id)
+    state.update({"status": "running", "phase": "rendering"})
+    manager._write(state)
+
+    manager.v2._run_instrumental_export(job_id)
+
+    result = manager._read(job_id)
+    assert result["status"] == "completed"
+    assert any(item["kind"] == "instrument_score_midi" for item in result["artifacts"])
+    assert any(item["kind"] == "instrument_musicxml" for item in result["artifacts"])
+    assert any(item["kind"] == "instrument_score_svg_long" for item in result["artifacts"])

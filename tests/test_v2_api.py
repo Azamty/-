@@ -7,7 +7,8 @@ from types import MethodType
 import mido
 import pytest
 
-from backend.jianpu_score.domain import MusicAnalysis, NoteEvent, Score, ScoreNote, ScoreVoice
+from backend.jianpu_score.domain import MusicAnalysis, NoteEvent
+from backend.jianpu_score.high_accuracy_service import HighAccuracyBuildResult
 from backend.jianpu_score.models.adapter import EngineResult
 from backend.job_manager import JobManager
 from backend.muscriptor_v2 import stable_track_id
@@ -88,6 +89,9 @@ def test_v2_selection_is_a_persistent_revision_snapshot(tmp_path: Path) -> None:
     assert persisted["v2"]["selection"]["bpm_override"] == 96
     assert persisted["v2"]["selection"]["key_override"] == "Am"
     assert persisted["v2"]["selection"]["time_signature_override"] == "6/8"
+    assert persisted["v2"]["selection"]["bpm_override_explicit"] is True
+    assert persisted["v2"]["selection"]["key_override_explicit"] is True
+    assert persisted["v2"]["selection"]["time_signature_override_explicit"] is True
 
 
 def test_v2_selection_uses_music_analysis_suggestion_when_unmodified(tmp_path: Path) -> None:
@@ -238,6 +242,13 @@ def test_v2_vocal_separation_then_game_reuses_only_vocals_stem(monkeypatch, tmp_
         sample_rate=16000,
         duration_sec=1.0,
         bpm=120,
+        beat_times=[0.0, 0.5, 1.0, 1.5],
+        metadata={
+            "beat_engine": "beatnet",
+            "beatnet_version": "1.1.3",
+            "beat_source": "beatnet",
+            "beat_grid": {"beats": [{"index": index, "time_sec": index * 0.5, "downbeat": index == 0} for index in range(4)]},
+        },
         note_events=[NoteEvent(start_sec=0, end_sec=0.5, midi=60, source="game")],
     )
     game_calls: list[dict[str, object]] = []
@@ -280,6 +291,27 @@ def test_v2_vocal_separation_then_game_reuses_only_vocals_stem(monkeypatch, tmp_
         return EngineResult(events=[NoteEvent(start_sec=0, end_sec=0.5, midi=60, source="game")], engine="game", model="GAME")
 
     monkeypatch.setattr("backend.v2_job_manager.run_engine", fake_game)
+    class FakeHighAccuracyService:
+        def build(self, **kwargs: object) -> HighAccuracyBuildResult:
+            output_dir = Path(str(kwargs["output_dir"])).resolve()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            manifest = output_dir / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            return HighAccuracyBuildResult(
+                instrument_id=str(kwargs["instrument_id"]),
+                title=str(kwargs["title"]),
+                variant=str(kwargs["variant"]),
+                program=int(kwargs["program"]),
+                is_drum=False,
+                status="completed",
+                jianpu_status="completed",
+                output_dir=output_dir,
+                manifest_path=manifest,
+                artifacts=(),
+                performance_metadata={},
+            )
+
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
     monkeypatch.setattr("backend.v2_job_manager.render_score", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(manager, "_package_artifacts", lambda *_args: [])
     manager.v2._run_vocal_generation(job_id)

@@ -78,6 +78,16 @@ def safe_filename(value: str, fallback: str = "audio") -> str:
 
 
 def _error_payload(exc: Exception) -> dict[str, str]:
+    high_accuracy_stage = getattr(exc, "stage", None)
+    if high_accuracy_stage:
+        instrument_id = getattr(exc, "instrument_id", "unknown")
+        cause = getattr(exc, "cause", str(exc))
+        return {
+            "code": "high_accuracy_failed",
+            "message": f"高精度处理失败（{instrument_id}/{high_accuracy_stage}）：{cause}",
+            "instrument_id": str(instrument_id),
+            "stage": str(high_accuracy_stage),
+        }
     if isinstance(exc, NoNotesError):
         return {
             "code": "no_notes",
@@ -478,8 +488,11 @@ class JobManager:
                     selections = output / "selections"
                     if selections.is_symlink() or (selections.exists() and selections.resolve().parent != output):
                         raise ValueError("invalid V2 selection output path")
-                    if selections.exists():
-                        shutil.rmtree(selections)
+                    # Keep prior revisions and any diagnostics on retry.  The
+                    # high-accuracy service owns each revision/track bundle
+                    # and will only overwrite a matching manifest; deleting
+                    # the whole selections tree here could remove an unknown
+                    # file supplied by a caller.
                     state["artifacts"] = [
                         item for item in state.get("artifacts", [])
                         if not str(item.get("artifact_id", "")).startswith("v2-selection-")
@@ -492,15 +505,9 @@ class JobManager:
                     preparation = output / "vocal-prep"
                     if preparation.is_symlink() or (preparation.exists() and preparation.resolve().parent != output):
                         raise ValueError("invalid V2 vocal preparation path")
-                    for child in list(output.iterdir()):
-                        if child == preparation:
-                            continue
-                        if child.is_symlink() or (child.is_dir() and child.resolve().parent != output):
-                            raise ValueError("invalid V2 vocal generation output path")
-                        if child.is_dir():
-                            shutil.rmtree(child)
-                        else:
-                            child.unlink(missing_ok=True)
+                    # Preserve prior GAME/raw/cleanup/service diagnostics. A
+                    # retry gets a new attempt directory and never needs to
+                    # delete unknown files from the output root.
                     retained_ids = {"v2-source-audio", "v2-vocals-audio", "v2-vocal-analysis", "v2-beat-grid"}
                     state["artifacts"] = [item for item in state.get("artifacts", []) if str(item.get("artifact_id")) in retained_ids]
                     retained_artifacts = list(state["artifacts"])

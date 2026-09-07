@@ -9,23 +9,30 @@ ticks.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
+import itertools
 import json
 import math
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 import mido
 
 from .domain import MusicAnalysis, NoteEvent, normalize_key, normalize_time_signature
 from .quantize import _build_beat_mapper
 
-
 PERFORMANCE_TICKS_PER_QUARTER = 480
 PERFORMANCE_SCHEMA_VERSION = "1.0"
 DEFAULT_VELOCITY = 80
 DRUM_CHANNEL = 9  # MIDI channel 10 in one-based terminology.
+
+
+def _midi_text(value: str) -> str:
+    """Keep track names encodable by the SMF latin-1 text convention."""
+
+    return str(value).encode("ascii", "replace").decode("ascii")
 
 
 @dataclass(frozen=True)
@@ -83,7 +90,7 @@ def _midi_key(value: str) -> str:
 
 
 def _default_track_id(instrument_group: str, program: int, is_drum: bool) -> str:
-    identity = f"{instrument_group}|{program}|{int(is_drum)}".encode("utf-8")
+    identity = f"{instrument_group}|{program}|{int(is_drum)}".encode()
     return "track-" + hashlib.sha1(identity).hexdigest()[:12]
 
 
@@ -113,7 +120,7 @@ def _score_origin_audio_seconds(mapper: Any) -> float:
     if raw_position >= len(times) - 1:
         interval = times[-1] - times[-2]
         return float(times[-1] + (raw_position - (len(times) - 1)) * interval)
-    left = int(math.floor(raw_position))
+    left = math.floor(raw_position)
     fraction = raw_position - left
     return float(times[left] + fraction * (times[left + 1] - times[left]))
 
@@ -128,11 +135,11 @@ def _tempo_points(mapper: Any) -> list[tuple[int, int, float]]:
 
     if mapper.fixed or len(mapper.beat_times) < 2:
         bpm = _finite_positive(mapper.bpm, label="BPM")
-        return [(0, int(round(mido.bpm2tempo(bpm))), bpm)]
+        return [(0, round(mido.bpm2tempo(bpm)), bpm)]
     times = mapper.beat_times
     scale = float(mapper.beat_scale)
     shift = float(mapper.shift_beats)
-    intervals = [right - left for left, right in zip(times, times[1:])]
+    intervals = [right - left for left, right in itertools.pairwise(times)]
     if any(interval <= 0 for interval in intervals):
         raise ValueError("beat times must be strictly increasing")
 
@@ -140,8 +147,8 @@ def _tempo_points(mapper: Any) -> list[tuple[int, int, float]]:
     for index, interval in enumerate(intervals):
         bpm = _finite_positive(60.0 * scale / interval, label="tempo map BPM")
         score_beat = index * scale + shift
-        tick = int(round(score_beat * PERFORMANCE_TICKS_PER_QUARTER))
-        raw.append((tick, int(round(mido.bpm2tempo(bpm))), bpm))
+        tick = round(score_beat * PERFORMANCE_TICKS_PER_QUARTER)
+        raw.append((tick, round(mido.bpm2tempo(bpm)), bpm))
 
     # MIDI cannot represent negative delta time.  Select the tempo interval
     # that contains score zero after applying the explicit score origin, then
@@ -149,7 +156,7 @@ def _tempo_points(mapper: Any) -> list[tuple[int, int, float]]:
     # when the first detected downbeat is a later BeatNet beat: the interval
     # before that downbeat must not become the playback tempo at tick zero.
     raw_origin_position = -shift / scale if scale else 0.0
-    base_index = max(0, min(len(raw) - 1, int(math.floor(raw_origin_position))))
+    base_index = max(0, min(len(raw) - 1, math.floor(raw_origin_position)))
     points: dict[int, tuple[int, float]] = {0: (raw[base_index][1], raw[base_index][2])}
     for tick, tempo, bpm in raw:
         if tick <= 0:
@@ -184,8 +191,8 @@ def _absolute_note_ticks(
     for index, note in enumerate(notes):
         start_beat = float(mapper.seconds_to_beat(note.start_sec))
         end_beat = float(mapper.seconds_to_beat(note.end_sec))
-        start_tick = max(0, int(round(start_beat * PERFORMANCE_TICKS_PER_QUARTER)))
-        end_tick = max(start_tick + 1, int(round(end_beat * PERFORMANCE_TICKS_PER_QUARTER)))
+        start_tick = max(0, round(start_beat * PERFORMANCE_TICKS_PER_QUARTER))
+        end_tick = max(start_tick + 1, round(end_beat * PERFORMANCE_TICKS_PER_QUARTER))
         mapped.append(
             {
                 "index": index,
@@ -215,7 +222,7 @@ def _write_track_messages(
     is_drum: bool,
 ) -> mido.MidiTrack:
     track = mido.MidiTrack()
-    track.append(mido.MetaMessage("track_name", name=title, time=0))
+    track.append(mido.MetaMessage("track_name", name=_midi_text(title), time=0))
     if not is_drum:
         track.append(mido.Message("program_change", channel=channel, program=program, time=0))
     events: list[tuple[int, int, int, mido.Message]] = []
@@ -260,7 +267,7 @@ def _write_conductor_track(
 ) -> mido.MidiTrack:
     numerator, denominator = (int(value) for value in normalize_time_signature(analysis.time_signature).split("/"))
     track = mido.MidiTrack()
-    track.append(mido.MetaMessage("track_name", name=title, time=0))
+    track.append(mido.MetaMessage("track_name", name=_midi_text(title), time=0))
     track.append(
         mido.MetaMessage(
             "time_signature",

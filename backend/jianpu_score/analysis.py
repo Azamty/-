@@ -266,6 +266,7 @@ def analyze_audio(
             "ffprobe": os.fspath(resolve_ffprobe()) if resolve_ffprobe() else None,
             "probe": probe,
             "beat_source": beat_source,
+            "beat_engine": "beatnet",
             "beatnet_version": beat_grid.get("beatnet", {}).get("version", "1.1.3"),
             "beatnet_mode": beat_grid.get("mode", "offline"),
             "beatnet_inference": beat_grid.get("inference", "DBN"),

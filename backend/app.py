@@ -485,7 +485,14 @@ def create_app(
         artifacts = manager.list_artifacts(job_id)
         score_artifact = next((item for item in reversed(artifacts) if item.get("artifact_id") == "score-json"), None)
         if score_artifact is None:
-            score_artifact = next((item for item in reversed(artifacts) if item.get("kind") == "instrument_score_json"), None)
+            score_artifact = next(
+                (
+                    item
+                    for item in reversed(artifacts)
+                    if item.get("kind") in {"instrument_score_json", "vocal_score_json", "main_melody_score_json"}
+                ),
+                None,
+            )
         if score_artifact is None:
             refusal = (manager.get(job_id).get("v2") or {}).get("score_refusal")
             detail = refusal or {"code": "score_not_found", "message": "当前选择没有可下载的简谱"}
