@@ -28,7 +28,7 @@ import mido
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_OUTPUT = ROOT / ".cache" / "high-accuracy-benchmarks" / "runs"
-RUNNER_SCHEMA_VERSION = "1.0"
+RUNNER_SCHEMA_VERSION = "1.1"
 PRODUCTION_RECOGNIZER_VERSION = "1.0"
 
 Adapter = Callable[[Mapping[str, Any], Mapping[str, Any], Path], Mapping[str, Any]]
@@ -96,6 +96,104 @@ def _pipeline_roots(result_root: Path, baseline_root: Path | None, new_root: Pat
     if baseline in {result, new} or new == result:
         raise ValueError("baseline, new, and raw result roots must be independent")
     return baseline, new
+
+
+def _recognizer_identity(recognizer: Adapter | None) -> dict[str, Any]:
+    """Return the stable identity that owns an immutable raw payload."""
+
+    if recognizer is None:
+        return {"mode": "unconfigured", "implementation": "none", "version": RUNNER_SCHEMA_VERSION}
+    declared = getattr(recognizer, "recognizer_identity", None)
+    if callable(declared):
+        declared = declared()
+    if isinstance(declared, Mapping):
+        identity = dict(declared)
+    else:
+        implementation = getattr(recognizer, "__qualname__", type(recognizer).__qualname__)
+        module = getattr(recognizer, "__module__", type(recognizer).__module__)
+        identity = {"mode": "custom", "implementation": f"{module}.{implementation}", "version": RUNNER_SCHEMA_VERSION}
+    identity.setdefault("mode", "custom")
+    identity.setdefault("version", RUNNER_SCHEMA_VERSION)
+    return identity
+
+
+def _recognizer_provenance(recognizer: Adapter | None) -> dict[str, Any]:
+    identity = _recognizer_identity(recognizer)
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "mode": str(identity.get("mode") or "custom"),
+        "identity": identity,
+        "fingerprint": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _effective_evaluation_scope(case: Mapping[str, Any], raw: Mapping[str, Any]) -> str:
+    """Derive the claim scope from recognition provenance, not registry intent."""
+
+    provenance = raw.get("provenance")
+    provenance = provenance if isinstance(provenance, Mapping) else {}
+    if provenance.get("reference_is_not_model_output") is True or raw.get("model_output") is False:
+        return "quantizer_isolation"
+    if raw.get("model_output") is True or provenance.get("model_output") is True:
+        return "production_end_to_end"
+    declared = provenance.get("effective_evaluation_scope") or provenance.get("evaluation_scope")
+    if isinstance(declared, str) and declared.startswith("quantizer_isolation"):
+        return "quantizer_isolation"
+    return "quantizer_isolation"
+
+
+def _annotate_raw_provenance(
+    raw: Mapping[str, Any],
+    *,
+    case: Mapping[str, Any],
+    recognizer_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Attach immutable runner ownership and effective scope to one raw payload."""
+
+    payload = dict(raw)
+    declared = payload.get("provenance")
+    provenance = dict(declared) if isinstance(declared, Mapping) else {}
+    expected_mode = str(recognizer_provenance["mode"])
+    expected_fingerprint = str(recognizer_provenance["fingerprint"])
+    if provenance.get("recognizer_mode") not in {None, expected_mode} or provenance.get("recognizer_fingerprint") not in {None, expected_fingerprint}:
+        raise ValueError("recognizer payload provenance does not match the requested recognizer identity")
+    effective_scope = _effective_evaluation_scope(case, payload)
+    provenance.update(
+        {
+            "recognizer_mode": expected_mode,
+            "recognizer_identity": dict(recognizer_provenance["identity"]),
+            "recognizer_fingerprint": expected_fingerprint,
+            "model_output": payload.get("model_output") is True,
+            "case_evaluation_scope": case.get("evaluation_scope"),
+            "effective_evaluation_scope": effective_scope,
+        }
+    )
+    payload["provenance"] = provenance
+    return payload
+
+
+def _validate_existing_raw_provenance(
+    raw: Mapping[str, Any],
+    *,
+    case_id: str,
+    recognizer_provenance: Mapping[str, Any],
+) -> None:
+    provenance = raw.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise BatchRunError(case_id, "raw", "existing recognition.json has no recognizer provenance; use a new mode-isolated result root")
+    expected_mode = str(recognizer_provenance["mode"])
+    expected_fingerprint = str(recognizer_provenance["fingerprint"])
+    actual_mode = provenance.get("recognizer_mode")
+    actual_fingerprint = provenance.get("recognizer_fingerprint")
+    if actual_mode != expected_mode or actual_fingerprint != expected_fingerprint:
+        raise BatchRunError(
+            case_id,
+            "raw",
+            "existing recognition.json belongs to a different recognizer "
+            f"(found mode={actual_mode!r}, fingerprint={actual_fingerprint!r}; "
+            f"requested mode={expected_mode!r}, fingerprint={expected_fingerprint!r}); "
+            "use a new mode-isolated result root",
+        )
 
 
 def _reference_isolation_payload(case: Mapping[str, Any], *, root: Path) -> Mapping[str, Any]:
@@ -209,6 +307,16 @@ class ProductionRecognizer:
 
     isolated_process = True
 
+    @property
+    def recognizer_identity(self) -> Mapping[str, Any]:
+        return {
+            "mode": "production",
+            "implementation": "MuScriptor+Demucs+GAME+BeatNet",
+            "version": PRODUCTION_RECOGNIZER_VERSION,
+            "demucs_model": self.demucs_model or "htdemucs",
+            "beat_route": "original_mix_once",
+        }
+
     def __init__(self, *, timeout_sec: float = 1800.0, demucs_model: str | None = None) -> None:
         self.timeout_sec = float(timeout_sec)
         self.demucs_model = demucs_model
@@ -274,6 +382,21 @@ class ProductionRecognizer:
         return raw
 
 
+class ReferenceIsolationRecognizer:
+    """Build raw from reference MIDI for quantizer diagnostics only."""
+
+    @property
+    def recognizer_identity(self) -> Mapping[str, Any]:
+        return {
+            "mode": "reference-isolation",
+            "implementation": "reference-midi-quantizer-isolation",
+            "version": "1.0",
+        }
+
+    def __call__(self, case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        return _reference_isolation_payload(case, root=ROOT)
+
+
 def _analysis_and_events_from_raw(raw: Mapping[str, Any], case: Mapping[str, Any]):
     """Build the production domain objects required by either score chain.
 
@@ -312,7 +435,27 @@ def _analysis_and_events_from_raw(raw: Mapping[str, Any], case: Mapping[str, Any
         else:
             raise ValueError(f"raw note {index} lacks start_sec/end_sec")
         max_end = max(max_end, end_sec)
-        notes.append(NoteEvent(start_sec=start_sec, end_sec=end_sec, midi=int(item["midi"]), confidence=item.get("confidence"), velocity=item.get("velocity"), raw_pitch=item.get("raw_pitch"), voice_id=str(item.get("voice_id", "voice-0")), source=str(item.get("source", "benchmark-raw")), metadata={"raw_index": index}))
+        channel = item.get("channel")
+        is_drum = bool(item.get("is_drum")) or channel is not None and int(channel) == 9
+        notes.append(
+            NoteEvent(
+                start_sec=start_sec,
+                end_sec=end_sec,
+                midi=int(item["midi"]),
+                confidence=item.get("confidence"),
+                velocity=item.get("velocity"),
+                raw_pitch=item.get("raw_pitch"),
+                voice_id=str(item.get("voice_id", "voice-0")),
+                source=str(item.get("source", "benchmark-raw")),
+                metadata={
+                    "raw_index": index,
+                    "is_drum": is_drum,
+                    "channel": channel,
+                    "instrument_group": item.get("instrument_group"),
+                    "program": item.get("program"),
+                },
+            )
+        )
     duration_sec = max(float(analysis_payload.get("duration_sec") or 0.0), max_end, (beat_times[-1] if beat_times else 0.0) + 0.1, 0.1)
     sample_rate = int(analysis_payload.get("sample_rate") or raw.get("sample_rate") or 44_100)
     metadata = dict(analysis_payload.get("metadata") or {})
@@ -322,13 +465,27 @@ def _analysis_and_events_from_raw(raw: Mapping[str, Any], case: Mapping[str, Any
     return analysis, notes
 
 
+def _pitched_events(events: Sequence[Any]) -> list[Any]:
+    """Exclude drum events from numeric notation while retaining raw input."""
+
+    return [event for event in events if not bool(getattr(event, "metadata", {}).get("is_drum"))]
+
+
+def _pitched_analysis(analysis: Any, events: Sequence[Any]) -> Any:
+    return analysis.model_copy(update={"note_events": list(events)})
+
+
 def legacy_baseline_adapter(case: Mapping[str, Any], raw: Mapping[str, Any], destination: Path) -> Mapping[str, Any]:
     """Run the preserved uniform-grid quantizer for baseline comparison only."""
 
     from backend.jianpu_score.quantize import quantize_events
     from backend.jianpu_score.render import render_score
 
-    analysis, events = _analysis_and_events_from_raw(raw, case)
+    analysis, all_events = _analysis_and_events_from_raw(raw, case)
+    events = _pitched_events(all_events)
+    if not events:
+        raise ValueError("raw recognition contains no pitched events after excluding drums")
+    analysis = _pitched_analysis(analysis, events)
     destination = destination.resolve()
     destination.mkdir(parents=True, exist_ok=True)
     score = quantize_events(events, analysis, mode="polyphonic", title=str(case.get("title") or case["id"]))
@@ -348,7 +505,11 @@ def high_accuracy_service_adapter(case: Mapping[str, Any], raw: Mapping[str, Any
 
     from backend.jianpu_score.high_accuracy_service import build_high_accuracy_artifacts
 
-    analysis, events = _analysis_and_events_from_raw(raw, case)
+    analysis, all_events = _analysis_and_events_from_raw(raw, case)
+    events = _pitched_events(all_events)
+    if not events:
+        raise ValueError("raw recognition contains no pitched events after excluding drums")
+    analysis = _pitched_analysis(analysis, events)
     destination = destination.resolve()
     service_output = destination / "service_output"
     source_kind = str(case.get("source_kind"))
@@ -417,12 +578,16 @@ class BenchmarkBatchRunner:
         case_dir = _safe_case_dir(result_root, case_id)
         case_dir.mkdir(parents=True, exist_ok=True)
         baseline_root, new_root = _pipeline_roots(result_root, baseline_result_root, new_result_root)
+        recognizer_provenance = _recognizer_provenance(self.recognizer)
         manifest_path = case_dir / "manifest.json"
         state: dict[str, Any] = {
             "schema_version": RUNNER_SCHEMA_VERSION,
             "case_id": case_id,
             "status": "running",
-            "evaluation_scope": case.get("evaluation_scope"),
+            "evaluation_scope": None,
+            "case_evaluation_scope": case.get("evaluation_scope"),
+            "recognizer_mode": recognizer_provenance["mode"],
+            "recognizer_fingerprint": recognizer_provenance["fingerprint"],
             "raw": None,
             "pipelines": {},
             "pipeline_roots": {"baseline": str(baseline_root), "new": str(new_root)},
@@ -435,6 +600,7 @@ class BenchmarkBatchRunner:
                 raw = json.loads(raw_path.read_text(encoding="utf-8"))
                 if not isinstance(raw, Mapping) or not isinstance(raw.get("notes"), list):
                     raise BatchRunError(case_id, "raw", "existing recognition.json is invalid")
+                _validate_existing_raw_provenance(raw, case_id=case_id, recognizer_provenance=recognizer_provenance)
                 raw_hash = _sha256(raw_path)
             else:
                 if self.recognizer is None:
@@ -442,9 +608,23 @@ class BenchmarkBatchRunner:
                 raw = self._call_with_timeout(self.recognizer, case, {}, raw_dir, "raw")
                 if not isinstance(raw.get("notes"), list) or not isinstance(raw.get("beat_grid"), Mapping):
                     raise BatchRunError(case_id, "raw", "recognizer must return notes[] and beat_grid object")
+                raw = _annotate_raw_provenance(raw, case=case, recognizer_provenance=recognizer_provenance)
                 raw_hash = _write_json_once(raw_path, raw)
+            effective_scope = _effective_evaluation_scope(case, raw)
+            state["evaluation_scope"] = effective_scope
             beat_hash = _write_json_once(raw_dir / "beat_grid.json", raw.get("beat_grid", {}))
-            state["raw"] = {"recognition": "raw/recognition.json", "recognition_sha256": raw_hash, "beat_grid": "raw/beat_grid.json", "beat_grid_sha256": beat_hash, "immutable": True, "model_output": raw.get("model_output") is not False}
+            state["raw"] = {
+                "recognition": "raw/recognition.json",
+                "recognition_sha256": raw_hash,
+                "beat_grid": "raw/beat_grid.json",
+                "beat_grid_sha256": beat_hash,
+                "immutable": True,
+                "model_output": raw.get("model_output") is True,
+                "evaluation_scope": effective_scope,
+                "case_evaluation_scope": case.get("evaluation_scope"),
+                "recognizer_mode": recognizer_provenance["mode"],
+                "recognizer_fingerprint": recognizer_provenance["fingerprint"],
+            }
             if _sha256(raw_path) != raw_hash:
                 raise BatchRunError(case_id, "raw", "raw recognition changed during pipeline")
             for name, adapter, pipeline_root in (
@@ -459,11 +639,28 @@ class BenchmarkBatchRunner:
                         isinstance(existing, Mapping)
                         and existing.get("status") == "success"
                         and existing.get("raw_recognition_sha256") == raw_hash
+                        and existing.get("recognizer_mode") == recognizer_provenance["mode"]
+                        and existing.get("recognizer_fingerprint") == recognizer_provenance["fingerprint"]
+                        and existing.get("effective_evaluation_scope") == effective_scope
                     ):
                         state["pipelines"][name] = existing
                         continue
                 if adapter is None:
-                    failure = {"schema_version": RUNNER_SCHEMA_VERSION, "case_id": case_id, "pipeline": name, "status": "failed", "stage": name, "error": "adapter is not configured; no result fabricated"}
+                    failure = {
+                        "schema_version": RUNNER_SCHEMA_VERSION,
+                        "case_id": case_id,
+                        "pipeline": name,
+                        "status": "failed",
+                        "stage": name,
+                        "error": "adapter is not configured; no result fabricated",
+                        "evaluation_scope": effective_scope,
+                        "effective_evaluation_scope": effective_scope,
+                        "case_evaluation_scope": case.get("evaluation_scope"),
+                        "raw_model_output": raw.get("model_output") is True,
+                        "raw_recognition_sha256": raw_hash,
+                        "recognizer_mode": recognizer_provenance["mode"],
+                        "recognizer_fingerprint": recognizer_provenance["fingerprint"],
+                    }
                     destination.mkdir(parents=True, exist_ok=True)
                     _replace_json(destination / "manifest.json", failure)
                     state["pipelines"][name] = failure
@@ -475,10 +672,14 @@ class BenchmarkBatchRunner:
                     "pipeline": name,
                     "status": "success",
                     "stage": name,
-                    "evaluation_scope": case.get("evaluation_scope"),
+                    "evaluation_scope": effective_scope,
+                    "effective_evaluation_scope": effective_scope,
+                    "case_evaluation_scope": case.get("evaluation_scope"),
                     "source_kind": case.get("source_kind"),
                     "raw_model_output": raw.get("model_output") is True,
                     "raw_recognition_sha256": raw_hash,
+                    "recognizer_mode": recognizer_provenance["mode"],
+                    "recognizer_fingerprint": recognizer_provenance["fingerprint"],
                     "result": result,
                     "final_midi": result.get("final_midi"),
                     "beat_grid": result.get("beat_grid"),
@@ -536,10 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--timeout-sec must be greater than zero")
     recognizer: Adapter | None = None
     if args.reference_isolation:
-        def reference_recognizer(case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
-            return _reference_isolation_payload(case, root=ROOT)
-
-        recognizer = reference_recognizer
+        recognizer = ReferenceIsolationRecognizer()
     elif args.production_recognizer or args.run_legacy_baseline or args.run_new_chain:
         recognizer = ProductionRecognizer(timeout_sec=args.timeout_sec, demucs_model=args.demucs_model)
     runner = BenchmarkBatchRunner(

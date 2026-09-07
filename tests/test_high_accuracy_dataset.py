@@ -5,6 +5,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +91,116 @@ def test_batch_runner_recognizes_once_and_shares_immutable_raw_between_pipelines
     raw = json.loads((tmp_path / "results" / "smoke-case" / "raw" / "recognition.json").read_text(encoding="utf-8"))
     assert raw["notes"] == [{"midi": 60}]
     assert raw["model_output"] is True
+
+
+def _owned_recognizer(mode: str, *, model_output: bool):
+    def recognize(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        return {
+            "source": mode,
+            "model_output": model_output,
+            "notes": [{"midi": 60, "start_sec": 0.0, "end_sec": 0.5}],
+            "beat_grid": {"beats": [{"time_sec": 0.0, "downbeat": True}]},
+        }
+
+    recognize.recognizer_identity = {"mode": mode, "implementation": f"test-{mode}", "version": "1"}
+    return recognize
+
+
+def test_batch_runner_rejects_raw_resume_across_recognizer_modes(tmp_path: Path) -> None:
+    case = {"id": "mode-switch", "evaluation_scope": "quantizer_isolation_fixture"}
+    root = tmp_path / "shared"
+    reference = runner_module.BenchmarkBatchRunner(
+        recognizer=_owned_recognizer("reference-isolation", model_output=False),
+        baseline=None,
+        new_chain=None,
+    )
+    first = reference.run_case(case, result_root=root)
+    assert first["raw"]["recognizer_mode"] == "reference-isolation"
+
+    production = runner_module.BenchmarkBatchRunner(
+        recognizer=_owned_recognizer("production", model_output=True),
+        baseline=None,
+        new_chain=None,
+    )
+    second = production.run_case(case, result_root=root)
+    assert second["status"] == "failed"
+    assert second["error"]["stage"] == "raw"
+    assert "different recognizer" in second["error"]["message"]
+    assert "mode-isolated result root" in second["error"]["message"]
+
+
+def test_batch_runner_derives_effective_scope_from_raw_provenance(tmp_path: Path) -> None:
+    case = {"id": "scope-switch", "evaluation_scope": "quantizer_isolation_fixture"}
+
+    def adapter(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        return {"artifact": "test"}
+
+    reference_root = tmp_path / "reference"
+    reference = runner_module.BenchmarkBatchRunner(
+        recognizer=_owned_recognizer("reference-isolation", model_output=False),
+        baseline=adapter,
+        new_chain=adapter,
+    )
+    reference_outcome = reference.run_case(case, result_root=reference_root)
+    assert reference_outcome["evaluation_scope"] == "quantizer_isolation"
+    reference_manifest = json.loads((reference_root / "scope-switch" / "manifest.json").read_text(encoding="utf-8"))
+    assert reference_manifest["evaluation_scope"] == "quantizer_isolation"
+    assert reference_manifest["pipelines"]["new"]["effective_evaluation_scope"] == "quantizer_isolation"
+
+    production_root = tmp_path / "production"
+    production = runner_module.BenchmarkBatchRunner(
+        recognizer=_owned_recognizer("production", model_output=True),
+        baseline=adapter,
+        new_chain=adapter,
+    )
+    production_outcome = production.run_case(case, result_root=production_root)
+    assert production_outcome["evaluation_scope"] == "production_end_to_end"
+    production_manifest = json.loads((production_root / "scope-switch" / "manifest.json").read_text(encoding="utf-8"))
+    assert production_manifest["evaluation_scope"] == "production_end_to_end"
+    assert production_manifest["pipelines"]["new"]["effective_evaluation_scope"] == "production_end_to_end"
+
+
+def test_high_accuracy_adapter_preserves_raw_drums_but_excludes_them_from_notation(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_build(*, events, is_drum, output_dir, **_kwargs):
+        captured["events"] = tuple(events)
+        captured["is_drum"] = is_drum
+        output_dir.mkdir(parents=True, exist_ok=True)
+        final_midi = output_dir / "score.mid"
+        final_midi.write_bytes(b"midi")
+        manifest = output_dir / "manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        artifact = SimpleNamespace(as_dict=lambda: {"kind": "score_midi", "relative_path": "score.mid"})
+        return SimpleNamespace(
+            artifacts=(artifact,),
+            manifest_path=manifest,
+            status="completed",
+            jianpu_status="completed",
+        )
+
+    import backend.jianpu_score.high_accuracy_service as service
+
+    monkeypatch.setattr(service, "build_high_accuracy_artifacts", fake_build)
+    raw = {
+        "notes": [
+            {"midi": 60, "start_sec": 0.0, "end_sec": 0.5, "is_drum": False},
+            {"midi": 36, "start_sec": 0.0, "end_sec": 0.25, "is_drum": True, "channel": 9},
+        ],
+        "beat_grid": {"beats": [{"time_sec": 0.0}, {"time_sec": 0.5}]},
+        "analysis": {"bpm": 120.0, "time_signature": "4/4", "key": "C", "metadata": {"beat_engine": "beatnet", "beatnet_version": "1.1.3"}},
+    }
+    analysis, all_events = runner_module._analysis_and_events_from_raw(raw, {"id": "drum-filter"})
+    assert len(all_events) == 2
+    assert all_events[1].metadata["is_drum"] is True
+    result = runner_module.high_accuracy_service_adapter(
+        {"id": "drum-filter", "source_kind": "instrumental"},
+        raw,
+        tmp_path / "new",
+    )
+    assert result["final_midi"]
+    assert captured["is_drum"] is False
+    assert [event.midi for event in captured["events"]] == [60]
 
 
 def test_batch_runner_records_unconfigured_pipeline_without_fabricating_success(tmp_path: Path) -> None:

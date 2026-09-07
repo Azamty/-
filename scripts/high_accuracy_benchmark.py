@@ -78,7 +78,7 @@ def _load_registry(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _midi_notes(path: Path) -> tuple[int, list[MidiNote]]:
+def _midi_notes(path: Path, *, exclude_drum_channel: bool = False) -> tuple[int, list[MidiNote]]:
     midi = mido.MidiFile(path)
     notes: list[MidiNote] = []
     for track in midi.tracks:
@@ -86,10 +86,13 @@ def _midi_notes(path: Path) -> tuple[int, list[MidiNote]]:
         active: dict[tuple[int, int], list[int]] = defaultdict(list)
         for message in track:
             tick += int(message.time)
+            channel = int(getattr(message, "channel", 0))
+            if exclude_drum_channel and channel == 9 and message.type in {"note_on", "note_off"}:
+                continue
             if message.type == "note_on" and message.velocity > 0:
-                active[(int(getattr(message, "channel", 0)), int(message.note))].append(tick)
+                active[(channel, int(message.note))].append(tick)
             elif message.type in {"note_off", "note_on"}:
-                key = (int(getattr(message, "channel", 0)), int(message.note))
+                key = (channel, int(message.note))
                 starts = active.get(key, [])
                 if starts:
                     start = starts.pop(0)
@@ -283,6 +286,26 @@ def _find_result_artifact(result_root: Path, manifest: Mapping[str, Any], suffix
     return unique[0] if len(unique) == 1 else None
 
 
+def _manifest_effective_scope(manifest: Mapping[str, Any], *, raw_model_output: bool | None) -> str:
+    """Read the scope selected by the runner, with a safe legacy fallback."""
+
+    owners: list[Mapping[str, Any]] = [manifest]
+    nested = manifest.get("result")
+    if isinstance(nested, Mapping):
+        owners.append(nested)
+    for owner in owners:
+        value = owner.get("effective_evaluation_scope")
+        if isinstance(value, str) and value.strip():
+            return value
+    if raw_model_output is not None:
+        return "production_end_to_end" if raw_model_output is True else "quantizer_isolation"
+    for owner in owners:
+        value = owner.get("evaluation_scope")
+        if isinstance(value, str) and value.strip():
+            return value
+    return "quantizer_isolation"
+
+
 def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {
         "id": str(case["id"]),
@@ -297,6 +320,8 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         "reference_midi_reliable": bool(case.get("reference_midi_reliable", False)),
         "beat_annotation": _file_record(case.get("beat_annotation"), required=False),
         "evaluation_policy": case.get("evaluation_policy", "reference_metrics"),
+        "evaluation_scope": case.get("evaluation_scope"),
+        "case_evaluation_scope": case.get("evaluation_scope"),
         "status": "registered",
         "crash": None,
         "metrics": {"pitch_f1": None, "chord_retention": None, "rhythm_error": None, "beat_f1": None, "downbeat_f1": None},
@@ -320,6 +345,12 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         if failed:
             result.update({"status": "crashed", "reason": manifest.get("error", "service manifest reports failure")})
             return result
+        raw_model_output = manifest.get("raw_model_output")
+        if raw_model_output is None and isinstance(manifest.get("result"), Mapping):
+            raw_model_output = manifest["result"].get("raw_model_output")
+        raw_model_output = raw_model_output if isinstance(raw_model_output, bool) else None
+        effective_scope = _manifest_effective_scope(manifest, raw_model_output=raw_model_output)
+        result["evaluation_scope"] = effective_scope
         if result["evaluation_policy"] != "reference_metrics" or not result["reference_midi_reliable"]:
             result.update({"status": "integrity_only", "reason": "此样本没有可用于准确率结论的可靠参考标注"})
             return result
@@ -329,8 +360,8 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         if predicted_path is None or reference_path is None or not reference_path.is_file():
             result.update({"status": "not_evaluated", "reason": "final MIDI or reliable reference is unavailable"})
             return result
-        pred_ppq, predicted = _midi_notes(predicted_path)
-        ref_ppq, reference = _midi_notes(reference_path)
+        pred_ppq, predicted = _midi_notes(predicted_path, exclude_drum_channel=True)
+        ref_ppq, reference = _midi_notes(reference_path, exclude_drum_channel=True)
         # _midi_notes already converts each SMF's integer ticks to exact
         # quarter-note Fractions.  The tolerance is therefore independent of
         # whether one file uses 96, 480, or another PPQ.
@@ -344,16 +375,14 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         }
         result.update({"status": "evaluated", "result_midi": str(predicted_path), "reference_ppq": ref_ppq, "result_ppq": pred_ppq})
         beat_path = _resolve_path(case.get("beat_annotation"))
-        scope = str(case.get("evaluation_scope") or "")
+        scope = str(effective_scope or "")
+        case_scope = str(case.get("evaluation_scope") or "")
         reference_derived = (
-            "reference_derived" in scope
+            "reference_derived" in case_scope
             or str(case.get("beat_annotation_source") or "").casefold() in {"reference_midi", "reference-derived", "same_reference"}
         )
         quantizer_isolation = scope.startswith("quantizer_isolation")
-        raw_model_output = manifest.get("raw_model_output")
-        if raw_model_output is None and isinstance(manifest.get("result"), Mapping):
-            raw_model_output = manifest["result"].get("raw_model_output")
-        beat_eligible = bool(beat_path) and not reference_derived and not quantizer_isolation and case.get("beat_annotation_independent", True) is not False and raw_model_output is not False
+        beat_eligible = bool(beat_path) and not reference_derived and not quantizer_isolation and case.get("beat_annotation_independent") is True and raw_model_output is True
         result["beat_metrics_eligible"] = beat_eligible
         if not beat_path:
             result["beat_metrics_reason"] = "beat annotation unavailable"
@@ -361,9 +390,9 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
             result["beat_metrics_reason"] = "beat annotation is derived from the reference MIDI; excluded from independent BeatNet F1"
         elif quantizer_isolation:
             result["beat_metrics_reason"] = "quantizer-isolation case; beat grid is not an independent production recognition result"
-        elif raw_model_output is False:
+        elif raw_model_output is not True:
             result["beat_metrics_reason"] = "result manifest is reference-derived rather than model output"
-        elif not beat_eligible:
+        elif case.get("beat_annotation_independent") is not True:
             result["beat_metrics_reason"] = "case does not declare an independent beat annotation"
         if beat_eligible:
             predicted_beat_path = _find_result_artifact(case_root, manifest, ("beat_grid.json",))
@@ -552,16 +581,11 @@ def assess_accuracy_claim(
                 _include_scopes=False,
             )
         if production_cases:
-            production_requires_beats = any(
-                case.get("beat_metrics_eligible") is True
-                or _metric_f1(case, "beat_f1", "f1") is not None
-                for case in production_cases
-            )
             scopes["production_end_to_end_subset"] = assess_accuracy_claim(
                 production_cases,
                 production_baseline,
                 minimum_cases=len(production_cases),
-                require_beat_metrics=production_requires_beats,
+                require_beat_metrics=True,
                 _include_scopes=False,
             )
         result["scopes"] = scopes
@@ -585,18 +609,34 @@ def build_report(
         if baseline_root is not None
         else None
     )
-    claim = assess_accuracy_claim(cases, baseline_cases)
-    scoped_claims = claim.get("scopes", {})
-    accuracy_ready = (
-        all(item.get("ready") is True for item in scoped_claims.values())
-        if scoped_claims
-        else claim["ready"]
+    production_cases = [
+        case
+        for case in cases
+        if str(case.get("evaluation_scope") or "").startswith("production_end_to_end")
+    ]
+    production_baseline = (
+        [
+            case
+            for case in baseline_cases
+            if str(case.get("evaluation_scope") or "").startswith("production_end_to_end")
+        ]
+        if baseline_cases is not None
+        else None
     )
-    accuracy_reason = (
-        "; ".join(f"{name}: {value.get('reason')}" for name, value in scoped_claims.items())
-        if scoped_claims and not accuracy_ready
-        else claim["reason"]
+    # The acceptance gate is always the shared 30-case production gate.  The
+    # quantizer and production subset claims below are diagnostics and cannot
+    # make a partial or reference-derived run acceptable.
+    claim = assess_accuracy_claim(
+        production_cases,
+        production_baseline,
+        minimum_cases=30,
+        require_beat_metrics=True,
+        _include_scopes=False,
     )
+    diagnostic_claim = assess_accuracy_claim(cases, baseline_cases)
+    scoped_claims = diagnostic_claim.get("scopes", {})
+    accuracy_ready = claim["ready"]
+    accuracy_reason = claim["reason"]
     return {
         "schema_version": "2.0",
         "registry": str(DEFAULT_REGISTRY),

@@ -94,6 +94,23 @@ def test_beat_grid_time_sec_and_downbeat_metrics_are_read_correctly(tmp_path: Pa
     assert benchmark.beat_f1([0.0, 1.0], [0.0, 1.0])["f1"] == 1.0
 
 
+def test_numeric_midi_metrics_ignore_general_midi_drum_channel(tmp_path: Path) -> None:
+    path = tmp_path / "mixed.mid"
+    midi = mido.MidiFile(ticks_per_beat=480)
+    pitched = mido.MidiTrack()
+    pitched.append(mido.Message("note_on", channel=0, note=60, velocity=80, time=0))
+    pitched.append(mido.Message("note_off", channel=0, note=60, velocity=0, time=480))
+    drums = mido.MidiTrack()
+    drums.append(mido.Message("note_on", channel=9, note=36, velocity=80, time=0))
+    drums.append(mido.Message("note_off", channel=9, note=36, velocity=0, time=480))
+    midi.tracks.extend((pitched, drums))
+    midi.save(path)
+    _, all_notes = benchmark._midi_notes(path)
+    _, pitched_notes = benchmark._midi_notes(path, exclude_drum_channel=True)
+    assert {note[0] for note in all_notes} == {36, 60}
+    assert [note[0] for note in pitched_notes] == [60]
+
+
 def test_downbeat_reader_does_not_treat_unmarked_beats_as_downbeats(tmp_path: Path) -> None:
     beat_grid = tmp_path / "beat_grid.json"
     beat_grid.write_text(
@@ -171,6 +188,58 @@ def test_reference_derived_pjs_beats_are_excluded_from_beatnet_f1(tmp_path: Path
     assert "reference MIDI" in evaluated["beat_metrics_reason"]
 
 
+def test_evaluator_uses_selected_manifest_scope_over_static_case_scope(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.mid"
+    _write_midi(reference)
+    input_audio = tmp_path / "input.wav"
+    input_audio.write_bytes(b"fixture")
+    beat_annotation = tmp_path / "independent-beats.json"
+    beat_annotation.write_text(json.dumps({"beat_grid": {"beats": [{"time_sec": 0.0, "downbeat": True}]}}), encoding="utf-8")
+    case = {
+        "id": "scope-case",
+        "title": "scope",
+        "input": str(input_audio),
+        "reference_midi": str(reference),
+        "reference_midi_reliable": True,
+        "beat_annotation": str(beat_annotation),
+        "beat_annotation_independent": True,
+        "evaluation_policy": "reference_metrics",
+        "evaluation_scope": "quantizer_isolation_fixture",
+    }
+
+    def write_result(root: Path, *, model_output: bool, scope: str) -> None:
+        case_root = root / "scope-case"
+        case_root.mkdir(parents=True)
+        result_midi = case_root / "score.mid"
+        _write_midi(result_midi)
+        beat_grid = case_root / "beat_grid.json"
+        beat_grid.write_text(json.dumps({"beats": [{"time_sec": 0.0, "downbeat": True}]}), encoding="utf-8")
+        (case_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "status": "success",
+                    "effective_evaluation_scope": scope,
+                    "raw_model_output": model_output,
+                    "final_midi": result_midi.name,
+                    "beat_grid": beat_grid.name,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    production_root = tmp_path / "production"
+    reference_root = tmp_path / "reference-results"
+    write_result(production_root, model_output=True, scope="production_end_to_end")
+    write_result(reference_root, model_output=False, scope="quantizer_isolation")
+    production = benchmark.evaluate_case(case, result_root=production_root)
+    reference_result = benchmark.evaluate_case(case, result_root=reference_root)
+    assert production["evaluation_scope"] == "production_end_to_end"
+    assert production["beat_metrics_eligible"] is True
+    assert reference_result["evaluation_scope"] == "quantizer_isolation"
+    assert reference_result["beat_metrics_eligible"] is False
+    assert reference_result["metrics"]["beat_f1"] is None
+
+
 def test_accuracy_gate_reports_quantizer_and_production_scopes_separately() -> None:
     def case(case_id: str, scope: str, rhythm: float) -> dict[str, object]:
         return {
@@ -193,8 +262,8 @@ def test_accuracy_gate_reports_quantizer_and_production_scopes_separately() -> N
     baseline = [case("quantizer", "quantizer_isolation_fixture", 0.2), case("production", "end_to_end_pitch_rhythm_reference_derived_beats", 0.2)]
     claim = benchmark.assess_accuracy_claim(new, baseline, minimum_cases=2)
     assert claim["scopes"]["quantizer_isolation_overall"]["ready"] is True
-    assert claim["scopes"]["production_end_to_end_subset"]["ready"] is True
-    assert claim["scopes"]["production_end_to_end_subset"]["require_beat_metrics"] is False
+    assert claim["scopes"]["production_end_to_end_subset"]["ready"] is False
+    assert claim["scopes"]["production_end_to_end_subset"]["require_beat_metrics"] is True
 
 
 def test_manual_only_reference_never_becomes_accuracy_result(tmp_path: Path) -> None:
@@ -264,3 +333,43 @@ def test_accuracy_gate_rejects_disjoint_case_ids_even_when_each_side_has_thirty(
     assert disjoint["ready"] is False
     assert disjoint["shared_case_ids"] == []
     assert "相同可靠 case ID" in disjoint["reason"]
+
+
+def test_build_report_requires_thirty_shared_production_cases(monkeypatch) -> None:
+    def evaluated(case_id: str, scope: str, *, beat: float | None) -> dict[str, object]:
+        return {
+            "id": case_id,
+            "status": "evaluated",
+            "crash": False,
+            "evaluation_policy": "reference_metrics",
+            "reference_midi_reliable": True,
+            "evaluation_scope": scope,
+            "beat_metrics_eligible": beat is not None,
+            "metrics": {
+                "pitch_f1": {"f1": 0.9},
+                "chord_retention": {"retention": 0.9},
+                "rhythm_error": {"mean_rhythm_error_quarter": 0.1},
+                "beat_f1": {"f1": beat} if beat is not None else None,
+                "downbeat_f1": {"f1": 0.8} if beat is not None else None,
+            },
+        }
+
+    values = {
+        "quantizer": evaluated("quantizer", "quantizer_isolation", beat=None),
+        "production": evaluated("production", "production_end_to_end", beat=0.9),
+    }
+    baseline_values = {
+        **values,
+        "quantizer": {**values["quantizer"], "metrics": {**values["quantizer"]["metrics"], "rhythm_error": {"mean_rhythm_error_quarter": 0.2}}},
+        "production": {**values["production"], "metrics": {**values["production"]["metrics"], "rhythm_error": {"mean_rhythm_error_quarter": 0.2}}},
+    }
+    monkeypatch.setattr(benchmark, "evaluate_case", lambda case, result_root=None: values[str(case["id"])])
+    report = benchmark.build_report(
+        {"cases": [{"id": "quantizer"}, {"id": "production"}]},
+        baseline_report={"cases": [baseline_values["quantizer"], baseline_values["production"]]},
+    )
+    assert report["accuracy_claim_ready"] is False
+    assert "30" in report["accuracy_claim_reason"]
+    assert report["accuracy_gate"]["new_reliable_count"] == 1
+    assert report["accuracy_gate_scopes"]["quantizer_isolation_overall"]["ready"] is True
+    assert report["accuracy_gate_scopes"]["production_end_to_end_subset"]["ready"] is True

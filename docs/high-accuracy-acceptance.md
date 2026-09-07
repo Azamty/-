@@ -53,14 +53,16 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
 
 没有结果时指标保持 `null`。Luv Letter 的同名 MIDI 只用于首尾和版本核对候选；当前没有可靠音频对齐标注，因此脚本只允许完整性和人工听谱验收，不用于 pitch/rhythm 或“节奏误差下降 20%”结论。仓库不提交受版权保护音频。
 
-批处理编排器是 `scripts/run_high_accuracy_batch.py`。默认的 production route 在独立可终止 worker 中运行：器乐走原曲 MuScriptor + 原曲 BeatNet 一次，人声走原曲 Demucs → GAME → GAME cleanup，并复用原曲 BeatNet 一次。每个 case 的识别只运行一次，原始音符和 beat grid 写入 `raw/` 后按 hash 复用，baseline 与 new 使用独立结果根并收到同一份 raw 的独立副本。已有成功 pipeline 会在 `--resume` 下跳过，单 case 失败写入明确的 stage/error manifest；production worker 超时会终止整个子进程树，不能留下后台模型。没有 adapter 时只记录“未配置”，不会伪造识别或准确率。`--reference-isolation` 是专门的量化器隔离模式：它从可靠参考 MIDI 生成 raw，并在 provenance 中明确 `model_output=false`，不能被当成人声或音频模型的端到端结果。
+批处理编排器是 `scripts/run_high_accuracy_batch.py`。默认的 production route 在独立可终止 worker 中运行：器乐走原曲 MuScriptor + 原曲 BeatNet 一次，人声走原曲 Demucs → GAME → GAME cleanup，并复用原曲 BeatNet 一次。每个 case 的识别只运行一次，原始音符和 beat grid 写入 `raw/` 后按 hash 复用；raw 同时保存 recognizer mode、identity 和 fingerprint，切换 reference/production 时不会静默复用另一种 raw，必须使用新的 mode-isolated result root。baseline 与 new 使用独立结果根并收到同一份 raw 的独立副本。已有成功 pipeline 会在 `--resume` 下跳过，但只在 raw hash、recognizer fingerprint 和 effective scope 都一致时跳过；单 case 失败写入明确的 stage/error manifest；production worker 超时会终止整个子进程树，不能留下后台模型。raw 中的鼓事件保留用于审计，baseline/new 记谱前会过滤鼓事件，鼓不会进入数字谱或最终 score MIDI。没有 adapter 时只记录“未配置”，不会伪造识别或准确率。`--reference-isolation` 是专门的量化器隔离模式：它从可靠参考 MIDI 生成 raw，并在 provenance 中明确 `model_output=false`，不能被当成人声或音频模型的端到端结果。
 
 ```powershell
 & .\.venv\Scripts\python.exe scripts\run_high_accuracy_batch.py `
   --case-id synthetic-piano-01 `
   --reference-isolation `
   --run-legacy-baseline `
-  --run-new-chain
+  --run-new-chain `
+  --baseline-result-root .\artifacts\review\high-accuracy-benchmark\baseline `
+  --new-result-root .\artifacts\review\high-accuracy-benchmark\new
 ```
 
 MAESTRO 10 条目前只登记官方入口、CC BY-NC-SA 4.0、MIDI archive SHA-256 和选取规则，状态是 `not_downloaded`；它没有被下载或冒充本地结果。待审查后按清单中的官方下载地址取得 archive，校验 `70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c`，再记录实际 archive 字节数、选中文件 hash，并从 MIDI 渲染音频。该本地音频是确定性正弦振荡器渲染，只能保持 MIDI 音高、时值、起音和 tempo map；它不代表钢琴音色、踏板噪声、房间声学或原始演奏细节，manifest 会把这些限制写入 `render_domain`。PJS 的拍点文件由同源 MIDI 透明推导，报告会保留这一限制，不把它描述成独立人工 beat 标注。
@@ -84,7 +86,7 @@ MIDI 音符指标先把各文件的 tick 精确换算为四分音符位置，因
   --baseline-result-root .\artifacts\review\high-accuracy-benchmark\baseline
 ```
 
-报告会分别给出 `accuracy_gate_scopes.quantizer_isolation_overall` 与 `accuracy_gate_scopes.production_end_to_end_subset`。量化器隔离总体只比较共享 raw 上的节奏、音高和和弦；端到端子集按真实音频模型产物比较同样指标。只有显式登记为独立人工/外部拍点的样本才进入 BeatNet F1 门槛；PJS 的同源 MIDI 派生拍点不会计入独立拍点 F1。每个 scope 都必须满足可靠样本、无崩溃、节奏误差相对 baseline 下降至少 20%、pitch F1 下降不超过 0.01 且和弦保留率不下降时，报告才会将 `accuracy_claim_ready` 设为 `true`；缺少任何数据会列出具体原因并保持 `false`。也可以用 `--baseline-report` 读取已经生成的 baseline 报告。
+报告会分别给出 `accuracy_gate_scopes.quantizer_isolation_overall` 与 `accuracy_gate_scopes.production_end_to_end_subset`，但它们只是诊断。`accuracy_claim_ready` 的唯一主门槛是 baseline/new 共享的 30 个可靠 production case，且 production raw 必须来自模型输出；quantizer isolation case、1+1 的 scope 拆分或 reference-derived raw 都不能替代这 30 个 case。production gate 始终要求独立 BeatNet/人工拍点与重拍指标，缺少独立拍点不会自动关闭该门槛；PJS 的同源 MIDI 派生拍点不会计入独立 BeatNet F1。量化器隔离总体只比较共享 raw 上的节奏、音高和和弦；端到端子集按真实音频模型产物比较同样指标。主门槛还必须满足无崩溃、节奏误差相对 baseline 下降至少 20%、pitch F1 下降不超过 0.01 且和弦保留率不下降；缺少任何数据会列出具体原因并保持 `false`。也可以用 `--baseline-report` 读取已经生成的 baseline 报告。
 
 运行后端与前端检查：
 
