@@ -70,6 +70,7 @@ def _run_muscriptor(audio: Path, destination: Path) -> tuple[list[dict[str, Any]
         os.fspath(progress),
         "--seed",
         str(MUSCRIPTOR_BENCHMARK_SEED),
+        "--deterministic",
     ]
     model = _cached_muscriptor_model()
     if model is not None:

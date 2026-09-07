@@ -154,6 +154,7 @@ def main() -> int:
     parser.add_argument("--model", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=DEFAULT_BENCHMARK_SEED)
+    parser.add_argument("--deterministic", action="store_true", help="enable the reproducible benchmark decode contract")
     args = parser.parse_args()
     if not args.audio.is_file():
         raise SystemExit(f"audio file not found: {args.audio}")
@@ -166,12 +167,25 @@ def main() -> int:
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("MuScriptor CUDA is unavailable")
-    reproducibility = _configure_reproducibility(args.seed)
+    if args.deterministic:
+        reproducibility = _configure_reproducibility(args.seed)
+    else:
+        reproducibility = {
+            "seed": None,
+            "decoder": "greedy",
+            "sampling": False,
+            "numpy_seeded": False,
+            "torch_deterministic_algorithms": False,
+            "cuda_deterministic_flags": False,
+            "autocast": "package_default",
+        }
     model = TranscriptionModel.load_model(args.model or _local_model_path(), device=args.device)
-    # The package enables fp16 autocast on CUDA even when the checkpoint is
-    # loaded as float32.  Disabling that private context avoids marginal CUDA
-    # reduction differences changing a greedy token at a tied logit boundary.
-    model._model.autocast.enabled = False
+    if args.deterministic:
+        # The package enables fp16 autocast on CUDA even when the checkpoint is
+        # loaded as float32.  Disabling that private context avoids marginal
+        # CUDA reduction differences changing a greedy token at a tied logit
+        # boundary.
+        model._model.autocast.enabled = False
     raw_events: list[Any] = []
     last_progress = {"completed": 0, "total": 0}
     for event in model.transcribe(args.audio, instruments=None, prelude_forcing=True):
