@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from typing import Any, Mapping
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+benchmark = _load("high_accuracy_benchmark_dataset_test", ROOT / "scripts" / "high_accuracy_benchmark.py")
+generator = _load("high_accuracy_fixture_generator_test", ROOT / "scripts" / "generate_high_accuracy_benchmarks.py")
+runner_module = _load("high_accuracy_batch_runner_test", ROOT / "scripts" / "run_high_accuracy_batch.py")
+maestro = _load("prepare_maestro_benchmark_test", ROOT / "scripts" / "prepare_maestro_benchmark.py")
+
+
+def _hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_registry_has_distinct_30_case_reliable_set() -> None:
+    registry = benchmark._load_registry(ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json")
+    reliable = [case for case in registry["cases"] if case.get("reference_midi_reliable") is True]
+    assert len(reliable) == 30
+    assert len({case["id"] for case in reliable}) == 30
+    assert {case["category"] for case in reliable} == {"synthetic_rendered", "official_piano_rendered", "vocal", "specialized_fixture"}
+    assert all(case.get("source_id") in registry["sources"] for case in reliable)
+
+
+def test_two_deterministic_smoke_cases_have_midi_audio_and_beat_annotation(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for destination in (first, second):
+        generator.generate_case("synthetic-piano-01", destination=destination)
+        generator.generate_case("special-triplet", destination=destination)
+    for case_id in ("synthetic-piano-01", "special-triplet"):
+        first_root = first / case_id
+        second_root = second / case_id
+        assert (first_root / f"{case_id}.mid").is_file()
+        assert (first_root / f"{case_id}.wav").is_file()
+        beat = json.loads((first_root / f"{case_id}.beat_grid.json").read_text(encoding="utf-8"))
+        assert beat["source"] == "generated_from_reference_midi"
+        assert beat["beat_grid"]["downbeats"]
+        assert _hash(first_root / f"{case_id}.mid") == _hash(second_root / f"{case_id}.mid")
+        assert _hash(first_root / f"{case_id}.wav") == _hash(second_root / f"{case_id}.wav")
+        assert _hash(first_root / f"{case_id}.beat_grid.json") == _hash(second_root / f"{case_id}.beat_grid.json")
+
+
+def test_batch_runner_recognizes_once_and_shares_immutable_raw_between_pipelines(tmp_path: Path) -> None:
+    calls = {"recognizer": 0, "baseline": 0, "new": 0}
+    seen: dict[str, int] = {}
+
+    def recognizer(case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        calls["recognizer"] += 1
+        return {"source": "test-recognizer", "model_output": True, "notes": [{"midi": 60}], "beat_grid": {"beats": [{"time_sec": 0.0, "downbeat": True}]}}
+
+    def baseline(case: Mapping[str, Any], raw: Mapping[str, Any], destination: Path) -> Mapping[str, Any]:
+        calls["baseline"] += 1
+        seen["baseline"] = len(raw["notes"])
+        # The adapter must not be able to mutate the copy passed to the new chain.
+        raw["notes"].append({"midi": 61})  # type: ignore[attr-defined]
+        destination.mkdir(parents=True, exist_ok=True)
+        return {"artifact": "baseline"}
+
+    def new_chain(case: Mapping[str, Any], raw: Mapping[str, Any], destination: Path) -> Mapping[str, Any]:
+        calls["new"] += 1
+        seen["new"] = len(raw["notes"])
+        destination.mkdir(parents=True, exist_ok=True)
+        return {"artifact": "new"}
+
+    runner = runner_module.BenchmarkBatchRunner(recognizer=recognizer, baseline=baseline, new_chain=new_chain, timeout_sec=5)
+    case = {"id": "smoke-case", "evaluation_scope": "test"}
+    first = runner.run_case(case, result_root=tmp_path / "results")
+    second = runner.run_case(case, result_root=tmp_path / "results")
+    assert first["status"] == "success"
+    assert second["status"] == "success"
+    assert calls == {"recognizer": 1, "baseline": 1, "new": 1}
+    assert seen == {"baseline": 1, "new": 1}
+    raw = json.loads((tmp_path / "results" / "smoke-case" / "raw" / "recognition.json").read_text(encoding="utf-8"))
+    assert raw["notes"] == [{"midi": 60}]
+    assert raw["model_output"] is True
+
+
+def test_batch_runner_records_unconfigured_pipeline_without_fabricating_success(tmp_path: Path) -> None:
+    runner = runner_module.BenchmarkBatchRunner(
+        recognizer=lambda _case, _raw, _destination: {"notes": [], "beat_grid": {}, "model_output": True},
+        baseline=None,
+        new_chain=None,
+        timeout_sec=5,
+    )
+    outcome = runner.run_case({"id": "unconfigured", "evaluation_scope": "test"}, result_root=tmp_path / "results")
+    assert outcome["status"] == "failed"
+    assert outcome["pipelines"]["baseline"]["status"] == "failed"
+    assert outcome["pipelines"]["new"]["status"] == "failed"
+    manifest = json.loads((tmp_path / "results" / "unconfigured" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert "not configured" in manifest["pipelines"]["new"]["error"]
+
+
+def test_batch_runner_can_resume_failed_pipeline_without_rerunning_raw(tmp_path: Path) -> None:
+    calls = {"recognizer": 0}
+
+    def recognizer(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        calls["recognizer"] += 1
+        return {"notes": [{"midi": 60}], "beat_grid": {"beats": []}, "model_output": True}
+
+    root = tmp_path / "results"
+    first = runner_module.BenchmarkBatchRunner(recognizer=recognizer, baseline=None, new_chain=None, timeout_sec=5)
+    assert first.run_case({"id": "retry-case"}, result_root=root)["status"] == "failed"
+
+    def adapter(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        return {"ok": True}
+
+    second = runner_module.BenchmarkBatchRunner(recognizer=recognizer, baseline=adapter, new_chain=adapter, timeout_sec=5)
+    assert second.run_case({"id": "retry-case"}, result_root=root)["status"] == "success"
+    assert calls["recognizer"] == 1
+
+
+def test_maestro_selector_records_archive_and_member_hashes(tmp_path: Path, monkeypatch) -> None:
+    import mido
+    import zipfile
+
+    source_midi = tmp_path / "source.mid"
+    midi = mido.MidiFile(ticks_per_beat=480)
+    track = mido.MidiTrack()
+    track.append(mido.Message("note_on", note=60, velocity=80, time=0))
+    track.append(mido.Message("note_off", note=60, velocity=0, time=480))
+    midi.tracks.append(track)
+    midi.save(source_midi)
+    archive = tmp_path / "maestro.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.write(source_midi, "z/second.mid")
+        bundle.write(source_midi, "a/first.mid")
+    monkeypatch.setattr(maestro, "EXPECTED_SHA256", _hash(archive))
+    result = maestro.prepare_archive(archive, output_root=tmp_path / "maestro", count=2)
+    assert [item["archive_member"] for item in result["cases"]] == ["a/first.mid", "z/second.mid"]
+    assert result["archive"]["sha256"] == _hash(archive)
+    assert all(item["midi"]["sha256"] for item in result["cases"])
+    assert (tmp_path / "maestro" / "selection_manifest.json").is_file()

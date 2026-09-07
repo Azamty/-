@@ -57,8 +57,8 @@ def _file_record(value: str | None, *, required: bool = False) -> dict[str, Any]
 
 def _load_registry(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != "1.0" or not isinstance(payload.get("cases"), list):
-        raise ValueError(f"benchmark registry is not schema 1.0: {path}")
+    if payload.get("schema_version") not in {"1.0", "2.0"} or not isinstance(payload.get("cases"), list):
+        raise ValueError(f"benchmark registry is not a supported schema: {path}")
     ids: set[str] = set()
     for item in payload["cases"]:
         if not isinstance(item, Mapping) or not item.get("id") or item["id"] in ids:
@@ -66,6 +66,15 @@ def _load_registry(path: Path) -> dict[str, Any]:
         ids.add(str(item["id"]))
         if not item.get("input"):
             raise ValueError(f"benchmark case {item['id']} has no input")
+        if payload.get("schema_version") == "2.0":
+            if not item.get("category") or not item.get("source_kind"):
+                raise ValueError(f"benchmark case {item['id']} requires category and source_kind")
+            if item.get("source_id") and item["source_id"] not in payload.get("sources", {}):
+                raise ValueError(f"benchmark case {item['id']} refers to an unknown source_id")
+    if payload.get("schema_version") == "2.0":
+        reliable_count = sum(1 for item in payload["cases"] if item.get("reference_midi_reliable") is True and item.get("evaluation_policy") == "reference_metrics")
+        if reliable_count != 30:
+            raise ValueError(f"benchmark schema 2.0 requires exactly 30 reliable cases, found {reliable_count}")
     return payload
 
 
@@ -236,6 +245,9 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         "id": str(case["id"]),
         "title": case.get("title", case["id"]),
         "language": case.get("language"),
+        "category": case.get("category"),
+        "source_kind": case.get("source_kind"),
+        "source_id": case.get("source_id"),
         "license": case.get("license"),
         "input": _file_record(str(case["input"]), required=True),
         "reference_midi": _file_record(case.get("reference_midi"), required=False),
@@ -458,7 +470,7 @@ def build_report(
     )
     claim = assess_accuracy_claim(cases, baseline_cases)
     return {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "registry": str(DEFAULT_REGISTRY),
         "result_root": str(result_root) if result_root else None,
         "registered_count": len(cases),

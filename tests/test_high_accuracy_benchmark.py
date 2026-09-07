@@ -27,13 +27,19 @@ def _write_midi(path: Path, *, pitch: int = 60, ppq: int = 480, pitches: tuple[i
 
 def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
     registry = benchmark._load_registry(ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json")
-    assert {item["id"] for item in registry["cases"]} == {"pjs001", "pjs002", "pjs003", "pjs004", "pjs005", "luv-letter"}
+    assert registry["schema_version"] == "2.0"
+    assert len(registry["cases"]) == 31
+    assert sum(item.get("reference_midi_reliable") is True for item in registry["cases"]) == 30
+    assert {item["id"] for item in registry["cases"] if item["category"] == "vocal"} == {"pjs001", "pjs002", "pjs003", "pjs004", "pjs005"}
+    assert sum(item["category"] == "synthetic_rendered" for item in registry["cases"]) == 10
+    assert sum(item["category"] == "official_piano_rendered" for item in registry["cases"]) == 10
+    assert sum(item["category"] == "specialized_fixture" for item in registry["cases"]) == 5
     luv = next(item for item in registry["cases"] if item["id"] == "luv-letter")
     assert luv["evaluation_policy"] == "integrity_and_manual_listening_only"
     assert luv["reference_midi_reliable"] is False
 
     report = benchmark.build_report(registry)
-    assert report["registered_count"] == 6
+    assert report["registered_count"] == 31
     assert report["evaluated_count"] == 0
     assert report["accuracy_claim_ready"] is False
     assert all(item["metrics"]["pitch_f1"] is None for item in report["cases"])

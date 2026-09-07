@@ -1,6 +1,6 @@
 # 高精度扒谱链路与验收
 
-当前网页入口是 V2：`http://127.0.0.1:8000` 通过 `/api/v2/jobs` 上传、识别、选择轨道并导出。旧的 `/api/jobs` 与 `backend/jianpu_score/pipeline.py` 保留一个版本周期，供 Git 回退和对照使用；它们不是当前网页入口，V2 任务不会调用旧的均匀网格量化器。
+当前网页入口是 V2：`http://127.0.0.1:8000` 通过 `/api/v2/jobs` 上传、识别、选择轨道并导出。旧的 `/api/jobs` 与 `backend/jianpu_score/pipeline.py` 保留一个版本周期，供 Git 回退和对照使用；它们不是当前网页入口，V2 任务不会调用旧的均匀网格量化器。基准的 baseline 明确调用 `backend.jianpu_score.quantize.quantize_events`，只用于同一 raw 输入的历史对照；它不会改变网页入口，也不能作为新链路结果。
 
 ## 工具链
 
@@ -30,10 +30,18 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
 
 ## 重复验收
 
-验收登记文件是 `fixtures/high_accuracy/benchmark_manifest.json`，脚本不会把音频或语料复制进 Git：
+验收登记文件是 `fixtures/high_accuracy/benchmark_manifest.json`。当前清单包含 30 个可靠 case，另保留 `luv-letter` 作为本机完整性候选；脚本不会把音频或语料复制进 Git。30 个可靠 case 的构成为：10 个固定 seed 的钢琴/吉他/贝斯/多轨合成样本、10 个 MAESTRO v3 官方钢琴 MIDI 渲染候选、PJS 日语歌声 5 条和 5 个弱起/3/4/6/8/三连音/变速/复杂和弦专门 fixture。
 
 ```powershell
 & .\.venv\Scripts\python.exe scripts\high_accuracy_benchmark.py --check
+```
+
+生成器只写入被 `.gitignore` 忽略的 `.cache\high-accuracy-benchmarks\generated`。第一次只运行两个 smoke case：
+
+```powershell
+& .\.venv\Scripts\python.exe scripts\generate_high_accuracy_benchmarks.py `
+  --case-id synthetic-piano-01 `
+  --case-id special-triplet
 ```
 
 它会登记本机可用的 PJS `pjs001`–`pjs005`（PJS 数据为 CC BY-SA 4.0），并登记 `E:\edge\first\Luv Letter.mp3`。如果已有服务结果，按 case id 放入结果目录后计算真实的 pitch F1、和弦保留率、节奏误差、拍点 F1、重拍 F1 和崩溃状态：
@@ -44,6 +52,25 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
 ```
 
 没有结果时指标保持 `null`。Luv Letter 的同名 MIDI 只用于首尾和版本核对候选；当前没有可靠音频对齐标注，因此脚本只允许完整性和人工听谱验收，不用于 pitch/rhythm 或“节奏误差下降 20%”结论。仓库不提交受版权保护音频。
+
+批处理编排器是 `scripts/run_high_accuracy_batch.py`。它要求调用方显式提供 recognition、baseline 和 new-chain adapter；每个 case 的识别只运行一次，原始音符和 beat grid 写入 `raw/` 后按 hash 复用，两个链路收到同一份 raw 的独立副本。已有成功 pipeline 会在 `--resume` 下跳过，单 case 失败写入明确的 stage/error manifest，超时也不会被当成通过。没有 adapter 时只记录“未配置”，不会伪造识别或准确率。`--reference-isolation` 是专门的量化器隔离模式：它从可靠参考 MIDI 生成 raw，并在 provenance 中明确 `model_output=false`，不能被当成人声或音频模型的端到端结果。
+
+```powershell
+& .\.venv\Scripts\python.exe scripts\run_high_accuracy_batch.py `
+  --case-id synthetic-piano-01 `
+  --reference-isolation
+```
+
+MAESTRO 10 条目前只登记官方入口、CC BY-NC-SA 4.0、MIDI archive SHA-256 和选取规则，状态是 `not_downloaded`；它没有被下载或冒充本地结果。待审查后按清单中的官方下载地址取得 archive，校验 `70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c`，再记录实际 archive 字节数、选中文件 hash，并从 MIDI 渲染音频。PJS 的拍点文件由同源 MIDI 透明推导，报告会保留这一限制，不把它描述成独立人工 beat 标注。
+
+校验和选取官方 MIDI 的命令是：
+
+```powershell
+& .\.venv\Scripts\python.exe scripts\prepare_maestro_benchmark.py `
+  --archive .\.cache\packages\maestro-v3.0.0-midi.zip
+```
+
+该命令默认不联网；需要下载时必须显式增加 `--download`，脚本仍会先验证固定 SHA-256，再按归档成员名排序选十条、记录成员 hash，并在本地渲染 WAV 与 beat/downbeat 标注。这里的音频是 MIDI 渲染音频，属于量化器隔离样本；在拥有独立表演录音前不会被描述为端到端准确率证据。
 
 MIDI 音符指标先把各文件的 tick 精确换算为四分音符位置，因此不同 PPQ 可直接比较；节奏报告同时给出起音和时值误差，单位是 `quarter_note`。当前报告不把 tempo map 推导的秒误差冒充为已计算指标。
 
