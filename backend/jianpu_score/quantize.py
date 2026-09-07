@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_right
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from fractions import Fraction
+from itertools import pairwise
+from typing import Any
 
 from .domain import (
     MusicAnalysis,
@@ -30,6 +33,10 @@ def _time_signature_values(value: str) -> tuple[int, int]:
 
 class NoNotesError(ValueError):
     """Raised when an engine produces no usable note events."""
+
+
+class JianpuSerializationError(ValueError):
+    """Raised when a Score cannot be represented without changing its timing."""
 
 
 def _voice_name(event: NoteEvent, layer_index: int) -> str:
@@ -268,7 +275,7 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
 
 def _straight_tick(value: float, quarter_ticks: int) -> int:
     sixteenth = max(1, quarter_ticks // 4)
-    return max(0, int(round(value / sixteenth)) * sixteenth)
+    return max(0, round(value / sixteenth) * sixteenth)
 
 
 def _triplet_group_targets(raw: list[tuple[float, float, NoteEvent]], start_index: int, quarter_ticks: int) -> tuple[int, int, int, int] | None:
@@ -326,7 +333,7 @@ def _tempo_events(analysis: MusicAnalysis, mapper: _BeatMapper, quarter_ticks: i
         if interval <= 0:
             continue
         bpm = 60.0 * mapper.beat_scale / interval
-        tick = max(0, int(round((index * mapper.beat_scale + mapper.shift_beats) * quarter_ticks)))
+        tick = max(0, round((index * mapper.beat_scale + mapper.shift_beats) * quarter_ticks))
         # The first detected beat can be a pickup after audio zero.  Its
         # partial interval must not overwrite the median tempo at score tick
         # zero; later intervals still contribute their local tempo changes.
@@ -353,7 +360,7 @@ def quantize_events(
     if not raw_events:
         raise NoNotesError("NoNotes: the selected engine produced no usable note events")
     numerator, denominator = _time_signature_values(analysis.time_signature)
-    bar_ticks = int(round(numerator * quarter_ticks * 4 / denominator))
+    bar_ticks = round(numerator * quarter_ticks * 4 / denominator)
     mapper = _build_beat_mapper(analysis, raw_events)
     selected = select_voice_events(raw_events, mode=mode)
     if not selected:
@@ -366,7 +373,7 @@ def quantize_events(
     last_event_beat = max((mapper.seconds_to_beat(event.end_sec) for event in selected), default=0.0)
     raw_total_ticks = max(total_beats, last_event_beat) * quarter_ticks
     quantization_tolerance = max(1.0, quarter_ticks / 12.0)
-    bars = max(1, int(math.ceil((raw_total_ticks - quantization_tolerance) / bar_ticks)))
+    bars = max(1, math.ceil((raw_total_ticks - quantization_tolerance) / bar_ticks))
     total_ticks = max(bar_ticks, bars * bar_ticks)
     score_voices: list[ScoreVoice] = []
     triplet_group_count = 0
@@ -514,7 +521,65 @@ class _Slice:
     start_tick: int
     duration_tick: int
     midi: int | None
-    continues: bool
+    chord_pitches: tuple[int, ...] = ()
+    tie_before: frozenset[int] = frozenset()
+    tie_after: frozenset[int] = frozenset()
+    tuplet_actual: int | None = None
+    tuplet_normal: int | None = None
+    dots: int = 0
+
+    @property
+    def end_tick(self) -> int:
+        return self.start_tick + self.duration_tick
+
+    @property
+    def pitches(self) -> tuple[int, ...]:
+        if self.chord_pitches:
+            return self.chord_pitches
+        return () if self.midi is None else (self.midi,)
+
+
+@dataclass(frozen=True)
+class _MeasureSpan:
+    start_tick: int
+    end_tick: int
+
+    @property
+    def duration_tick(self) -> int:
+        return self.end_tick - self.start_tick
+
+
+def _duration_options(quarter_ticks: int, note: str) -> list[tuple[int, list[str]]]:
+    """Return exact jianpu-ly duration atoms, longest first.
+
+    ``q/s/d/h`` are eighth through sixty-fourth notes, dots augment those
+    values, and dashes extend minims and longer values.  All calculations use
+    exact fractions before converting to the Score tick grid.
+    """
+
+    options: list[tuple[int, list[str]]] = []
+    prefixes = {4: "", 8: "q", 16: "s", 32: "d", 64: "h"}
+    for denominator in (1, 2, 4, 8, 16, 32, 64):
+        base = Fraction(quarter_ticks * 4, denominator)
+        for dots in range(4):
+            duration = base * Fraction(2 ** (dots + 1) - 1, 2**dots)
+            if duration.denominator != 1:
+                continue
+            ticks = int(duration)
+            if denominator <= 2:
+                # Jianpu-ly documents dashes for minims and semibreves.  A
+                # dotted minim is ``1 - -`` and a whole note is ``1 - - -``.
+                dash_count = ticks // quarter_ticks - 1
+                if dash_count < 0 or ticks % quarter_ticks:
+                    continue
+                tokens = [note, *(["-"] * dash_count)]
+            else:
+                tokens = [f"{prefixes[denominator]}{note}{'.' * dots}"]
+            options.append((ticks, tokens))
+    unique: dict[int, list[str]] = {}
+    for ticks, tokens in sorted(options, key=lambda value: (value[0], len(value[1])), reverse=True):
+        unique.setdefault(ticks, tokens)
+    return sorted(unique.items(), key=lambda value: value[0], reverse=True)
 
 
 def _duration_chunks(duration_tick: int, quarter_ticks: int) -> list[int]:
@@ -522,12 +587,11 @@ def _duration_chunks(duration_tick: int, quarter_ticks: int) -> list[int]:
         return []
     remaining = duration_tick
     chunks: list[int] = []
-    allowed = [quarter_ticks * 3 // 2, quarter_ticks, quarter_ticks // 2, quarter_ticks // 4]
-    allowed = sorted({value for value in allowed if value > 0}, reverse=True)
+    allowed = [ticks for ticks, _tokens in _duration_options(quarter_ticks, "1")]
     while remaining:
         choice = next((value for value in allowed if value <= remaining), None)
         if choice is None:
-            raise ValueError(
+            raise JianpuSerializationError(
                 f"duration {duration_tick} ticks cannot be represented by jianpu-ly "
                 f"with quarter_ticks={quarter_ticks}"
             )
@@ -536,79 +600,352 @@ def _duration_chunks(duration_tick: int, quarter_ticks: int) -> list[int]:
     return chunks
 
 
-def _format_duration(note: str, duration_tick: int, quarter_ticks: int) -> list[str]:
+def _format_duration(
+    note: str,
+    duration_tick: int,
+    quarter_ticks: int,
+    *,
+    dots: int = 0,
+) -> list[str]:
+    """Format one note/rest duration, inserting ties between split atoms."""
+
     if duration_tick <= 0:
         return []
-    if duration_tick == quarter_ticks * 3 // 2:
-        return [f"{note}."]
-    if duration_tick == quarter_ticks:
-        return [note]
-    if duration_tick == quarter_ticks // 2:
-        return [f"q{note}"]
-    if duration_tick == quarter_ticks // 4:
-        return [f"s{note}"]
-    return [token for chunk in _duration_chunks(duration_tick, quarter_ticks) for token in _format_duration(note, chunk, quarter_ticks)]
+    if dots:
+        matching = [
+            tokens
+            for ticks, tokens in _duration_options(quarter_ticks, note)
+            if ticks == duration_tick and any(token.endswith("." * dots) for token in tokens)
+        ]
+        if matching:
+            return list(matching[0])
+    options = _duration_options(quarter_ticks, note)
+    groups: list[list[str]] = []
+    remaining = duration_tick
+    while remaining:
+        choice = next(((ticks, tokens) for ticks, tokens in options if ticks <= remaining), None)
+        if choice is None:
+            raise JianpuSerializationError(
+                f"duration {duration_tick} ticks cannot be represented by jianpu-ly "
+                f"with quarter_ticks={quarter_ticks}"
+            )
+        ticks, tokens = choice
+        if note == "0" and len(tokens) > 1:
+            # A dash after a rest is stateful in jianpu-ly.  Repeating rests is
+            # unambiguous and retains the same duration without a fake tie.
+            groups.append(["0"] * len(tokens))
+        else:
+            groups.append(list(tokens))
+        remaining -= ticks
+    result: list[str] = []
+    for index, group in enumerate(groups):
+        if index and note != "0":
+            result.append("~")
+        result.extend(group)
+    return result
+
+
+def _event_pitches(event: ScoreNote) -> tuple[int, ...]:
+    if event.midi is None:
+        if event.chord_pitches:
+            raise JianpuSerializationError("a rest cannot carry chord_pitches")
+        return ()
+    pitches = tuple(event.chord_pitches) if event.chord_pitches else (event.midi,)
+    if event.midi not in pitches:
+        raise JianpuSerializationError(
+            f"ScoreNote at {event.start_tick} has midi={event.midi} outside chord_pitches={list(pitches)}"
+        )
+    return pitches
+
+
+def _event_tie_sets(event: ScoreNote) -> tuple[frozenset[int], frozenset[int]]:
+    pitches = _event_pitches(event)
+    if not pitches:
+        if event.tie or event.tie_types:
+            raise JianpuSerializationError(f"rest at {event.start_tick} cannot carry a tie")
+        return frozenset(), frozenset()
+    if event.tie_types:
+        if len(event.tie_types) != len(pitches):
+            raise JianpuSerializationError(
+                f"tie_types length {len(event.tie_types)} does not match {len(pitches)} pitches at {event.start_tick}"
+            )
+        before = frozenset(pitch for pitch, tie in zip(pitches, event.tie_types) if tie in {"stop", "continue"})
+        after = frozenset(pitch for pitch, tie in zip(pitches, event.tie_types) if tie in {"start", "continue"})
+        return before, after
+    if event.tie == "stop":
+        return frozenset(pitches), frozenset()
+    if event.tie == "start":
+        return frozenset(), frozenset(pitches)
+    if event.tie == "continue":
+        return frozenset(pitches), frozenset(pitches)
+    return frozenset(), frozenset()
+
+
+def _validate_explicit_ties(voice: ScoreVoice) -> None:
+    events = voice.events
+    tie_sets = [_event_tie_sets(event) for event in events]
+    for index, (event, (before, after)) in enumerate(zip(events, tie_sets)):
+        if not before and not after:
+            continue
+        previous = events[index - 1] if index else None
+        following = events[index + 1] if index + 1 < len(events) else None
+        if before:
+            previous_after = tie_sets[index - 1][1] if previous is not None else frozenset()
+            if previous is None or previous.end_tick != event.start_tick or not before <= previous_after:
+                raise JianpuSerializationError(
+                    f"dangling tie into voice {voice.voice_id} at tick {event.start_tick}: pitches={sorted(before)}"
+                )
+        if after:
+            following_before = tie_sets[index + 1][0] if following is not None else frozenset()
+            if following is None or following.start_tick != event.end_tick or not after <= following_before:
+                raise JianpuSerializationError(
+                    f"dangling tie out of voice {voice.voice_id} at tick {event.end_tick}: pitches={sorted(after)}"
+                )
+
+
+def _fixed_measure_spans(score: Score) -> list[_MeasureSpan]:
+    numerator, denominator = _time_signature_values(score.time_signature)
+    bar_ticks = round(numerator * score.quarter_ticks * 4 / denominator)
+    if bar_ticks <= 0:
+        raise JianpuSerializationError("time signature produces an empty measure")
+    spans: list[_MeasureSpan] = []
+    cursor = 0
+    while cursor < score.total_ticks:
+        spans.append(_MeasureSpan(cursor, min(score.total_ticks, cursor + bar_ticks)))
+        cursor += bar_ticks
+    return spans
+
+
+def _slice_voice_events(voice: ScoreVoice, spans: list[_MeasureSpan]) -> list[list[_Slice]]:
+    """Split one ScoreVoice at fixed Score.time_signature bar boundaries."""
+
+    _validate_explicit_ties(voice)
+    result: list[list[_Slice]] = [[] for _span in spans]
+    for event in voice.events:
+        pitches = _event_pitches(event)
+        tie_before, tie_after = _event_tie_sets(event)
+        segment_count = 0
+        last_end = event.start_tick
+        for span_index, span in enumerate(spans):
+            if event.end_tick <= span.start_tick or event.start_tick >= span.end_tick:
+                continue
+            start = max(event.start_tick, span.start_tick)
+            end = min(event.end_tick, span.end_tick)
+            if start >= end:
+                continue
+            segment_count += 1
+            is_first = start == event.start_tick
+            is_last = end == event.end_tick
+            result[span_index].append(
+                _Slice(
+                    start_tick=start,
+                    duration_tick=end - start,
+                    midi=event.midi,
+                    chord_pitches=pitches if event.midi is not None else (),
+                    tie_before=frozenset(pitches if not is_first and pitches else tie_before),
+                    tie_after=frozenset(pitches if not is_last and pitches else tie_after),
+                    tuplet_actual=event.tuplet_actual,
+                    tuplet_normal=event.tuplet_normal,
+                    dots=event.dots if is_first and is_last else 0,
+                )
+            )
+            last_end = end
+        if segment_count == 0 or last_end != event.end_tick:
+            raise JianpuSerializationError(
+                f"ScoreVoice {voice.voice_id} event {event.start_tick}:{event.end_tick} lies outside score"
+            )
+    for span_index, (span, bar) in enumerate(zip(spans, result)):
+        bar.sort(key=lambda item: (item.start_tick, item.end_tick))
+        cursor = span.start_tick
+        for item in bar:
+            if item.start_tick != cursor:
+                raise JianpuSerializationError(
+                    f"voice {voice.voice_id} has a measure gap or overlap at tick {cursor}"
+                )
+            cursor = item.end_tick
+        if cursor != span.end_tick:
+            raise JianpuSerializationError(
+                f"voice {voice.voice_id} measure {span_index + 1} ends at {cursor}, expected {span.end_tick}"
+            )
+    return result
+
+
+def _pitch_token(pitches: tuple[int, ...], key: str) -> str:
+    if not pitches:
+        return "0"
+    return "".join(midi_to_jianpu(pitch, key) for pitch in sorted(pitches))
+
+
+def _slice_tokens(
+    item: _Slice,
+    key: str,
+    quarter_ticks: int,
+    *,
+    duration_tick: int | None = None,
+    dots: int = 0,
+    include_tie: bool = True,
+) -> list[str]:
+    note = _pitch_token(item.pitches, key)
+    tokens = _format_duration(note, duration_tick or item.duration_tick, quarter_ticks, dots=dots)
+    if include_tie and item.tie_after and item.pitches:
+        tokens.append("~")
+    return tokens
+
+
+def _explicit_tuplet_groups(slices: list[_Slice]) -> dict[int, tuple[int, int]]:
+    groups: dict[int, tuple[int, int]] = {}
+    covered: set[int] = set()
+    for start in range(max(0, len(slices) - 2)):
+        if start in covered:
+            continue
+        group = slices[start : start + 3]
+        # The first time-modification event is the reliable group anchor.  Do
+        # not absorb a preceding rest because two later notes share a ratio.
+        if not group or group[0].tuplet_actual is None and group[0].tuplet_normal is None:
+            continue
+        if len(group) != 3 or any(left.end_tick != right.start_tick for left, right in pairwise(group)):
+            continue
+        explicit = [(item.tuplet_actual, item.tuplet_normal) for item in group if item.tuplet_actual is not None or item.tuplet_normal is not None]
+        if len(explicit) < 2:
+            continue
+        if any(actual is None or normal is None for actual, normal in explicit):
+            raise JianpuSerializationError("tuplet_actual and tuplet_normal must be supplied together")
+        ratio = explicit[0]
+        if any(value != ratio for value in explicit):
+            raise JianpuSerializationError("a tuplet group contains inconsistent actual/normal ratios")
+        if ratio != (3, 2):
+            raise JianpuSerializationError(
+                f"jianpu-ly serializer only supports explicit 3:2 tuplets, got {ratio[0]}:{ratio[1]}"
+            )
+        groups[start] = ratio
+        covered.update(range(start, start + 3))
+    for index, item in enumerate(slices):
+        if (item.tuplet_actual is not None or item.tuplet_normal is not None) and index not in covered:
+            raise JianpuSerializationError(
+                f"explicit tuplet at tick {item.start_tick} does not form a complete three-note group"
+            )
+    return groups
+
+
+def _legacy_triplet(slices: list[_Slice], index: int, quarter_ticks: int, bar_end: int) -> bool:
+    if index + 2 >= len(slices):
+        return False
+    group = slices[index : index + 3]
+    if any(item.tuplet_actual is not None or item.tuplet_normal is not None for item in group):
+        return False
+    triplet_duration = Fraction(quarter_ticks, 3)
+    if any(item.duration_tick != triplet_duration for item in group):
+        return False
+    if any(left.end_tick != right.start_tick for left, right in pairwise(group)):
+        return False
+    return group[-1].end_tick <= bar_end and group[0].start_tick + quarter_ticks <= bar_end
+
+
+def _serialize_measure(
+    slices: list[_Slice],
+    span: _MeasureSpan,
+    key: str,
+    quarter_ticks: int,
+) -> list[str]:
+    explicit_groups = _explicit_tuplet_groups(slices)
+    output: list[str] = []
+    index = 0
+    cursor = span.start_tick
+    while index < len(slices):
+        item = slices[index]
+        if item.start_tick != cursor:
+            raise JianpuSerializationError(f"measure serializer gap at tick {cursor}")
+        if index in explicit_groups:
+            ratio = explicit_groups[index]
+            group = slices[index : index + 3]
+            output.append(f"{ratio[0]}[")
+            for group_index, member in enumerate(group):
+                nominal = Fraction(member.duration_tick * ratio[0], ratio[1])
+                if nominal.denominator != 1:
+                    raise JianpuSerializationError(
+                        f"tuplet note at tick {member.start_tick} is not exact at {quarter_ticks} TPQ"
+                    )
+                output.extend(
+                    _slice_tokens(
+                        member,
+                        key,
+                        quarter_ticks,
+                        duration_tick=int(nominal),
+                        dots=member.dots,
+                        include_tie=group_index < 2,
+                    )
+                )
+            output.append("]")
+            if group[-1].tie_after and group[-1].pitches:
+                output.append("~")
+            cursor = group[-1].end_tick
+            index += 3
+            continue
+        if _legacy_triplet(slices, index, quarter_ticks, span.end_tick):
+            group = slices[index : index + 3]
+            output.append("3[")
+            for group_index, member in enumerate(group):
+                nominal = Fraction(member.duration_tick * 3, 2)
+                if nominal.denominator != 1:
+                    raise JianpuSerializationError("legacy triplet duration is not exact")
+                output.extend(
+                    _slice_tokens(
+                        member,
+                        key,
+                        quarter_ticks,
+                        duration_tick=int(nominal),
+                        dots=0,
+                        include_tie=group_index < 2,
+                    )
+                )
+            output.append("]")
+            if group[-1].tie_after and group[-1].pitches:
+                output.append("~")
+            cursor = group[-1].end_tick
+            index += 3
+            continue
+        output.extend(_slice_tokens(item, key, quarter_ticks, dots=item.dots))
+        cursor = item.end_tick
+        index += 1
+    if cursor != span.end_tick:
+        raise JianpuSerializationError(f"measure serializer ended at {cursor}, expected {span.end_tick}")
+    output.append("|")
+    return output
+
+
+def _key_command(key: str) -> str:
+    # Preserve the historical serializer contract: minor scores are written
+    # from their relative major (F#m becomes 1=A).
+    return f"1={relative_major_key(normalize_key(key))}"
 
 
 def score_to_jianpu(score: Score) -> str:
-    """Serialize a Score into jianpu-ly input with explicit bars and tuplets."""
+    """Serialize a 12/48 TPQ Score into notation-preserving jianpu-ly input."""
 
-    numerator, denominator = _time_signature_values(score.time_signature)
-    bar_ticks = int(round(numerator * score.quarter_ticks * 4 / denominator))
+    spans = _fixed_measure_spans(score)
     title = sanitize_title(score.title)
     key = normalize_key(score.key)
-    key_command = f"1={relative_major_key(key)}"
-    lines = [f"title={title}", key_command, f"4={round(score.bpm)}", normalize_time_signature(score.time_signature), ""]
-    for voice_index, voice in enumerate(score.voices):
-        slices: list[_Slice] = []
-        for event in voice.events:
-            end = event.end_tick
-            cursor = event.start_tick
-            while cursor < end:
-                boundary = ((cursor // bar_ticks) + 1) * bar_ticks
-                segment_end = min(end, boundary)
-                slices.append(_Slice(cursor, segment_end - cursor, event.midi, segment_end < end))
-                cursor = segment_end
+    lines = [
+        f"title={title}",
+        _key_command(key),
+        f"4={round(score.bpm)}",
+        normalize_time_signature(score.time_signature),
+        "",
+    ]
+    voice_bars = [_slice_voice_events(voice, spans) for voice in score.voices]
+    for voice_index, (voice, bars) in enumerate(zip(score.voices, voice_bars)):
+        if len(score.voices) > 1:
+            label = sanitize_title(voice.label or voice.voice_id).replace("=", " ")
+            lines.append(f"instrument={label}")
+            if voice_index:
+                # jianpu-ly parses each ``NextPart`` independently.  Repeat
+                # the score context for later parts so compound meters (and
+                # their key/tempo context) are not reset to the vendor
+                # defaults when a new voice starts.
+                lines.extend([_key_command(key), f"4={round(score.bpm)}", normalize_time_signature(score.time_signature)])
         output: list[str] = []
-        cursor = 0
-        index = 0
-        while cursor < score.total_ticks:
-            bar_end = min(score.total_ticks, ((cursor // bar_ticks) + 1) * bar_ticks)
-            bar_tokens: list[str] = []
-            while cursor < bar_end and index < len(slices):
-                current = slices[index]
-                if current.start_tick != cursor:
-                    raise ValueError(f"voice {voice.voice_id} serializer gap at {cursor}")
-                if (
-                    index + 2 < len(slices)
-                    and current.duration_tick == score.quarter_ticks // 3
-                    and slices[index + 1].duration_tick == score.quarter_ticks // 3
-                    and slices[index + 2].duration_tick == score.quarter_ticks // 3
-                    and current.start_tick + score.quarter_ticks // 3 == slices[index + 1].start_tick
-                    and current.start_tick + 2 * score.quarter_ticks // 3 == slices[index + 2].start_tick
-                    and current.start_tick + score.quarter_ticks <= bar_end
-                ):
-                    notes = []
-                    for triplet in slices[index : index + 3]:
-                        number = "0" if triplet.midi is None else midi_to_jianpu(triplet.midi, score.key)
-                        notes.append(f"q{number}")
-                    bar_tokens.extend(["3[", *notes, "]"])
-                    cursor += score.quarter_ticks
-                    index += 3
-                    continue
-                number = "0" if current.midi is None else midi_to_jianpu(current.midi, score.key)
-                chunks = _format_duration(number, current.duration_tick, score.quarter_ticks)
-                for chunk_index, token in enumerate(chunks):
-                    bar_tokens.append(token)
-                    if chunk_index < len(chunks) - 1 or current.continues:
-                        if current.midi is not None:
-                            bar_tokens.append("~")
-                cursor += current.duration_tick
-                index += 1
-            if cursor != bar_end:
-                raise ValueError(f"voice {voice.voice_id} serializer bar mismatch at {cursor}, expected {bar_end}")
-            bar_tokens.append("|")
-            output.extend(bar_tokens)
+        for span, slices in zip(spans, bars):
+            output.extend(_serialize_measure(slices, span, key, score.quarter_ticks))
         lines.append(" ".join(output))
         if voice_index + 1 < len(score.voices):
             lines.append("NextPart")
