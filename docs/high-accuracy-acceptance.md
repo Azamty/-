@@ -16,8 +16,8 @@ BeatNet 依赖放在独立的 `.venv-model-beatnet`，MusicXML 标准化 worker 
 MuseScore 也可以直接启动检查安装（项目解包目录或系统安装目录二选一）：
 
 ```powershell
-& 'C:\Program Files\MuseScore 4\bin\MuseScore4.exe'
-# 或：& '.\tools\musescore-4.7.4\MuseScore4.exe'
+& '.\tools\musescore-4.7.4\MuseScore 4\bin\MuseScore4.exe'
+# 或：& 'C:\Program Files\MuseScore 4\bin\MuseScore4.exe'
 ```
 
 若项目目录没有本地副本，安装脚本会从固定版本缓存或下载地址恢复，并先校验 SHA-256；重复执行会复用已校验文件。
@@ -44,6 +44,18 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
 ```
 
 没有结果时指标保持 `null`。Luv Letter 的同名 MIDI 只用于首尾和版本核对候选；当前没有可靠音频对齐标注，因此脚本只允许完整性和人工听谱验收，不用于 pitch/rhythm 或“节奏误差下降 20%”结论。仓库不提交受版权保护音频。
+
+MIDI 音符指标先把各文件的 tick 精确换算为四分音符位置，因此不同 PPQ 可直接比较；节奏报告同时给出起音和时值误差，单位是 `quarter_note`。当前报告不把 tempo map 推导的秒误差冒充为已计算指标。
+
+要计算新旧链路的准确率门槛，另提供旧链路结果目录：
+
+```powershell
+& .\.venv\Scripts\python.exe scripts\high_accuracy_benchmark.py `
+  --result-root .\artifacts\review\high-accuracy-benchmark\new `
+  --baseline-result-root .\artifacts\review\high-accuracy-benchmark\baseline
+```
+
+只有至少 30 个可靠结果、拍点 F1 ≥ 0.85、重拍 F1 ≥ 0.75、无崩溃、节奏误差相对 baseline 下降至少 20%、pitch F1 下降不超过 0.01 且和弦保留率不下降时，报告才会将 `accuracy_claim_ready` 设为 `true`；缺少任何数据会列出具体原因并保持 `false`。也可以用 `--baseline-report` 读取已经生成的 baseline 报告。
 
 运行后端与前端检查：
 

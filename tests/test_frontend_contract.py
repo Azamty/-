@@ -16,12 +16,13 @@ def test_v2_track_checkbox_is_the_single_selection_control() -> None:
 
 def test_vocal_ready_contract_uses_staged_generation_and_long_svg_first() -> None:
     source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+    score_artifacts = (ROOT / "frontend" / "src" / "scoreArtifacts.ts").read_text(encoding="utf-8")
 
     assert "vocal-ready" in source
     assert "下一步 · 生成人声简谱" in source
     assert "/vocal/generate" in source
     assert "Demucs 分离人声 → GAME" in source
-    assert "score_svg_long" in source
+    assert "score_svg_long" in score_artifacts
     assert 'name="separation-model"' in source
     assert "htdemucs_ft" in source
     assert "modelChoiceHint" in source
@@ -110,6 +111,7 @@ def test_synth_pause_contract_destroys_worklet_queue_and_resumes_from_offset() -
 
 def test_high_accuracy_result_contract_keeps_long_score_first_and_exposes_diagnostics() -> None:
     source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+    score_artifacts = (ROOT / "frontend" / "src" / "scoreArtifacts.ts").read_text(encoding="utf-8")
     styles = (ROOT / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
 
     assert "notation_engine" in source
@@ -123,6 +125,9 @@ def test_high_accuracy_result_contract_keeps_long_score_first_and_exposes_diagno
     assert "instrument_musicxml" in source
     assert "instrument_alignment_report" in source
     assert "instrument_performance_midi" in source
+    assert "main_melody_score_svg_long" in score_artifacts
+    assert 'data-score-group="long"' in source
+    assert 'data-score-group="paged"' in source
     assert "vocal_raw_notes" in source
     assert "vocal_cleaned_notes" in source
     assert "high_accuracy_manifest" in source

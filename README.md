@@ -177,7 +177,7 @@ V2 每个有音高乐器的最终结果都登记 `score.mid`、MusicXML、alignm
 .\scripts\check_toolchain.ps1
 ```
 
-BeatNet 使用独立 `.venv-model-beatnet`，MusicXML worker 使用独立 `.venv-notation`；MuseScore 4.7.4 的固定 MSI 和校验文件位于本地忽略目录 `.cache\packages`，项目解包目录是 `tools\musescore-4.7.4`，也支持已安装的 `C:\Program Files\MuseScore 4\bin\MuseScore4.exe`。MuseScore 可以直接启动检查：`& 'C:\Program Files\MuseScore 4\bin\MuseScore4.exe'`；服务内的 CLI 调用从启动到退出串行执行。
+BeatNet 使用独立 `.venv-model-beatnet`，MusicXML worker 使用独立 `.venv-notation`；MuseScore 4.7.4 的固定 MSI 和校验文件位于本地忽略目录 `.cache\packages`，项目解包目录是 `tools\musescore-4.7.4\MuseScore 4\bin\MuseScore4.exe`，也支持已安装的 `C:\Program Files\MuseScore 4\bin\MuseScore4.exe`。MuseScore 可以直接启动检查：`& '.\tools\musescore-4.7.4\MuseScore 4\bin\MuseScore4.exe'`；服务内的 CLI 调用从启动到退出串行执行。
 
 可重复的候选登记和指标验收见 [docs/high-accuracy-acceptance.md](docs/high-accuracy-acceptance.md)：
 

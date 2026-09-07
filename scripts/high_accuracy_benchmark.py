@@ -15,6 +15,7 @@ import json
 import math
 import sys
 from collections import defaultdict
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -23,7 +24,7 @@ import mido
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_OUTPUT = ROOT / "artifacts" / "review" / "high-accuracy-benchmark" / "latest.json"
-MIDI_SUFFIXES = (".mid", ".midi")
+MidiNote = tuple[int, Fraction, Fraction]
 
 
 def _sha256(path: Path) -> str:
@@ -68,9 +69,9 @@ def _load_registry(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _midi_notes(path: Path) -> tuple[int, list[tuple[int, int, int]]]:
+def _midi_notes(path: Path) -> tuple[int, list[MidiNote]]:
     midi = mido.MidiFile(path)
-    notes: list[tuple[int, int, int]] = []
+    notes: list[MidiNote] = []
     for track in midi.tracks:
         tick = 0
         active: dict[tuple[int, int], list[int]] = defaultdict(list)
@@ -84,7 +85,7 @@ def _midi_notes(path: Path) -> tuple[int, list[tuple[int, int, int]]]:
                 if starts:
                     start = starts.pop(0)
                     if tick > start:
-                        notes.append((int(message.note), start, tick))
+                        notes.append((int(message.note), Fraction(start, midi.ticks_per_beat), Fraction(tick, midi.ticks_per_beat)))
     return int(midi.ticks_per_beat), sorted(notes, key=lambda value: (value[1], value[0], value[2]))
 
 
@@ -95,14 +96,14 @@ def _f1(precision_count: int, recall_count: int, predicted_count: int, reference
     return {"true_positive": precision_count, "predicted": predicted_count, "reference": reference_count, "precision": precision, "recall": recall, "f1": f1}
 
 
-def pitch_metrics(reference: Sequence[tuple[int, int, int]], predicted: Sequence[tuple[int, int, int]], *, tolerance_ticks: int) -> dict[str, Any]:
+def pitch_metrics(reference: Sequence[MidiNote], predicted: Sequence[MidiNote], *, tolerance_quarters: Fraction) -> dict[str, Any]:
     used: set[int] = set()
     matched: list[tuple[int, int]] = []
     for pred_index, (pitch, start, _end) in enumerate(predicted):
         candidates = [
             (abs(start - ref_start), ref_index)
             for ref_index, (ref_pitch, ref_start, _ref_end) in enumerate(reference)
-            if ref_index not in used and ref_pitch == pitch and abs(start - ref_start) <= tolerance_ticks
+            if ref_index not in used and ref_pitch == pitch and abs(start - ref_start) <= tolerance_quarters
         ]
         if candidates:
             _, ref_index = min(candidates)
@@ -111,25 +112,38 @@ def pitch_metrics(reference: Sequence[tuple[int, int, int]], predicted: Sequence
     return _f1(len(matched), len(matched), len(predicted), len(reference))
 
 
-def rhythm_error(reference: Sequence[tuple[int, int, int]], predicted: Sequence[tuple[int, int, int]], *, tolerance_ticks: int) -> dict[str, Any]:
+def rhythm_error(reference: Sequence[MidiNote], predicted: Sequence[MidiNote], *, tolerance_quarters: Fraction) -> dict[str, Any]:
     used: set[int] = set()
-    errors: list[int] = []
-    for pitch, start, _end in predicted:
+    onset_errors: list[Fraction] = []
+    duration_errors: list[Fraction] = []
+    for pitch, start, end in predicted:
         candidates = [
             (abs(start - ref_start), ref_index)
             for ref_index, (ref_pitch, ref_start, _ref_end) in enumerate(reference)
-            if ref_index not in used and ref_pitch == pitch and abs(start - ref_start) <= tolerance_ticks
+            if ref_index not in used and ref_pitch == pitch and abs(start - ref_start) <= tolerance_quarters
         ]
         if candidates:
-            error, ref_index = min(candidates)
+            _onset_error, ref_index = min(candidates)
             used.add(ref_index)
-            errors.append(error)
-    return {"matched_notes": len(errors), "mean_onset_error_ticks": (sum(errors) / len(errors) if errors else None)}
+            _, ref_start, ref_end = reference[ref_index]
+            onset_errors.append(abs(start - ref_start))
+            duration_errors.append(abs((end - start) - (ref_end - ref_start)))
+    mean_onset = sum(onset_errors, Fraction(0)) / len(onset_errors) if onset_errors else None
+    mean_duration = sum(duration_errors, Fraction(0)) / len(duration_errors) if duration_errors else None
+    combined = [onset + duration for onset, duration in zip(onset_errors, duration_errors, strict=True)]
+    mean_combined = sum(combined, Fraction(0)) / len(combined) if combined else None
+    return {
+        "matched_notes": len(onset_errors),
+        "mean_onset_error_quarter": float(mean_onset) if mean_onset is not None else None,
+        "mean_duration_error_quarter": float(mean_duration) if mean_duration is not None else None,
+        "mean_rhythm_error_quarter": float(mean_combined) if mean_combined is not None else None,
+        "unit": "quarter_note",
+    }
 
 
-def chord_retention(reference: Sequence[tuple[int, int, int]], predicted: Sequence[tuple[int, int, int]], *, tolerance_ticks: int) -> dict[str, Any]:
-    def groups(notes: Sequence[tuple[int, int, int]]) -> list[tuple[int, frozenset[int]]]:
-        grouped: dict[int, set[int]] = defaultdict(set)
+def chord_retention(reference: Sequence[MidiNote], predicted: Sequence[MidiNote], *, tolerance_quarters: Fraction) -> dict[str, Any]:
+    def groups(notes: Sequence[MidiNote]) -> list[tuple[Fraction, frozenset[int]]]:
+        grouped: dict[Fraction, set[int]] = defaultdict(set)
         for pitch, start, _end in notes:
             grouped[start].add(pitch)
         return sorted((start, frozenset(pitches)) for start, pitches in grouped.items() if len(pitches) > 1)
@@ -137,7 +151,7 @@ def chord_retention(reference: Sequence[tuple[int, int, int]], predicted: Sequen
     predicted_groups = groups(predicted)
     retained = 0
     for ref_start, ref_pitches in groups(reference):
-        if any(abs(pred_start - ref_start) <= tolerance_ticks and ref_pitches.issubset(pred_pitches) for pred_start, pred_pitches in predicted_groups):
+        if any(abs(pred_start - ref_start) <= tolerance_quarters and ref_pitches.issubset(pred_pitches) for pred_start, pred_pitches in predicted_groups):
             retained += 1
     total = len(groups(reference))
     return {"reference_chords": total, "retained_chords": retained, "retention": retained / total if total else None}
@@ -151,14 +165,21 @@ def _read_time_points(path: Path | None, *, downbeats: bool = False) -> list[flo
     except (OSError, json.JSONDecodeError):
         return []
     values: list[float] = []
+    if isinstance(payload, Mapping) and isinstance(payload.get("beat_grid"), Mapping):
+        payload = payload["beat_grid"]
     if isinstance(payload, Mapping):
-        records = payload.get("downbeats" if downbeats else "beats") or payload.get("beat_times") or []
+        records = payload.get("downbeats") if downbeats else payload.get("beats")
+        records = records or payload.get("beats") or payload.get("beat_times") or []
     else:
         records = payload
     if isinstance(records, list):
         for item in records:
-            value = item.get("time") if isinstance(item, Mapping) else item
-            if downbeats and isinstance(item, Mapping) and not item.get("downbeat", False):
+            value = (
+                item.get("time_sec", item.get("time", item.get("start_sec")))
+                if isinstance(item, Mapping)
+                else item
+            )
+            if downbeats and isinstance(item, Mapping) and "downbeat" in item and not item.get("downbeat", False):
                 continue
             try:
                 number = float(value)
@@ -242,11 +263,14 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
             return result
         pred_ppq, predicted = _midi_notes(predicted_path)
         ref_ppq, reference = _midi_notes(reference_path)
-        tolerance = max(2, round(max(pred_ppq, ref_ppq) * 0.08))
+        # _midi_notes already converts each SMF's integer ticks to exact
+        # quarter-note Fractions.  The tolerance is therefore independent of
+        # whether one file uses 96, 480, or another PPQ.
+        tolerance_quarters = Fraction(1, 16)
         result["metrics"] = {
-            "pitch_f1": pitch_metrics(reference, predicted, tolerance_ticks=tolerance),
-            "chord_retention": chord_retention(reference, predicted, tolerance_ticks=tolerance),
-            "rhythm_error": rhythm_error(reference, predicted, tolerance_ticks=tolerance),
+            "pitch_f1": pitch_metrics(reference, predicted, tolerance_quarters=tolerance_quarters),
+            "chord_retention": chord_retention(reference, predicted, tolerance_quarters=tolerance_quarters),
+            "rhythm_error": rhythm_error(reference, predicted, tolerance_quarters=tolerance_quarters),
             "beat_f1": None,
             "downbeat_f1": None,
         }
@@ -259,10 +283,113 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
     return result
 
 
-def build_report(registry: Mapping[str, Any], *, result_root: Path | None = None) -> dict[str, Any]:
+def _metric_f1(case: Mapping[str, Any], name: str, field: str) -> float | None:
+    value = (case.get("metrics") or {}).get(name)
+    if not isinstance(value, Mapping):
+        return None
+    number = value.get(field)
+    return float(number) if isinstance(number, (int, float)) and math.isfinite(float(number)) else None
+
+
+def _mean_metric(cases: Sequence[Mapping[str, Any]], name: str, field: str) -> float | None:
+    values = [value for case in cases if (value := _metric_f1(case, name, field)) is not None]
+    return sum(values) / len(values) if values else None
+
+
+def assess_accuracy_claim(
+    cases: Sequence[Mapping[str, Any]],
+    baseline_cases: Sequence[Mapping[str, Any]] | None,
+    *,
+    minimum_cases: int = 30,
+) -> dict[str, Any]:
+    """Apply the stated accuracy gate without filling missing results.
+
+    The gate is deliberately separate from per-case scoring so a future run
+    can supply a baseline produced by the old chain without changing this
+    registry or pretending that unrun cases passed.
+    """
+
+    reliable = [
+        case for case in cases
+        if case.get("status") == "evaluated"
+        and case.get("evaluation_policy") == "reference_metrics"
+        and case.get("reference_midi_reliable") is True
+    ]
+    reasons: list[str] = []
+    if len(reliable) < minimum_cases:
+        reasons.append(f"可靠的新链路结果只有 {len(reliable)}/{minimum_cases} 个")
+    if any(case.get("crash") is True for case in cases):
+        reasons.append("新链路存在崩溃样本")
+    new_beat = _mean_metric(reliable, "beat_f1", "f1")
+    new_downbeat = _mean_metric(reliable, "downbeat_f1", "f1")
+    if new_beat is None or new_beat < 0.85:
+        reasons.append(f"拍点 F1 不足 0.85（当前 {new_beat if new_beat is not None else '缺失'}）")
+    if new_downbeat is None or new_downbeat < 0.75:
+        reasons.append(f"重拍 F1 不足 0.75（当前 {new_downbeat if new_downbeat is not None else '缺失'}）")
+
+    baseline_reliable = [
+        case for case in (baseline_cases or [])
+        if case.get("status") == "evaluated"
+        and case.get("evaluation_policy") == "reference_metrics"
+        and case.get("reference_midi_reliable") is True
+    ]
+    baseline_rhythm = _mean_metric(baseline_reliable, "rhythm_error", "mean_rhythm_error_quarter")
+    new_rhythm = _mean_metric(reliable, "rhythm_error", "mean_rhythm_error_quarter")
+    baseline_pitch = _mean_metric(baseline_reliable, "pitch_f1", "f1")
+    new_pitch = _mean_metric(reliable, "pitch_f1", "f1")
+    baseline_chord = _mean_metric(baseline_reliable, "chord_retention", "retention")
+    new_chord = _mean_metric(reliable, "chord_retention", "retention")
+    if len(baseline_reliable) < minimum_cases:
+        reasons.append(f"可靠的 baseline 结果只有 {len(baseline_reliable)}/{minimum_cases} 个")
+    if baseline_rhythm is None or new_rhythm is None:
+        reasons.append("新链路或 baseline 缺少可比较的四分音符节奏误差")
+    elif baseline_rhythm <= 0:
+        reasons.append("baseline 节奏误差为零，无法计算20%下降")
+    elif new_rhythm > baseline_rhythm * 0.8:
+        reasons.append(f"节奏误差未下降至少20%（新 {new_rhythm:.6f}，baseline {baseline_rhythm:.6f}）")
+    if baseline_pitch is None or new_pitch is None:
+        reasons.append("新链路或 baseline 缺少 pitch F1")
+    elif new_pitch + 1e-9 < baseline_pitch - 0.01:
+        reasons.append(f"pitch F1 下降超过0.01（新 {new_pitch:.6f}，baseline {baseline_pitch:.6f}）")
+    if baseline_chord is None or new_chord is None:
+        reasons.append("新链路或 baseline 缺少和弦保留率")
+    elif new_chord < baseline_chord:
+        reasons.append(f"和弦保留率下降（新 {new_chord:.6f}，baseline {baseline_chord:.6f}）")
+    return {
+        "ready": not reasons,
+        "reason": "; ".join(reasons) if reasons else "已满足30个可靠样本、拍点/重拍、节奏、音高、和弦和无崩溃门槛",
+        "minimum_cases": minimum_cases,
+        "new_reliable_count": len(reliable),
+        "baseline_reliable_count": len(baseline_reliable),
+        "new_mean_beat_f1": new_beat,
+        "new_mean_downbeat_f1": new_downbeat,
+        "new_mean_rhythm_error_quarter": new_rhythm,
+        "baseline_mean_rhythm_error_quarter": baseline_rhythm,
+        "new_mean_pitch_f1": new_pitch,
+        "baseline_mean_pitch_f1": baseline_pitch,
+        "new_mean_chord_retention": new_chord,
+        "baseline_mean_chord_retention": baseline_chord,
+    }
+
+
+def build_report(
+    registry: Mapping[str, Any],
+    *,
+    result_root: Path | None = None,
+    baseline_root: Path | None = None,
+    baseline_report: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     cases = [evaluate_case(item, result_root=result_root) for item in registry["cases"]]
     evaluated = [item for item in cases if item["status"] == "evaluated"]
     crashed = [item for item in cases if item["crash"] is True]
+    baseline_cases = (
+        list(baseline_report.get("cases", []))
+        if baseline_report is not None and isinstance(baseline_report.get("cases"), list)
+        else [evaluate_case(item, result_root=baseline_root) for item in registry["cases"]]
+        if baseline_root is not None
+        else None
+    )
+    claim = assess_accuracy_claim(cases, baseline_cases)
     return {
         "schema_version": "1.0",
         "registry": str(DEFAULT_REGISTRY),
@@ -270,8 +397,10 @@ def build_report(registry: Mapping[str, Any], *, result_root: Path | None = None
         "registered_count": len(cases),
         "evaluated_count": len(evaluated),
         "crash_count": len(crashed),
-        "accuracy_claim_ready": False,
-        "accuracy_claim_reason": "本机只登记了少量候选；没有完整30段结果，不据此声称节奏误差下降20%。",
+        "baseline_result_root": str(baseline_root) if baseline_root else None,
+        "accuracy_claim_ready": claim["ready"],
+        "accuracy_claim_reason": claim["reason"],
+        "accuracy_gate": claim,
         "cases": cases,
     }
 
@@ -280,12 +409,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_REGISTRY)
     parser.add_argument("--result-root", type=Path, help="按 case id/manifest.json 提供已完成服务结果")
+    parser.add_argument("--baseline-result-root", type=Path, help="按 case id/manifest.json 提供旧链路对照结果")
+    parser.add_argument("--baseline-report", type=Path, help="读取已有 benchmark 报告作为 baseline 对照")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--strict-inputs", action="store_true", help="缺少登记的本机输入时以失败退出")
     parser.add_argument("--check", action="store_true", help="只登记并校验输入，不评估服务结果")
     args = parser.parse_args(argv)
     registry = _load_registry(args.manifest.resolve())
-    report = build_report(registry, result_root=None if args.check else (args.result_root.resolve() if args.result_root else None))
+    baseline_report = json.loads(args.baseline_report.resolve().read_text(encoding="utf-8")) if args.baseline_report else None
+    report = build_report(
+        registry,
+        result_root=None if args.check else (args.result_root.resolve() if args.result_root else None),
+        baseline_root=None if args.check else (args.baseline_result_root.resolve() if args.baseline_result_root else None),
+        baseline_report=baseline_report,
+    )
     missing = [item["id"] for item in report["cases"] if not item["input"]["available"]]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
