@@ -1,9 +1,11 @@
 """Resumable orchestration for the 30-case high-accuracy benchmark.
 
-Recognition is an explicit dependency.  The runner calls it exactly once per
-case, stores its raw notes and beat grid immutably, and passes independent
-copies of that same payload to the legacy baseline and the new service.  A
-missing adapter is a recorded failure, never a fabricated pass.  The
+Recognition runs exactly once per case, stores its raw notes and beat grid
+immutably, and passes independent copies of that same payload to the legacy
+baseline and the new service.  The default production worker routes
+instrumental audio through MuScriptor plus one original-mix BeatNet pass, and
+vocal audio through Demucs, GAME cleanup, plus one original-mix BeatNet pass.
+A missing adapter is a recorded failure, never a fabricated pass.  The
 ``--reference-isolation`` mode is intentionally marked as such and only
 prepares a deterministic quantizer-isolation input from a reference MIDI.
 """
@@ -14,9 +16,10 @@ import argparse
 import copy
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -26,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_OUTPUT = ROOT / ".cache" / "high-accuracy-benchmarks" / "runs"
 RUNNER_SCHEMA_VERSION = "1.0"
+PRODUCTION_RECOGNIZER_VERSION = "1.0"
 
 Adapter = Callable[[Mapping[str, Any], Mapping[str, Any], Path], Mapping[str, Any]]
 
@@ -83,6 +87,17 @@ def _safe_case_dir(root: Path, case_id: str) -> Path:
     return case_dir
 
 
+def _pipeline_roots(result_root: Path, baseline_root: Path | None, new_root: Path | None) -> tuple[Path, Path]:
+    """Resolve independent pipeline roots and reject accidental aliasing."""
+
+    result = result_root.resolve()
+    baseline = (baseline_root or result / "baseline").resolve()
+    new = (new_root or result / "new").resolve()
+    if baseline in {result, new} or new == result:
+        raise ValueError("baseline, new, and raw result roots must be independent")
+    return baseline, new
+
+
 def _reference_isolation_payload(case: Mapping[str, Any], *, root: Path) -> Mapping[str, Any]:
     """Return a reference-derived payload with explicit non-model provenance."""
 
@@ -115,6 +130,15 @@ def _reference_isolation_payload(case: Mapping[str, Any], *, root: Path) -> Mapp
     if beat_path.is_file():
         payload = json.loads(beat_path.read_text(encoding="utf-8"))
         beat_grid = payload.get("beat_grid", payload) if isinstance(payload, Mapping) else {}
+    beat_records = beat_grid.get("beats", []) if isinstance(beat_grid, Mapping) else []
+    beat_times = [float(item.get("time_sec")) for item in beat_records if isinstance(item, Mapping) and item.get("time_sec") is not None]
+    tempo = beat_grid.get("tempo") if isinstance(beat_grid, Mapping) and isinstance(beat_grid.get("tempo"), Mapping) else {}
+    bpm = float(tempo.get("selected_bpm") or 120.0)
+    if bpm == 120.0 and len(beat_times) >= 2 and beat_times[1] > beat_times[0]:
+        bpm = 60.0 / (beat_times[1] - beat_times[0])
+    time_signature = beat_grid.get("time_signature", "4/4") if isinstance(beat_grid, Mapping) else "4/4"
+    if isinstance(time_signature, Mapping):
+        time_signature = time_signature.get("selected", "4/4")
     return {
         "schema_version": "1.0",
         "source": "reference_midi_quantizer_isolation",
@@ -123,8 +147,131 @@ def _reference_isolation_payload(case: Mapping[str, Any], *, root: Path) -> Mapp
         "reference_sha256": _sha256(path),
         "notes": notes,
         "beat_grid": beat_grid,
+        "analysis": {
+            "sample_rate": 44_100,
+            "duration_sec": max((float(item["end_quarter"]) * 60.0 / bpm for item in notes), default=(beat_times[-1] + 0.1 if beat_times else 0.1)),
+            "bpm": bpm,
+            "time_signature": str(time_signature),
+            "key": "C",
+            "metadata": {
+                "beat_engine": "beatnet",
+                "beatnet_version": "1.1.3",
+                "beat_source": "reference_midi_quantizer_isolation",
+                "reference_derived": True,
+                "beat_grid": beat_grid,
+            },
+        },
         "provenance": {"evaluation_scope": "quantizer_isolation", "reference_is_not_model_output": True},
     }
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Stop a production recognizer and every model child it created."""
+
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        try:
+            os.killpg(process.pid, 15)
+        except (OSError, ProcessLookupError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        # A model may ignore SIGTERM.  The process group/taskkill branch above
+        # should normally have removed the entire tree; this final kill keeps
+        # the parent from returning while an orphaned child is still running.
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+class ProductionRecognizer:
+    """Run the same model route used by V2 in a killable child process.
+
+    The child writes a normalized raw payload containing the original audio
+    BeatNet analysis.  Instrumental input uses MuScriptor on the original
+    mix; vocal input uses Demucs then GAME plus the shared original-mix
+    analysis.  The parent never imports either model runtime into the batch
+    process and can terminate the whole child tree on timeout.
+    """
+
+    isolated_process = True
+
+    def __init__(self, *, timeout_sec: float = 1800.0, demucs_model: str | None = None) -> None:
+        self.timeout_sec = float(timeout_sec)
+        self.demucs_model = demucs_model
+
+    def __call__(self, case: Mapping[str, Any], _raw: Mapping[str, Any], destination: Path) -> Mapping[str, Any]:
+        audio_value = str(case.get("input") or "")
+        audio = Path(audio_value)
+        if not audio.is_absolute():
+            audio = (ROOT / audio).resolve()
+        if not audio.is_file():
+            raise FileNotFoundError(f"production recognizer input is unavailable: {audio}")
+        source_kind = "vocal" if str(case.get("source_kind")) == "vocal" else "instrumental"
+        destination.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            os.fspath(ROOT / "scripts" / "high_accuracy_production_recognizer.py"),
+            "--audio",
+            os.fspath(audio),
+            "--source-kind",
+            source_kind,
+            "--output",
+            os.fspath(destination),
+        ]
+        if self.demucs_model:
+            command.extend(("--demucs-model", self.demucs_model))
+        environment = os.environ.copy()
+        environment["PYTHONNOUSERSITE"] = "1"
+        creationflags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) if os.name == "nt" else 0
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+            start_new_session=os.name != "nt",
+        )
+        try:
+            output, _ = process.communicate(timeout=self.timeout_sec)
+        except subprocess.TimeoutExpired as exc:
+            _terminate_process_tree(process)
+            try:
+                output, _ = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # ``taskkill /T`` is authoritative on Windows, and the POSIX
+                # process-group kill above is authoritative on Unix.  Do not
+                # leave a reader or model child behind if a pipe is stubborn.
+                output = ""
+            (destination / "production-recognizer.log").write_text(output or "", encoding="utf-8")
+            raise TimeoutError(f"production recognizer timed out after {self.timeout_sec:g}s; process tree terminated") from exc
+        (destination / "production-recognizer.log").write_text(output or "", encoding="utf-8")
+        if process.returncode:
+            raise RuntimeError(f"production recognizer failed ({process.returncode}): {(output or '')[-4000:]}")
+        raw_path = destination / "production_raw.json"
+        if not raw_path.is_file():
+            raise RuntimeError("production recognizer completed without production_raw.json")
+        raw = json.loads(raw_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, Mapping) or raw.get("model_output") is not True:
+            raise RuntimeError("production recognizer payload is not marked as model output")
+        return raw
 
 
 def _analysis_and_events_from_raw(raw: Mapping[str, Any], case: Mapping[str, Any]):
@@ -182,12 +329,18 @@ def legacy_baseline_adapter(case: Mapping[str, Any], raw: Mapping[str, Any], des
     from backend.jianpu_score.render import render_score
 
     analysis, events = _analysis_and_events_from_raw(raw, case)
+    destination = destination.resolve()
     destination.mkdir(parents=True, exist_ok=True)
     score = quantize_events(events, analysis, mode="polyphonic", title=str(case.get("title") or case["id"]))
     score_path = destination / "baseline.score.json"
     score_path.write_text(json.dumps(score.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     rendered = render_score(score, destination / "render", basename="baseline")
-    return {"engine": "legacy-uniform-grid", "score_json": str(score_path.relative_to(destination)), "render": rendered.model_dump(mode="json")}
+    beat_path = destination / "beat_grid.json"
+    beat_path.write_text(json.dumps(raw.get("beat_grid", {}), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    final_midi = Path(rendered.midi_path).resolve() if rendered.midi_path else None
+    if final_midi is None or not final_midi.is_file():
+        raise RuntimeError("legacy baseline renderer did not produce final MIDI")
+    return {"engine": "legacy-uniform-grid", "score_json": str(score_path.relative_to(destination.resolve())), "render": rendered.model_dump(mode="json"), "final_midi": str(final_midi.relative_to(destination.resolve())), "beat_grid": "beat_grid.json", "profile": "legacy-uniform-grid"}
 
 
 def high_accuracy_service_adapter(case: Mapping[str, Any], raw: Mapping[str, Any], destination: Path) -> Mapping[str, Any]:
@@ -196,9 +349,21 @@ def high_accuracy_service_adapter(case: Mapping[str, Any], raw: Mapping[str, Any
     from backend.jianpu_score.high_accuracy_service import build_high_accuracy_artifacts
 
     analysis, events = _analysis_and_events_from_raw(raw, case)
+    destination = destination.resolve()
     service_output = destination / "service_output"
-    result = build_high_accuracy_artifacts(instrument_id=str(case["id"]), title=str(case.get("title") or case["id"]), program=int(case.get("program", 0)), is_drum=False, events=events, analysis=analysis, output_dir=service_output, variant="benchmark-new", overwrite=False)
-    return {"engine": "musescore-midi-import", "manifest": str(result.manifest_path.relative_to(destination)), "status": result.status, "jianpu_status": result.jianpu_status, "artifacts": [artifact.as_dict() for artifact in result.artifacts]}
+    source_kind = str(case.get("source_kind"))
+    variant = "game-cleaned" if source_kind == "vocal" else "instrument-part"
+    result = build_high_accuracy_artifacts(instrument_id=str(case["id"]), title=str(case.get("title") or case["id"]), program=int(case.get("program", 0)), is_drum=False, events=events, analysis=analysis, output_dir=service_output, variant=variant, overwrite=False)
+    beat_path = destination / "beat_grid.json"
+    beat_path.write_text(json.dumps(raw.get("beat_grid", {}), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    artifact_dicts = [artifact.as_dict() for artifact in result.artifacts]
+    score_artifact = next((item for item in artifact_dicts if "score_midi" in str(item.get("kind", "")) or str(item.get("relative_path", "")).endswith("score.mid")), None)
+    if score_artifact is None:
+        raise RuntimeError("high-accuracy service did not register final score MIDI")
+    final_midi = service_output / str(score_artifact["relative_path"])
+    if not final_midi.is_file():
+        raise RuntimeError(f"high-accuracy final MIDI is missing: {final_midi}")
+    return {"engine": "musescore-midi-import", "variant": variant, "profile": variant, "manifest": str(result.manifest_path.relative_to(destination.resolve())), "status": result.status, "jianpu_status": result.jianpu_status, "artifacts": artifact_dicts, "final_midi": str(final_midi.relative_to(destination.resolve())), "beat_grid": "beat_grid.json"}
 
 
 class BenchmarkBatchRunner:
@@ -218,30 +383,40 @@ class BenchmarkBatchRunner:
         self.timeout_sec = float(timeout_sec)
 
     def _call_with_timeout(self, adapter: Adapter, case: Mapping[str, Any], raw: Mapping[str, Any], destination: Path, stage: str) -> Mapping[str, Any]:
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"benchmark-{stage}")
-        future: Future[Mapping[str, Any]] = executor.submit(adapter, case, copy.deepcopy(raw), destination)
+        started = time.monotonic()
         try:
-            result = future.result(timeout=self.timeout_sec)
-        except FutureTimeout as exc:
-            future.cancel()
-            raise BatchRunError(str(case["id"]), stage, f"timeout after {self.timeout_sec:g}s") from exc
+            # ProductionRecognizer owns a killable process tree.  Other
+            # adapters run synchronously so a timeout never leaves a model or
+            # external process running behind the resumable manifest.
+            result = adapter(case, copy.deepcopy(raw), destination)
         except BatchRunError:
             raise
         except Exception as exc:
             raise BatchRunError(str(case["id"]), stage, f"{type(exc).__name__}: {exc}") from exc
-        finally:
-            # A timed out worker may still be unwinding, but it cannot block
-            # the resumable manifest writer or be mistaken for a successful
-            # second pipeline.
-            executor.shutdown(wait=False, cancel_futures=True)
+        elapsed = time.monotonic() - started
+        if elapsed > self.timeout_sec:
+            raise BatchRunError(
+                str(case["id"]),
+                stage,
+                f"adapter exceeded {self.timeout_sec:g}s after synchronous cleanup ({elapsed:.1f}s); no background worker was left running",
+            )
         if not isinstance(result, Mapping):
             raise BatchRunError(str(case["id"]), stage, "adapter must return a JSON object")
         return result
 
-    def run_case(self, case: Mapping[str, Any], *, result_root: Path, resume: bool = True) -> dict[str, Any]:
+    def run_case(
+        self,
+        case: Mapping[str, Any],
+        *,
+        result_root: Path,
+        baseline_result_root: Path | None = None,
+        new_result_root: Path | None = None,
+        resume: bool = True,
+    ) -> dict[str, Any]:
         case_id = str(case["id"])
         case_dir = _safe_case_dir(result_root, case_id)
         case_dir.mkdir(parents=True, exist_ok=True)
+        baseline_root, new_root = _pipeline_roots(result_root, baseline_result_root, new_result_root)
         manifest_path = case_dir / "manifest.json"
         state: dict[str, Any] = {
             "schema_version": RUNNER_SCHEMA_VERSION,
@@ -250,6 +425,7 @@ class BenchmarkBatchRunner:
             "evaluation_scope": case.get("evaluation_scope"),
             "raw": None,
             "pipelines": {},
+            "pipeline_roots": {"baseline": str(baseline_root), "new": str(new_root)},
             "error": None,
         }
         raw_dir = case_dir / "raw"
@@ -271,22 +447,43 @@ class BenchmarkBatchRunner:
             state["raw"] = {"recognition": "raw/recognition.json", "recognition_sha256": raw_hash, "beat_grid": "raw/beat_grid.json", "beat_grid_sha256": beat_hash, "immutable": True, "model_output": raw.get("model_output") is not False}
             if _sha256(raw_path) != raw_hash:
                 raise BatchRunError(case_id, "raw", "raw recognition changed during pipeline")
-            for name, adapter in (("baseline", self.baseline), ("new", self.new_chain)):
-                destination = case_dir / name
+            for name, adapter, pipeline_root in (
+                ("baseline", self.baseline, baseline_root),
+                ("new", self.new_chain, new_root),
+            ):
+                destination = _safe_case_dir(pipeline_root, case_id)
                 pipeline_manifest = destination / "manifest.json"
                 if resume and pipeline_manifest.is_file():
                     existing = json.loads(pipeline_manifest.read_text(encoding="utf-8"))
-                    if isinstance(existing, Mapping) and existing.get("status") == "success":
+                    if (
+                        isinstance(existing, Mapping)
+                        and existing.get("status") == "success"
+                        and existing.get("raw_recognition_sha256") == raw_hash
+                    ):
                         state["pipelines"][name] = existing
                         continue
                 if adapter is None:
-                    failure = {"status": "failed", "stage": name, "error": "adapter is not configured; no result fabricated"}
+                    failure = {"schema_version": RUNNER_SCHEMA_VERSION, "case_id": case_id, "pipeline": name, "status": "failed", "stage": name, "error": "adapter is not configured; no result fabricated"}
                     destination.mkdir(parents=True, exist_ok=True)
                     _replace_json(destination / "manifest.json", failure)
                     state["pipelines"][name] = failure
                     continue
                 result = self._call_with_timeout(adapter, case, raw, destination, name)
-                pipeline_state = {"status": "success", "stage": name, "raw_recognition_sha256": raw_hash, "result": result}
+                pipeline_state = {
+                    "schema_version": RUNNER_SCHEMA_VERSION,
+                    "case_id": case_id,
+                    "pipeline": name,
+                    "status": "success",
+                    "stage": name,
+                    "evaluation_scope": case.get("evaluation_scope"),
+                    "source_kind": case.get("source_kind"),
+                    "raw_model_output": raw.get("model_output") is True,
+                    "raw_recognition_sha256": raw_hash,
+                    "result": result,
+                    "final_midi": result.get("final_midi"),
+                    "beat_grid": result.get("beat_grid"),
+                    "manifest_path": str(pipeline_manifest),
+                }
                 destination.mkdir(parents=True, exist_ok=True)
                 pipeline_state["manifest_sha256"] = _replace_json(pipeline_manifest, pipeline_state)
                 state["pipelines"][name] = pipeline_state
@@ -319,10 +516,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_REGISTRY)
     parser.add_argument("--result-root", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--baseline-result-root", type=Path, help="baseline pipeline manifests/artifacts root")
+    parser.add_argument("--new-result-root", type=Path, help="new pipeline manifests/artifacts root")
     parser.add_argument("--case-id", action="append", dest="case_ids")
-    parser.add_argument("--reference-isolation", action="store_true", help="显式使用参考 MIDI 准备量化器隔离 raw；不代表模型识别")
+    recognition = parser.add_mutually_exclusive_group()
+    recognition.add_argument("--reference-isolation", action="store_true", help="显式使用参考 MIDI 准备量化器隔离 raw；不代表模型识别")
+    recognition.add_argument("--production-recognizer", action="store_true", help="显式运行可终止的 MuScriptor/Demucs/GAME/BeatNet production worker")
     parser.add_argument("--run-legacy-baseline", action="store_true", help="在已准备的 raw 上运行保留的旧均匀网格 baseline")
     parser.add_argument("--run-new-chain", action="store_true", help="在已准备的 raw 上运行当前高精度服务")
+    parser.add_argument("--demucs-model", choices=("htdemucs", "htdemucs_ft"), help="vocal production route 的 Demucs model")
     parser.add_argument("--timeout-sec", type=float, default=1800.0)
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args(argv)
@@ -330,12 +532,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     cases = [case for case in registry["cases"] if not args.case_ids or str(case.get("id")) in set(args.case_ids)]
     if not cases:
         raise SystemExit("no benchmark cases selected")
+    if args.timeout_sec <= 0:
+        parser.error("--timeout-sec must be greater than zero")
     recognizer: Adapter | None = None
     if args.reference_isolation:
         def reference_recognizer(case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
             return _reference_isolation_payload(case, root=ROOT)
 
         recognizer = reference_recognizer
+    elif args.production_recognizer or args.run_legacy_baseline or args.run_new_chain:
+        recognizer = ProductionRecognizer(timeout_sec=args.timeout_sec, demucs_model=args.demucs_model)
     runner = BenchmarkBatchRunner(
         recognizer=recognizer,
         baseline=legacy_baseline_adapter if args.run_legacy_baseline else None,
@@ -344,8 +550,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     result_root = args.result_root.resolve()
     result_root.mkdir(parents=True, exist_ok=True)
-    outcomes = [runner.run_case(case, result_root=result_root, resume=not args.no_resume) for case in cases]
-    print(json.dumps({"result_root": str(result_root), "cases": [{"id": item["case_id"], "status": item["status"], "error": item.get("error")} for item in outcomes]}, ensure_ascii=False))
+    baseline_root = args.baseline_result_root.resolve() if args.baseline_result_root else None
+    new_root = args.new_result_root.resolve() if args.new_result_root else None
+    outcomes = [
+        runner.run_case(
+            case,
+            result_root=result_root,
+            baseline_result_root=baseline_root,
+            new_result_root=new_root,
+            resume=not args.no_resume,
+        )
+        for case in cases
+    ]
+    print(
+        json.dumps(
+            {
+                "result_root": str(result_root),
+                "baseline_result_root": str(baseline_root or result_root / "baseline"),
+                "new_result_root": str(new_root or result_root / "new"),
+                "recognizer": "reference-isolation" if args.reference_isolation else "production" if recognizer is not None else None,
+                "cases": [{"id": item["case_id"], "status": item["status"], "error": item.get("error")} for item in outcomes],
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0 if all(item["status"] == "success" for item in outcomes) else 2
 
 

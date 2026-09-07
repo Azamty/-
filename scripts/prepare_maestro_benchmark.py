@@ -6,7 +6,9 @@ it.  The archive hash is checked before extraction; selected members and their
 hashes are recorded so a later run cannot silently switch the public data.
 Audio is rendered locally from the selected MIDI, which makes these cases a
 quantizer-isolation subset until a separately licensed performance recording
-is supplied.
+is supplied.  The local renderer is a deterministic sine-oscillator fixture;
+it preserves MIDI timing and pitch but does not claim to reproduce piano
+timbre, pedal noise, room acoustics, or the original MAESTRO performance.
 """
 
 from __future__ import annotations
@@ -116,7 +118,24 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
             end_q = max((note.end for track in tracks for note in track.notes), default=Fraction(1))
             _beat_annotation(beat_destination, tempo=tempo, meter=(4, 4), end_q=end_q, source="official_maestro_midi_rendered")
             records.append({"id": normalized_id, "archive_member": member, "midi": {"path": midi_destination.name, "bytes": midi_destination.stat().st_size, "sha256": _sha256(midi_destination)}, "audio": {"path": audio_destination.name, "bytes": audio_destination.stat().st_size, "sha256": _sha256(audio_destination)}, "beat_annotation": {"path": beat_destination.name, "bytes": beat_destination.stat().st_size, "sha256": _sha256(beat_destination)}, "ticks_per_beat": midi.ticks_per_beat})
-    manifest = {"schema_version": "1.0", "source_url": "https://magenta.tensorflow.org/datasets/maestro", "download_url": DEFAULT_URL, "license": "CC BY-NC-SA 4.0", "render_seed": 20260907, "archive": {"path": str(archive), "bytes": archive.stat().st_size, "sha256": actual_sha}, "selection_rule": "sorted archive MIDI member names, first ten after hash verification", "cases": records}
+    manifest = {
+        "schema_version": "1.0",
+        "source_url": "https://magenta.tensorflow.org/datasets/maestro",
+        "download_url": DEFAULT_URL,
+        "license": "CC BY-NC-SA 4.0",
+        "render_seed": 20260907,
+        "archive": {"path": str(archive), "bytes": archive.stat().st_size, "sha256": actual_sha},
+        "selection_rule": "sorted archive MIDI member names, first ten after hash verification",
+        "render_domain": {
+            "kind": "local_midi_render",
+            "renderer": "deterministic_sine_oscillator",
+            "preserves": ["MIDI pitch", "MIDI onset and duration", "tempo map"],
+            "does_not_model": ["piano timbre", "pedal noise", "room acoustics", "original performance nuance"],
+            "evaluation_scope": "quantizer_isolation",
+            "production_end_to_end": False,
+        },
+        "cases": records,
+    }
     selection_manifest = output_root / "selection_manifest.json"
     temporary = selection_manifest.with_suffix(".tmp")
     temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

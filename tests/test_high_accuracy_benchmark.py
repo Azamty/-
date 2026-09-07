@@ -108,6 +108,95 @@ def test_downbeat_reader_does_not_treat_unmarked_beats_as_downbeats(tmp_path: Pa
     assert benchmark._read_time_points(explicit, downbeats=True) == [0.0, 2.0]
 
 
+def test_evaluator_never_scans_neighbor_pipeline_artifacts(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.mid"
+    _write_midi(reference)
+    input_audio = tmp_path / "input.wav"
+    input_audio.write_bytes(b"fixture")
+    root = tmp_path / "results"
+    case_root = root / "case-1"
+    case_root.mkdir(parents=True)
+    # This is the counterexample that the old rglob fallback selected from a
+    # neighboring pipeline when the selected manifest did not declare an
+    # artifact.  A missing declaration must remain not_evaluated.
+    (case_root / "baseline").mkdir()
+    _write_midi(case_root / "baseline" / "wrong.score.mid")
+    (case_root / "manifest.json").write_text(json.dumps({"status": "success", "artifacts": []}), encoding="utf-8")
+    case = {
+        "id": "case-1",
+        "title": "fixture",
+        "input": str(input_audio),
+        "reference_midi": str(reference),
+        "reference_midi_reliable": True,
+        "beat_annotation": None,
+        "evaluation_policy": "reference_metrics",
+    }
+    evaluated = benchmark.evaluate_case(case, result_root=root)
+    assert evaluated["status"] == "not_evaluated"
+    assert "final MIDI" in evaluated["reason"]
+
+
+def test_reference_derived_pjs_beats_are_excluded_from_beatnet_f1(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.mid"
+    _write_midi(reference)
+    input_audio = tmp_path / "input.wav"
+    input_audio.write_bytes(b"fixture")
+    beat_annotation = tmp_path / "reference-derived-beats.json"
+    beat_annotation.write_text(json.dumps({"beat_grid": {"beats": [{"time_sec": 0.0, "downbeat": True}]}}), encoding="utf-8")
+    root = tmp_path / "results"
+    case_root = root / "pjs001"
+    case_root.mkdir(parents=True)
+    result_midi = case_root / "pjs001.score.mid"
+    _write_midi(result_midi)
+    beat_grid = case_root / "beat_grid.json"
+    beat_grid.write_text(json.dumps({"beats": [{"time_sec": 0.0, "downbeat": True}]}), encoding="utf-8")
+    (case_root / "manifest.json").write_text(
+        json.dumps({"status": "success", "artifacts": [{"kind": "score_midi", "relative_path": result_midi.name}, {"kind": "beat_grid_json", "relative_path": beat_grid.name}]}),
+        encoding="utf-8",
+    )
+    case = {
+        "id": "pjs001",
+        "title": "PJS",
+        "input": str(input_audio),
+        "reference_midi": str(reference),
+        "reference_midi_reliable": True,
+        "beat_annotation": str(beat_annotation),
+        "evaluation_policy": "reference_metrics",
+        "evaluation_scope": "end_to_end_pitch_rhythm_reference_derived_beats",
+    }
+    evaluated = benchmark.evaluate_case(case, result_root=root)
+    assert evaluated["status"] == "evaluated"
+    assert evaluated["beat_metrics_eligible"] is False
+    assert evaluated["metrics"]["beat_f1"] is None
+    assert "reference MIDI" in evaluated["beat_metrics_reason"]
+
+
+def test_accuracy_gate_reports_quantizer_and_production_scopes_separately() -> None:
+    def case(case_id: str, scope: str, rhythm: float) -> dict[str, object]:
+        return {
+            "id": case_id,
+            "status": "evaluated",
+            "crash": False,
+            "evaluation_policy": "reference_metrics",
+            "reference_midi_reliable": True,
+            "evaluation_scope": scope,
+            "metrics": {
+                "pitch_f1": {"f1": 0.9},
+                "chord_retention": {"retention": 0.9},
+                "rhythm_error": {"mean_rhythm_error_quarter": rhythm},
+                "beat_f1": None,
+                "downbeat_f1": None,
+            },
+        }
+
+    new = [case("quantizer", "quantizer_isolation_fixture", 0.1), case("production", "end_to_end_pitch_rhythm_reference_derived_beats", 0.1)]
+    baseline = [case("quantizer", "quantizer_isolation_fixture", 0.2), case("production", "end_to_end_pitch_rhythm_reference_derived_beats", 0.2)]
+    claim = benchmark.assess_accuracy_claim(new, baseline, minimum_cases=2)
+    assert claim["scopes"]["quantizer_isolation_overall"]["ready"] is True
+    assert claim["scopes"]["production_end_to_end_subset"]["ready"] is True
+    assert claim["scopes"]["production_end_to_end_subset"]["require_beat_metrics"] is False
+
+
 def test_manual_only_reference_never_becomes_accuracy_result(tmp_path: Path) -> None:
     case = {
         "id": "manual",

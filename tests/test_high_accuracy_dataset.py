@@ -127,6 +127,30 @@ def test_batch_runner_can_resume_failed_pipeline_without_rerunning_raw(tmp_path:
     assert calls["recognizer"] == 1
 
 
+def test_batch_runner_writes_baseline_and_new_to_explicit_independent_roots(tmp_path: Path) -> None:
+    def recognizer(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        return {"notes": [{"midi": 60}], "beat_grid": {"beats": []}, "model_output": True}
+
+    def adapter(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        return {"ok": True}
+
+    raw_root = tmp_path / "raw"
+    baseline_root = tmp_path / "baseline"
+    new_root = tmp_path / "new"
+    outcome = runner_module.BenchmarkBatchRunner(recognizer=recognizer, baseline=adapter, new_chain=adapter).run_case(
+        {"id": "separate", "evaluation_scope": "test"},
+        result_root=raw_root,
+        baseline_result_root=baseline_root,
+        new_result_root=new_root,
+    )
+    assert outcome["status"] == "success"
+    assert (raw_root / "separate" / "raw" / "recognition.json").is_file()
+    assert (baseline_root / "separate" / "manifest.json").is_file()
+    assert (new_root / "separate" / "manifest.json").is_file()
+    assert not (raw_root / "separate" / "baseline").exists()
+    assert not (raw_root / "separate" / "new").exists()
+
+
 def test_maestro_selector_records_archive_and_member_hashes(tmp_path: Path, monkeypatch) -> None:
     import mido
     import zipfile

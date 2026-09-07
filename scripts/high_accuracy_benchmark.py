@@ -222,22 +222,65 @@ def beat_f1(reference: Sequence[float], predicted: Sequence[float], *, tolerance
     return _f1(true_positive, true_positive, len(predicted), len(reference))
 
 
+def _manifest_artifacts(manifest: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return only artifacts explicitly declared by the selected manifest."""
+
+    values: list[Mapping[str, Any]] = []
+    for owner in (manifest, manifest.get("result") if isinstance(manifest.get("result"), Mapping) else None):
+        if isinstance(owner, Mapping) and isinstance(owner.get("artifacts"), list):
+            values.extend(item for item in owner["artifacts"] if isinstance(item, Mapping))
+    return values
+
+
+def _safe_manifest_path(result_root: Path, value: Any) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = (result_root / value).resolve()
+    if not candidate.is_relative_to(result_root.resolve()) or not candidate.is_file():
+        return None
+    return candidate
+
+
 def _find_result_artifact(result_root: Path, manifest: Mapping[str, Any], suffixes: Iterable[str]) -> Path | None:
-    artifacts = manifest.get("artifacts", [])
-    for artifact in artifacts if isinstance(artifacts, list) else []:
-        if not isinstance(artifact, Mapping):
-            continue
-        kind = str(artifact.get("kind", ""))
+    """Resolve one artifact from manifest declarations; never scan by suffix.
+
+    A benchmark must fail closed when a manifest names multiple candidates.  A
+    recursive directory scan can silently select baseline/performance output
+    from a neighboring pipeline and is therefore not an acceptable fallback.
+    """
+
+    suffix_values = tuple(str(suffix).lower() for suffix in suffixes)
+    candidates: list[Path] = []
+    owners: list[Mapping[str, Any]] = [manifest]
+    nested = manifest.get("result")
+    if isinstance(nested, Mapping):
+        owners.append(nested)
+    for owner in owners:
+        for key in ("final_midi", "beat_grid", "beat_grid_path"):
+            path = _safe_manifest_path(result_root, owner.get(key))
+            if path is not None and (
+                any(str(path).lower().endswith(suffix) for suffix in suffix_values)
+                or key == "final_midi" and any("midi" in suffix for suffix in suffix_values)
+                or key.startswith("beat_grid") and any("beat_grid" in suffix for suffix in suffix_values)
+            ):
+                candidates.append(path)
+    for artifact in _manifest_artifacts(manifest):
         relative = artifact.get("relative_path") or artifact.get("path")
-        if relative and any(suffix in kind or str(relative).lower().endswith(suffix) for suffix in suffixes):
-            candidate = (result_root / str(relative)).resolve()
-            if candidate.is_file() and candidate.is_relative_to(result_root.resolve()):
-                return candidate
-    for suffix in suffixes:
-        matches = sorted(result_root.rglob(f"*{suffix}"))
-        if matches:
-            return matches[0]
-    return None
+        kind = str(artifact.get("kind", "")).lower()
+        path = _safe_manifest_path(result_root, relative)
+        kind_tokens = {suffix.lstrip(".").replace(".", "_") for suffix in suffix_values}
+        kind_tokens.update(
+            token.replace("_mid", "_midi")
+            for token in kind_tokens
+            if token.endswith("_mid")
+        )
+        if path is not None and (
+            any(str(path).lower().endswith(suffix) for suffix in suffix_values)
+            or any(token in kind for token in kind_tokens)
+        ):
+            candidates.append(path)
+    unique = list(dict.fromkeys(candidates))
+    return unique[0] if len(unique) == 1 else None
 
 
 def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -> dict[str, Any]:
@@ -257,6 +300,8 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         "status": "registered",
         "crash": None,
         "metrics": {"pitch_f1": None, "chord_retention": None, "rhythm_error": None, "beat_f1": None, "downbeat_f1": None},
+        "beat_metrics_eligible": False,
+        "beat_metrics_reason": None,
         "notes": case.get("notes", ""),
     }
     if result_root is None:
@@ -299,8 +344,31 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         }
         result.update({"status": "evaluated", "result_midi": str(predicted_path), "reference_ppq": ref_ppq, "result_ppq": pred_ppq})
         beat_path = _resolve_path(case.get("beat_annotation"))
-        result["metrics"]["beat_f1"] = beat_f1(_read_time_points(beat_path), _read_time_points(_find_result_artifact(case_root, manifest, ("beat_grid.json",)))) if beat_path else None
-        result["metrics"]["downbeat_f1"] = beat_f1(_read_time_points(beat_path, downbeats=True), _read_time_points(_find_result_artifact(case_root, manifest, ("beat_grid.json",)), downbeats=True)) if beat_path else None
+        scope = str(case.get("evaluation_scope") or "")
+        reference_derived = (
+            "reference_derived" in scope
+            or str(case.get("beat_annotation_source") or "").casefold() in {"reference_midi", "reference-derived", "same_reference"}
+        )
+        quantizer_isolation = scope.startswith("quantizer_isolation")
+        raw_model_output = manifest.get("raw_model_output")
+        if raw_model_output is None and isinstance(manifest.get("result"), Mapping):
+            raw_model_output = manifest["result"].get("raw_model_output")
+        beat_eligible = bool(beat_path) and not reference_derived and not quantizer_isolation and case.get("beat_annotation_independent", True) is not False and raw_model_output is not False
+        result["beat_metrics_eligible"] = beat_eligible
+        if not beat_path:
+            result["beat_metrics_reason"] = "beat annotation unavailable"
+        elif reference_derived:
+            result["beat_metrics_reason"] = "beat annotation is derived from the reference MIDI; excluded from independent BeatNet F1"
+        elif quantizer_isolation:
+            result["beat_metrics_reason"] = "quantizer-isolation case; beat grid is not an independent production recognition result"
+        elif raw_model_output is False:
+            result["beat_metrics_reason"] = "result manifest is reference-derived rather than model output"
+        elif not beat_eligible:
+            result["beat_metrics_reason"] = "case does not declare an independent beat annotation"
+        if beat_eligible:
+            predicted_beat_path = _find_result_artifact(case_root, manifest, ("beat_grid.json",))
+            result["metrics"]["beat_f1"] = beat_f1(_read_time_points(beat_path), _read_time_points(predicted_beat_path))
+            result["metrics"]["downbeat_f1"] = beat_f1(_read_time_points(beat_path, downbeats=True), _read_time_points(predicted_beat_path, downbeats=True))
     except Exception as exc:  # benchmark must record a crash instead of hiding it
         result.update({"status": "crashed", "crash": True, "reason": f"{type(exc).__name__}: {exc}"})
     return result
@@ -355,6 +423,8 @@ def assess_accuracy_claim(
     baseline_cases: Sequence[Mapping[str, Any]] | None,
     *,
     minimum_cases: int = 30,
+    require_beat_metrics: bool = True,
+    _include_scopes: bool = True,
 ) -> dict[str, Any]:
     """Apply the stated accuracy gate without filling missing results.
 
@@ -406,10 +476,11 @@ def assess_accuracy_claim(
 
     new_beat = _mean_metric(reliable, "beat_f1", "f1")
     new_downbeat = _mean_metric(reliable, "downbeat_f1", "f1")
-    if new_beat is None or new_beat < 0.85:
-        reasons.append(f"拍点 F1 不足 0.85（当前 {new_beat if new_beat is not None else '缺失'}）")
-    if new_downbeat is None or new_downbeat < 0.75:
-        reasons.append(f"重拍 F1 不足 0.75（当前 {new_downbeat if new_downbeat is not None else '缺失'}）")
+    if require_beat_metrics:
+        if new_beat is None or new_beat < 0.85:
+            reasons.append(f"拍点 F1 不足 0.85（当前 {new_beat if new_beat is not None else '缺失'}）")
+        if new_downbeat is None or new_downbeat < 0.75:
+            reasons.append(f"重拍 F1 不足 0.75（当前 {new_downbeat if new_downbeat is not None else '缺失'}）")
 
     baseline_rhythm = _mean_metric(baseline_reliable, "rhythm_error", "mean_rhythm_error_quarter")
     new_rhythm = _mean_metric(reliable, "rhythm_error", "mean_rhythm_error_quarter")
@@ -431,10 +502,11 @@ def assess_accuracy_claim(
         reasons.append("新链路或 baseline 缺少和弦保留率")
     elif new_chord < baseline_chord:
         reasons.append(f"和弦保留率下降（新 {new_chord:.6f}，baseline {baseline_chord:.6f}）")
-    return {
+    result = {
         "ready": not reasons,
-        "reason": "; ".join(reasons) if reasons else "已满足30个可靠样本、拍点/重拍、节奏、音高、和弦和无崩溃门槛",
+        "reason": "; ".join(reasons) if reasons else "已满足可靠样本、节奏、音高、和弦和无崩溃门槛" if not require_beat_metrics else "已满足30个可靠样本、拍点/重拍、节奏、音高、和弦和无崩溃门槛",
         "minimum_cases": minimum_cases,
+        "require_beat_metrics": require_beat_metrics,
         "new_reliable_count": len(reliable),
         "baseline_reliable_count": len(baseline_reliable),
         "new_reliable_total": len(new_by_id),
@@ -449,6 +521,51 @@ def assess_accuracy_claim(
         "new_mean_chord_retention": new_chord,
         "baseline_mean_chord_retention": baseline_chord,
     }
+    if _include_scopes:
+        quantizer_cases = [case for case in cases if str(case.get("evaluation_scope") or "").startswith("quantizer_isolation")]
+        quantizer_baseline = (
+            [case for case in baseline_cases if str(case.get("evaluation_scope") or "").startswith("quantizer_isolation")]
+            if baseline_cases is not None
+            else None
+        )
+        production_cases = [
+            case
+            for case in cases
+            if str(case.get("evaluation_scope") or "").startswith(("end_to_end", "production_end_to_end"))
+        ]
+        production_baseline = (
+            [
+                case
+                for case in baseline_cases
+                if str(case.get("evaluation_scope") or "").startswith(("end_to_end", "production_end_to_end"))
+            ]
+            if baseline_cases is not None
+            else None
+        )
+        scopes: dict[str, Any] = {}
+        if quantizer_cases:
+            scopes["quantizer_isolation_overall"] = assess_accuracy_claim(
+                quantizer_cases,
+                quantizer_baseline,
+                minimum_cases=len(quantizer_cases),
+                require_beat_metrics=False,
+                _include_scopes=False,
+            )
+        if production_cases:
+            production_requires_beats = any(
+                case.get("beat_metrics_eligible") is True
+                or _metric_f1(case, "beat_f1", "f1") is not None
+                for case in production_cases
+            )
+            scopes["production_end_to_end_subset"] = assess_accuracy_claim(
+                production_cases,
+                production_baseline,
+                minimum_cases=len(production_cases),
+                require_beat_metrics=production_requires_beats,
+                _include_scopes=False,
+            )
+        result["scopes"] = scopes
+    return result
 
 
 def build_report(
@@ -469,6 +586,17 @@ def build_report(
         else None
     )
     claim = assess_accuracy_claim(cases, baseline_cases)
+    scoped_claims = claim.get("scopes", {})
+    accuracy_ready = (
+        all(item.get("ready") is True for item in scoped_claims.values())
+        if scoped_claims
+        else claim["ready"]
+    )
+    accuracy_reason = (
+        "; ".join(f"{name}: {value.get('reason')}" for name, value in scoped_claims.items())
+        if scoped_claims and not accuracy_ready
+        else claim["reason"]
+    )
     return {
         "schema_version": "2.0",
         "registry": str(DEFAULT_REGISTRY),
@@ -477,9 +605,10 @@ def build_report(
         "evaluated_count": len(evaluated),
         "crash_count": len(crashed),
         "baseline_result_root": str(baseline_root) if baseline_root else None,
-        "accuracy_claim_ready": claim["ready"],
-        "accuracy_claim_reason": claim["reason"],
+        "accuracy_claim_ready": accuracy_ready,
+        "accuracy_claim_reason": accuracy_reason,
         "accuracy_gate": claim,
+        "accuracy_gate_scopes": scoped_claims,
         "cases": cases,
     }
 
