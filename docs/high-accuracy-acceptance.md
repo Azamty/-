@@ -86,7 +86,7 @@ MIDI 音符指标先把各文件的 tick 精确换算为四分音符位置，因
   --baseline-result-root .\artifacts\review\high-accuracy-benchmark\baseline
 ```
 
-报告会分别给出 `accuracy_gate_scopes.quantizer_isolation_overall` 与 `accuracy_gate_scopes.production_end_to_end_subset`，但它们只是诊断。`accuracy_claim_ready` 的唯一主门槛是 baseline/new 共享的 30 个可靠 production case，且 production raw 必须来自模型输出；quantizer isolation case、1+1 的 scope 拆分或 reference-derived raw 都不能替代这 30 个 case。production gate 始终要求独立 BeatNet/人工拍点与重拍指标，缺少独立拍点不会自动关闭该门槛；PJS 的同源 MIDI 派生拍点不会计入独立 BeatNet F1。量化器隔离总体只比较共享 raw 上的节奏、音高和和弦；端到端子集按真实音频模型产物比较同样指标。主门槛还必须满足无崩溃、节奏误差相对 baseline 下降至少 20%、pitch F1 下降不超过 0.01 且和弦保留率不下降；缺少任何数据会列出具体原因并保持 `false`。也可以用 `--baseline-report` 读取已经生成的 baseline 报告。
+报告会分别给出 `accuracy_gate_scopes.quantizer_isolation_overall` 与 `accuracy_gate_scopes.production_end_to_end_subset`，但它们只是诊断。`accuracy_claim_ready` 的唯一主门槛是 baseline/new 共享的 30 个可靠 production case，且 production raw 必须来自模型输出；quantizer isolation case、1+1 的 scope 拆分或 reference-derived raw 都不能替代这 30 个 case。production gate 还要求至少 25 个 eligible case 同时有 BeatNet beat/downbeat 指标，不能用少数 case 的高平均分覆盖缺失样本。合成音频和本地 MIDI 渲染的 25 个拍点文件是由精确 MIDI render ground truth 推导的可复现模型独立标注，不是人工拍点；PJS 的 5 个同源 MIDI 派生拍点明确 excluded，不计入独立 BeatNet F1。量化器隔离总体只比较共享 raw 上的节奏、音高和和弦；端到端子集按真实音频模型产物比较同样指标。主门槛还必须满足无崩溃、节奏误差相对 baseline 下降至少 20%、pitch F1 下降不超过 0.01 且和弦保留率不下降；缺少任何数据会列出具体原因并保持 `false`。也可以用 `--baseline-report` 读取已经生成的 baseline 报告。
 
 运行后端与前端检查：
 

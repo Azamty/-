@@ -319,6 +319,7 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         "reference_midi": _file_record(case.get("reference_midi"), required=False),
         "reference_midi_reliable": bool(case.get("reference_midi_reliable", False)),
         "beat_annotation": _file_record(case.get("beat_annotation"), required=False),
+        "beat_annotation_independent": case.get("beat_annotation_independent") is True,
         "evaluation_policy": case.get("evaluation_policy", "reference_metrics"),
         "evaluation_scope": case.get("evaluation_scope"),
         "case_evaluation_scope": case.get("evaluation_scope"),
@@ -453,6 +454,7 @@ def assess_accuracy_claim(
     *,
     minimum_cases: int = 30,
     require_beat_metrics: bool = True,
+    minimum_beat_cases: int | None = None,
     _include_scopes: bool = True,
 ) -> dict[str, Any]:
     """Apply the stated accuracy gate without filling missing results.
@@ -505,7 +507,15 @@ def assess_accuracy_claim(
 
     new_beat = _mean_metric(reliable, "beat_f1", "f1")
     new_downbeat = _mean_metric(reliable, "downbeat_f1", "f1")
+    beat_case_count = sum(
+        case.get("beat_metrics_eligible", True) is not False
+        and _metric_f1(case, "beat_f1", "f1") is not None
+        and _metric_f1(case, "downbeat_f1", "f1") is not None
+        for case in reliable
+    )
     if require_beat_metrics:
+        if minimum_beat_cases is not None and beat_case_count < minimum_beat_cases:
+            reasons.append(f"独立 BeatNet 拍点/重拍指标只有 {beat_case_count}/{minimum_beat_cases} 个 case")
         if new_beat is None or new_beat < 0.85:
             reasons.append(f"拍点 F1 不足 0.85（当前 {new_beat if new_beat is not None else '缺失'}）")
         if new_downbeat is None or new_downbeat < 0.75:
@@ -536,6 +546,8 @@ def assess_accuracy_claim(
         "reason": "; ".join(reasons) if reasons else "已满足可靠样本、节奏、音高、和弦和无崩溃门槛" if not require_beat_metrics else "已满足30个可靠样本、拍点/重拍、节奏、音高、和弦和无崩溃门槛",
         "minimum_cases": minimum_cases,
         "require_beat_metrics": require_beat_metrics,
+        "minimum_beat_cases": minimum_beat_cases,
+        "beat_cases_with_metrics": beat_case_count,
         "new_reliable_count": len(reliable),
         "baseline_reliable_count": len(baseline_reliable),
         "new_reliable_total": len(new_by_id),
@@ -581,11 +593,13 @@ def assess_accuracy_claim(
                 _include_scopes=False,
             )
         if production_cases:
+            expected_beat_cases = sum(case.get("beat_annotation_independent") is True for case in production_cases)
             scopes["production_end_to_end_subset"] = assess_accuracy_claim(
                 production_cases,
                 production_baseline,
                 minimum_cases=len(production_cases),
                 require_beat_metrics=True,
+                minimum_beat_cases=expected_beat_cases,
                 _include_scopes=False,
             )
         result["scopes"] = scopes
@@ -631,6 +645,7 @@ def build_report(
         production_baseline,
         minimum_cases=30,
         require_beat_metrics=True,
+        minimum_beat_cases=25,
         _include_scopes=False,
     )
     diagnostic_claim = assess_accuracy_claim(cases, baseline_cases)

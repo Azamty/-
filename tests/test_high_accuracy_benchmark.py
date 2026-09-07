@@ -34,6 +34,19 @@ def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
     assert sum(item["category"] == "synthetic_rendered" for item in registry["cases"]) == 10
     assert sum(item["category"] == "official_piano_rendered" for item in registry["cases"]) == 10
     assert sum(item["category"] == "specialized_fixture" for item in registry["cases"]) == 5
+    reliable = [item for item in registry["cases"] if item.get("reference_midi_reliable") is True]
+    assert sum(item.get("beat_annotation_independent") is True for item in reliable) == 25
+    assert sum(item.get("beat_annotation_independent") is False for item in reliable) == 5
+    assert all(
+        item.get("beat_annotation_source") == "deterministic_midi_render_ground_truth"
+        for item in reliable
+        if item.get("beat_annotation_independent") is True
+    )
+    assert all(
+        item.get("beat_annotation_source") == "reference_midi_derived"
+        for item in reliable
+        if item.get("beat_annotation_independent") is False
+    )
     luv = next(item for item in registry["cases"] if item["id"] == "luv-letter")
     assert luv["evaluation_policy"] == "integrity_and_manual_listening_only"
     assert luv["reference_midi_reliable"] is False
@@ -333,6 +346,49 @@ def test_accuracy_gate_rejects_disjoint_case_ids_even_when_each_side_has_thirty(
     assert disjoint["ready"] is False
     assert disjoint["shared_case_ids"] == []
     assert "相同可靠 case ID" in disjoint["reason"]
+
+
+def test_accuracy_gate_requires_beat_coverage_in_addition_to_mean_f1() -> None:
+    def case(index: int, *, with_beats: bool) -> dict[str, object]:
+        return {
+            "id": f"case-{index}",
+            "status": "evaluated",
+            "crash": False,
+            "evaluation_policy": "reference_metrics",
+            "reference_midi_reliable": True,
+            "beat_metrics_eligible": with_beats,
+            "metrics": {
+                "pitch_f1": {"f1": 0.9},
+                "chord_retention": {"retention": 0.9},
+                "rhythm_error": {"mean_rhythm_error_quarter": 0.1},
+                "beat_f1": {"f1": 0.95} if with_beats else None,
+                "downbeat_f1": {"f1": 0.85} if with_beats else None,
+            },
+        }
+
+    baseline_25 = [case(index, with_beats=True) for index in range(25)]
+    partial_25 = [case(index, with_beats=index < 24) for index in range(25)]
+    partial_claim = benchmark.assess_accuracy_claim(
+        partial_25,
+        baseline_25,
+        minimum_cases=25,
+        minimum_beat_cases=25,
+    )
+    assert partial_claim["ready"] is False
+    assert partial_claim["beat_cases_with_metrics"] == 24
+    assert "24/25" in partial_claim["reason"]
+
+    baseline_30 = [case(index, with_beats=True) for index in range(30)]
+    sparse_30 = [case(index, with_beats=index == 0) for index in range(30)]
+    sparse_claim = benchmark.assess_accuracy_claim(
+        sparse_30,
+        baseline_30,
+        minimum_cases=30,
+        minimum_beat_cases=30,
+    )
+    assert sparse_claim["ready"] is False
+    assert sparse_claim["beat_cases_with_metrics"] == 1
+    assert "1/30" in sparse_claim["reason"]
 
 
 def test_build_report_requires_thirty_shared_production_cases(monkeypatch) -> None:
