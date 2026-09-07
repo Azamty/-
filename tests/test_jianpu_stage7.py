@@ -9,7 +9,11 @@ import pytest
 from backend.jianpu_score import render as render_module
 from backend.jianpu_score.domain import Score, ScoreNote, ScoreVoice, TempoEvent
 from backend.jianpu_score.musicxml_standardize import _align_source_notes, _RawEvent
-from backend.jianpu_score.quantize import JianpuSerializationError, score_to_jianpu
+from backend.jianpu_score.quantize import (
+    JianpuSerializationError,
+    jianpu_serialization_diagnostics,
+    score_to_jianpu,
+)
 from backend.jianpu_score.render import render_score
 from scripts.musicxml_score_worker import _ordered_pitch_ties
 
@@ -115,6 +119,73 @@ def test_extreme_multi_octave_chord_renders_without_pitch_loss(tmp_path: Path) -
     midi = mido.MidiFile(artifacts.midi_path)
     pitches = {message.note for track in midi.tracks for message in track if message.type == "note_on" and message.velocity}
     assert {0, 60, 127} <= pitches
+
+
+@pytest.mark.skipif(
+    not render_module.JIANPU.is_file() or not render_module.LILYPOND.is_file(),
+    reason="pinned jianpu-ly or LilyPond is unavailable",
+)
+def test_b_flat_minor_nonleading_accidental_chord_splits_without_pitch_or_timing_loss(tmp_path: Path) -> None:
+    """A vendor simple-chord accidental bug must be isolated to pitch lanes.
+
+    In B-flat minor, ``[46, 50, 53]`` would serialize as ``6,,#1,3,``;
+    jianpu-ly applies that middle accidental to the wrong figure.  The
+    serializer therefore emits three NextPart lanes, each with the original
+    onset and duration.  This also proves that an unrelated voice is not
+    copied into each lane.
+    """
+
+    score = Score(
+        title="B-flat minor chord",
+        bpm=68,
+        key="Bbm",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=192,
+        voices=[
+            ScoreVoice(
+                voice_id="chord",
+                events=[
+                    ScoreNote(start_tick=0, duration_tick=48, midi=46, chord_pitches=[46, 50, 53]),
+                    ScoreNote(start_tick=48, duration_tick=144, midi=None),
+                ],
+            ),
+            ScoreVoice(
+                voice_id="melody",
+                events=[
+                    ScoreNote(start_tick=0, duration_tick=192, midi=60),
+                ],
+            ),
+        ],
+    )
+
+    diagnostics = jianpu_serialization_diagnostics(score)
+    assert diagnostics["chord_voice_split_count"] == 1
+    assert diagnostics["chord_voice_split_lane_count"] == 3
+    assert diagnostics["chord_voice_splits"][0]["reason"] == "non_leading_accidental_in_simple_chord"
+    jianpu = score_to_jianpu(score)
+    assert "6,,#1,3," not in jianpu
+    assert jianpu.count("NextPart") == 3
+
+    artifacts = render_score(score, tmp_path, basename="bbm-chord")
+    assert artifacts.midi_path is not None
+    midi = mido.MidiFile(artifacts.midi_path)
+    intervals: dict[int, list[tuple[int, int]]] = {}
+    for track in midi.tracks:
+        absolute = 0
+        active: dict[int, list[int]] = {}
+        for message in track:
+            absolute += message.time
+            if message.type == "note_on" and message.velocity:
+                active.setdefault(message.note, []).append(absolute)
+            elif message.type in {"note_off", "note_on"} and not message.velocity:
+                starts = active.get(message.note, [])
+                if starts:
+                    intervals.setdefault(message.note, []).append((starts.pop(0), absolute))
+
+    assert {46, 50, 53, 60} <= set(intervals)
+    assert all(intervals[pitch] == [(0, 384)] for pitch in (46, 50, 53))
+    assert intervals[60] == [(0, 1536)]
 
 
 def test_explicit_tuplet_ratio_is_required_to_be_three_over_two() -> None:

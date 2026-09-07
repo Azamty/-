@@ -35,6 +35,7 @@ from .high_accuracy import (
 from .musescore_import import MusicXMLArtifact, MuseScoreImportError, convert_performance_midi
 from .musicxml_standardize import MusicXMLStandardizationError, standardize_musicxml
 from .performance_midi import build_performance_midi
+from .quantize import jianpu_serialization_diagnostics
 from .render import RenderArtifacts, natural_svg_sort_key, render_score
 from .svg_long import merge_svg_pages
 
@@ -737,6 +738,15 @@ class HighAccuracyArtifactService:
                 )
             score_path = _safe_child(destination, f"{safe_instrument}.score.json")
             alignment_path = _safe_child(destination, f"{safe_instrument}.alignment_report.json")
+            serialization_report = jianpu_serialization_diagnostics(score)
+            score = score.model_copy(
+                update={
+                    "metadata": {
+                        **score.metadata,
+                        "jianpu_serialization": serialization_report,
+                    }
+                }
+            )
             _atomic_write_json(score_path, score.model_dump(mode="json"))
             _atomic_write_json(alignment_path, alignment_report)
             manifest["stages"]["musicxml_standardize"] = {
@@ -744,6 +754,7 @@ class HighAccuracyArtifactService:
                 "alignment_source_count": source_count,
                 "alignment_accounted_source_count": accounted_count,
                 "alignment_unresolved_count": unresolved_count,
+                "jianpu_serialization": serialization_report,
             }
 
             try:

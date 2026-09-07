@@ -966,17 +966,95 @@ def _copy_event_for_pitches(event: ScoreNote, selected: list[int]) -> ScoreNote:
     )
 
 
-def _serialization_voices(voices: list[ScoreVoice]) -> list[ScoreVoice]:
-    """Split partial chord ties into safe jianpu-ly parts.
+def _chord_split_records(
+    voices: list[ScoreVoice],
+    keys: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Find simple-chord tokens that jianpu-ly cannot spell losslessly.
+
+    The vendor's simple-chord grammar has one accidental state for a token.
+    An accidental on a later figure can therefore be applied to an earlier
+    figure (the B-flat-minor ``6,,#1,3,`` case is a concrete example).  Such a
+    chord is rendered as one lane per pitch by ``_serialization_voices``.  A
+    lane contains rests at the other events, so this preserves the original
+    voice timeline without duplicating unrelated notes.
+    """
+
+    normalized_keys = tuple(dict.fromkeys(normalize_key(key) for key in keys))
+    records: list[dict[str, Any]] = []
+    for voice in voices:
+        for event in voice.events:
+            pitches = _event_pitches(event)
+            if len(pitches) <= 1:
+                continue
+            for key in normalized_keys:
+                parts = [midi_to_jianpu(pitch, key) for pitch in sorted(pitches)]
+                accidental_positions = [
+                    index
+                    for index, part in enumerate(parts)
+                    if "#" in part or "b" in part
+                ]
+                if not any(index > 0 for index in accidental_positions):
+                    continue
+                records.append(
+                    {
+                        "voice_id": voice.voice_id,
+                        "start_tick": event.start_tick,
+                        "duration_tick": event.duration_tick,
+                        "pitches": sorted(pitches),
+                        "key": key,
+                        "token": "".join(parts),
+                        "reason": "non_leading_accidental_in_simple_chord",
+                    }
+                )
+                break
+    return records
+
+
+def _serialization_voices(
+    voices: list[ScoreVoice],
+    *,
+    keys: Iterable[str] | None = None,
+) -> list[ScoreVoice]:
+    """Split unsafe chord ties/accidentals into safe jianpu-ly parts.
 
     jianpu-ly's ``~`` applies to every note in a chord.  A MusicXML chord
     whose tie applies to only some pitches therefore needs independent parts
     for those pitches; emitting one chord-level tie would incorrectly tie the
-    untied notes as well.
+    untied notes as well.  Its simple-chord accidental state has a similar
+    limitation for a non-leading accidental, so those chords use one lane per
+    pitch as well.
     """
 
     result: list[ScoreVoice] = []
+    normalized_keys = tuple(dict.fromkeys(normalize_key(key) for key in (keys or ())))
     for voice in voices:
+        unsafe_chords = _chord_split_records([voice], normalized_keys)
+        if unsafe_chords:
+            # A simple-chord token is the only place where jianpu-ly can
+            # silently change an individual pitch.  Split the complete voice
+            # into pitch lanes for that voice.  Every lane has the original
+            # event boundaries and carries only its selected pitch; other
+            # events become rests, so unrelated notes are never duplicated.
+            pitches = sorted({pitch for event in voice.events for pitch in _event_pitches(event)})
+            label = voice.label or voice.voice_id
+            for pitch in pitches:
+                lane_events = []
+                for event in voice.events:
+                    event_pitches = list(_event_pitches(event))
+                    lane_events.append(
+                        _copy_event_for_pitches(event, [pitch] if pitch in event_pitches else [])
+                    )
+                result.append(
+                    voice.model_copy(
+                        update={
+                            "voice_id": f"{voice.voice_id}:chord-{pitch}",
+                            "label": f"{label} chord pitch {pitch}",
+                            "events": lane_events,
+                        }
+                    )
+                )
+            continue
         special = sorted(_partial_tie_pitches(voice))
         if not special:
             result.append(voice)
@@ -1437,6 +1515,29 @@ def _key_command(key: str) -> str:
     return f"1={relative_major_key(normalize_key(key))}"
 
 
+def jianpu_serialization_diagnostics(score: Score) -> dict[str, Any]:
+    """Describe renderer workarounds required by this Score.
+
+    The report is deliberately renderer-facing: the Score remains the source
+    of truth, while the report explains why a chord may become several
+    ``NextPart`` lanes in the jianpu-ly input.  Consumers that persist Score
+    metadata (the high-accuracy service does this before rendering) can keep
+    this audit trail with the other notation diagnostics.
+    """
+
+    spans = _fixed_measure_spans(score)
+    contexts, _meter_header = _measure_contexts(score, spans)
+    records = _chord_split_records(score.voices, [context.key for context in contexts])
+    lane_count = sum(len(item["pitches"]) for item in records)
+    return {
+        "schema_version": "1.0",
+        "chord_voice_split_count": len(records),
+        "chord_voice_split_lane_count": lane_count,
+        "chord_voice_splits": records,
+        "strategy": "one_next_part_per_pitch_for_non_leading_accidental_chords",
+    }
+
+
 def score_to_jianpu(score: Score) -> str:
     """Serialize a 12/48 TPQ Score into notation-preserving jianpu-ly input."""
 
@@ -1457,7 +1558,10 @@ def score_to_jianpu(score: Score) -> str:
         "OctavesAfter",
         "",
     ]
-    serialization_voices = _serialization_voices(score.voices)
+    serialization_voices = _serialization_voices(
+        score.voices,
+        keys=[context.key for context in contexts],
+    )
     voice_bars = [_slice_voice_events(voice, spans) for voice in serialization_voices]
     for voice_index, (voice, bars) in enumerate(zip(serialization_voices, voice_bars)):
         if len(serialization_voices) > 1:
