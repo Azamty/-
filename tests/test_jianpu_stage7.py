@@ -7,7 +7,7 @@ import mido
 import pytest
 
 from backend.jianpu_score import render as render_module
-from backend.jianpu_score.domain import Score, ScoreNote, ScoreVoice
+from backend.jianpu_score.domain import Score, ScoreNote, ScoreVoice, TempoEvent
 from backend.jianpu_score.musicxml_standardize import _align_source_notes, _RawEvent
 from backend.jianpu_score.quantize import JianpuSerializationError, score_to_jianpu
 from backend.jianpu_score.render import render_score
@@ -316,3 +316,210 @@ def test_real_stage56_score_roundtrips_to_svg_and_preserves_pitch_set(tmp_path) 
     assert artifacts.svg_paths
     assert set(note_ons) == expected_pitches
     assert len(expected_pitches) <= len(note_ons) <= expected_note_count
+
+
+def _pickup_score(meter: str, pickup_ticks: int) -> Score:
+    quarter_ticks = 48
+    full_ticks = {
+        "4/4": 192,
+        "6/8": 144,
+    }[meter]
+    final_ticks = full_ticks - pickup_ticks
+    total_ticks = pickup_ticks + full_ticks + final_ticks
+    return Score(
+        title=f"{meter} pickup",
+        bpm=108,
+        key="C",
+        time_signature=meter,
+        quarter_ticks=quarter_ticks,
+        total_ticks=total_ticks,
+        voices=[
+            ScoreVoice(
+                voice_id="pickup",
+                events=[
+                    ScoreNote(start_tick=0, duration_tick=pickup_ticks, midi=60),
+                    ScoreNote(start_tick=pickup_ticks, duration_tick=full_ticks, midi=62),
+                    ScoreNote(start_tick=pickup_ticks + full_ticks, duration_tick=final_ticks, midi=64),
+                ],
+            )
+        ],
+        metadata={
+            "timeline_measures": [
+                {
+                    "start_tick": 0,
+                    "duration_tick": pickup_ticks,
+                    "end_tick": pickup_ticks,
+                    "time_signature": meter,
+                    "is_pickup": True,
+                },
+                {
+                    "start_tick": pickup_ticks,
+                    "duration_tick": full_ticks,
+                    "end_tick": pickup_ticks + full_ticks,
+                    "time_signature": meter,
+                    "is_pickup": False,
+                },
+                {
+                    "start_tick": pickup_ticks + full_ticks,
+                    "duration_tick": final_ticks,
+                    "end_tick": total_ticks,
+                    "time_signature": meter,
+                    "is_pickup": False,
+                },
+            ],
+            "pickup": {"is_pickup": True, "duration_tick": pickup_ticks},
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("meter", "pickup_ticks", "header"),
+    [("4/4", 24, "4/4,8"), ("6/8", 48, "6/8,4"), ("6/8", 72, "6/8,4.")],
+)
+def test_timeline_pickups_use_exact_jianpu_header_and_render(
+    tmp_path, meter: str, pickup_ticks: int, header: str
+) -> None:
+    score = _pickup_score(meter, pickup_ticks)
+    jianpu = score_to_jianpu(score)
+
+    assert header in jianpu.splitlines()
+    artifacts = render_score(score, tmp_path / meter.replace("/", "-"), basename="pickup")
+    assert artifacts.svg_paths
+    midi = mido.MidiFile(artifacts.midi_path)
+    expected_end = score.total_ticks * midi.ticks_per_beat // score.quarter_ticks
+    note_tracks = [track for track in midi.tracks if any(message.type == "note_on" for message in track)]
+    assert note_tracks
+    assert all(sum(message.time for message in track) == expected_end for track in note_tracks)
+    assert {
+        message.note
+        for track in midi.tracks
+        for message in track
+        if message.type == "note_on" and message.velocity > 0
+    } == {60, 62, 64}
+
+
+def _meter_key_change_score() -> Score:
+    quarter_ticks = 48
+    measure_lengths = [144, 192, 192]
+    starts = [0, 144, 336]
+    total_ticks = sum(measure_lengths)
+    voice_one = [
+        ScoreNote(start_tick=start, duration_tick=48, midi=midi)
+        for start, midi in zip(
+            [0, 48, 96, 144, 192, 240, 288, 336, 384, 432, 480],
+            [60, 62, 64, 66, 67, 69, 71, 69, 71, 72, 74],
+        )
+    ]
+    voice_two = [
+        ScoreNote(start_tick=0, duration_tick=144, midi=None),
+        ScoreNote(start_tick=144, duration_tick=96, midi=60),
+        ScoreNote(start_tick=240, duration_tick=96, midi=None),
+        ScoreNote(start_tick=336, duration_tick=96, midi=69),
+        ScoreNote(start_tick=432, duration_tick=96, midi=None),
+    ]
+    return Score(
+        title="meter key tempo changes",
+        bpm=120,
+        key="C",
+        time_signature="3/4",
+        quarter_ticks=quarter_ticks,
+        total_ticks=total_ticks,
+        voices=[
+            ScoreVoice(voice_id="melody", label="melody", events=voice_one),
+            ScoreVoice(voice_id="harmony", label="harmony", events=voice_two),
+        ],
+        tempo_events=[
+            TempoEvent(start_tick=0, bpm=120),
+            TempoEvent(start_tick=48, bpm=120.4),
+            TempoEvent(start_tick=144, bpm=121),
+            TempoEvent(start_tick=336, bpm=122),
+            TempoEvent(start_tick=384, bpm=122.4),
+        ],
+        metadata={
+            "timeline_measures": [
+                {
+                    "start_tick": start,
+                    "duration_tick": duration,
+                    "end_tick": start + duration,
+                    "time_signature": meter,
+                    "is_pickup": False,
+                }
+                for start, duration, meter in zip(starts, measure_lengths, ["3/4", "4/4", "4/4"])
+            ],
+            "time_signature_events": [
+                {"start_tick": 0, "time_signature": "3/4"},
+                {"start_tick": 144, "time_signature": "4/4"},
+            ],
+            "key_signature_events": [
+                {"start_tick": 0, "key": "C"},
+                {"start_tick": 144, "key": "D"},
+                {"start_tick": 336, "key": "Am"},
+            ],
+        },
+    )
+
+
+def test_timeline_meter_key_tempo_changes_are_per_measure_and_render(tmp_path) -> None:
+    score = _meter_key_change_score()
+    jianpu = score_to_jianpu(score)
+
+    assert "3/4\n" in jianpu
+    assert "4/4 1=D 4=121" in jianpu
+    assert "| 1=C 4=122" in jianpu
+    assert jianpu.count("4=120") == 2  # initial header, once for each NextPart
+    assert jianpu.count("4=121") == 2
+    assert jianpu.count("4=122") == 2
+    artifacts = render_score(score, tmp_path, basename="meter-key")
+    assert artifacts.svg_paths
+    midi = mido.MidiFile(artifacts.midi_path)
+    expected_end = score.total_ticks * midi.ticks_per_beat // score.quarter_ticks
+    note_tracks = [track for track in midi.tracks if any(message.type == "note_on" for message in track)]
+    assert len(note_tracks) == 2
+    assert all(sum(message.time for message in track) == expected_end for track in note_tracks)
+    assert {
+        message.note
+        for track in midi.tracks
+        for message in track
+        if message.type == "note_on" and message.velocity > 0
+    } == {60, 62, 64, 66, 67, 69, 71, 72, 74}
+
+
+def test_timeline_measure_validation_and_boundary_events_are_strict() -> None:
+    score = Score(
+        title="invalid timeline",
+        bpm=100,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=192,
+        voices=[ScoreVoice(voice_id="voice-0", events=[ScoreNote(start_tick=0, duration_tick=192, midi=60)])],
+        metadata={
+            "timeline_measures": [
+                {"start_tick": 0, "duration_tick": 96, "end_tick": 96, "time_signature": "4/4"},
+                {"start_tick": 100, "duration_tick": 92, "end_tick": 192, "time_signature": "4/4"},
+            ],
+            "time_signature_events": [{"start_tick": 48, "time_signature": "3/4"}],
+        },
+    )
+
+    with pytest.raises(JianpuSerializationError, match="illegal gap"):
+        score_to_jianpu(score)
+
+    score.metadata["timeline_measures"][1]["start_tick"] = 96
+    score.metadata["timeline_measures"][1]["duration_tick"] = 96
+    with pytest.raises(JianpuSerializationError, match="not a measure boundary"):
+        score_to_jianpu(score)
+
+
+def test_pickup_duration_must_be_exactly_representable() -> None:
+    score = _pickup_score("4/4", 16)
+    with pytest.raises(JianpuSerializationError, match="pickup duration"):
+        score_to_jianpu(score)
+
+
+def test_timeline_key_change_uses_boundary_and_rejects_mid_measure() -> None:
+    score = _meter_key_change_score()
+    score.metadata["key_signature_events"] = [{"start_tick": 96, "key": "D"}]
+
+    with pytest.raises(JianpuSerializationError, match="key_signature_events event.*boundary"):
+        score_to_jianpu(score)

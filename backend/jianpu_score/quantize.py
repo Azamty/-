@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_right
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from fractions import Fraction
 from itertools import pairwise
@@ -543,10 +543,225 @@ class _Slice:
 class _MeasureSpan:
     start_tick: int
     end_tick: int
+    number: int | None = None
+    time_signature: str | None = None
+    is_pickup: bool = False
 
     @property
     def duration_tick(self) -> int:
         return self.end_tick - self.start_tick
+
+
+@dataclass(frozen=True)
+class _MeasureContext:
+    """Notation state effective at the beginning of one measure."""
+
+    time_signature: str
+    key: str
+    tempo_bpm: int
+
+
+def _boundary_events(
+    score: Score,
+    spans: list[_MeasureSpan],
+    metadata_key: str,
+    value_key: str,
+    normalize: Any,
+) -> dict[int, Any]:
+    """Validate and normalize metadata events that must start on a barline."""
+
+    values = score.metadata.get(metadata_key, [])
+    if values is None:
+        return {}
+    if not isinstance(values, list):
+        raise JianpuSerializationError(f"metadata.{metadata_key} must be a list")
+    boundaries = {span.start_tick for span in spans}
+    result: dict[int, Any] = {}
+    for index, value in enumerate(values):
+        if not isinstance(value, Mapping):
+            raise JianpuSerializationError(f"metadata.{metadata_key}[{index}] must be an object")
+        try:
+            start_tick = int(value["start_tick"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise JianpuSerializationError(
+                f"metadata.{metadata_key}[{index}] must contain an integer start_tick"
+            ) from exc
+        if start_tick not in boundaries:
+            raise JianpuSerializationError(
+                f"{metadata_key} event at tick {start_tick} is not a measure boundary"
+            )
+        if value_key not in value:
+            raise JianpuSerializationError(f"metadata.{metadata_key}[{index}] is missing {value_key}")
+        try:
+            normalized = normalize(value[value_key])
+        except (TypeError, ValueError) as exc:
+            raise JianpuSerializationError(
+                f"metadata.{metadata_key}[{index}] has an invalid {value_key}"
+            ) from exc
+        previous = result.get(start_tick)
+        if previous is not None and previous != normalized:
+            raise JianpuSerializationError(
+                f"conflicting {metadata_key} events at measure boundary {start_tick}"
+            )
+        result[start_tick] = normalized
+    return result
+
+
+def _rounded_tempo(bpm: float) -> int:
+    """Use conventional half-up rounding for the integer jianpu command."""
+
+    return max(1, math.floor(float(bpm) + 0.5))
+
+
+def _pickup_duration_token(duration_tick: int, quarter_ticks: int) -> str:
+    """Return the jianpu-ly comma suffix for an exact pickup duration."""
+
+    whole_note_ticks = 4 * quarter_ticks
+    target = Fraction(duration_tick, whole_note_ticks)
+    for denominator in (1, 2, 4, 8, 16, 32, 64):
+        base = Fraction(1, denominator)
+        for dots in range(2):
+            value = base * Fraction(2 ** (dots + 1) - 1, 2**dots)
+            if target == value:
+                return f"{denominator}{'.' * dots}"
+    raise JianpuSerializationError(
+        f"pickup duration {duration_tick} ticks cannot be represented by jianpu-ly "
+        "as a power-of-two or dotted power-of-two value"
+    )
+
+
+def _measure_contexts(score: Score, spans: list[_MeasureSpan]) -> tuple[list[_MeasureContext], str]:
+    """Build per-bar meter/key/tempo state and the initial meter header."""
+
+    if not spans:
+        raise JianpuSerializationError("score contains no measures")
+
+    timeline_meter = spans[0].time_signature
+    active_meter = normalize_time_signature(timeline_meter or score.time_signature)
+    time_events = _boundary_events(
+        score,
+        spans,
+        "time_signature_events",
+        "time_signature",
+        lambda value: normalize_time_signature(str(value)),
+    )
+    active_key = normalize_key(score.key)
+    key_events = _boundary_events(
+        score,
+        spans,
+        "key_signature_events",
+        "key",
+        lambda value: normalize_key(str(value)),
+    )
+
+    pickup_value = score.metadata.get("pickup")
+    if pickup_value is not None and not isinstance(pickup_value, Mapping):
+        raise JianpuSerializationError("metadata.pickup must be an object")
+    pickup_flag = bool(spans[0].is_pickup)
+    pickup_duration = spans[0].duration_tick
+    if isinstance(pickup_value, Mapping):
+        pickup_flag = pickup_flag or bool(pickup_value.get("is_pickup", False))
+        declared_duration = pickup_value.get("duration_tick")
+        if declared_duration not in (None, 0):
+            try:
+                declared_duration = int(declared_duration)
+            except (TypeError, ValueError) as exc:
+                raise JianpuSerializationError("metadata.pickup.duration_tick must be an integer") from exc
+            if declared_duration != pickup_duration:
+                raise JianpuSerializationError(
+                    f"pickup duration metadata {declared_duration} does not match first measure {pickup_duration}"
+                )
+    initial_meter = time_events.get(0, active_meter)
+    initial_numerator, initial_denominator = _time_signature_values(initial_meter)
+    initial_bar_ticks = round(initial_numerator * score.quarter_ticks * 4 / initial_denominator)
+    pickup_suffix: str | None = None
+    if pickup_flag:
+        if "timeline_measures" not in score.metadata:
+            raise JianpuSerializationError("pickup metadata requires timeline_measures")
+        if pickup_duration >= initial_bar_ticks:
+            raise JianpuSerializationError(
+                f"pickup first measure duration {pickup_duration} must be shorter than {initial_bar_ticks} ticks"
+            )
+        pickup_suffix = _pickup_duration_token(pickup_duration, score.quarter_ticks)
+        # jianpu-ly requires the final bar to make up the first anacrusis.  A
+        # changed meter before the final bar has its own full-bar semantics;
+        # in that case the vendor remains the final authority.  For the
+        # common unchanged-meter case, reject a malformed complement early.
+        if len(spans) > 1:
+            final_meter = spans[-1].time_signature or initial_meter
+            if final_meter == initial_meter:
+                expected_final = initial_bar_ticks - pickup_duration
+                if spans[-1].duration_tick != expected_final:
+                    raise JianpuSerializationError(
+                        f"final pickup bar has {spans[-1].duration_tick} ticks; expected {expected_final}"
+                    )
+
+    contexts: list[_MeasureContext] = []
+    tempo_index = 0
+    tempo_events = score.tempo_events
+    current_tempo = float(score.bpm)
+    previous_meter: str | None = None
+    for index, span in enumerate(spans):
+        if span.start_tick in time_events:
+            event_meter = time_events[span.start_tick]
+            if span.time_signature and span.time_signature != event_meter:
+                raise JianpuSerializationError(
+                    f"timeline measure {index} meter {span.time_signature} conflicts with "
+                    f"time_signature_events at tick {span.start_tick}"
+                )
+            active_meter = event_meter
+        elif span.time_signature:
+            # A timeline from MusicXML carries the meter on each measure even
+            # when the worker did not emit a separate event for an unchanged
+            # bar.  A changed value is therefore an implicit boundary event.
+            active_meter = span.time_signature
+        if index == 0 and span.time_signature:
+            active_meter = span.time_signature
+            if 0 in time_events and time_events[0] != active_meter:
+                raise JianpuSerializationError("initial timeline meter conflicts with time_signature_events")
+        if previous_meter is not None and span.time_signature and span.time_signature != previous_meter:
+            # The change is safe because the timeline itself places it at this
+            # span's start.  Mid-measure events were rejected above.
+            active_meter = span.time_signature
+        previous_meter = active_meter
+        while tempo_index < len(tempo_events) and tempo_events[tempo_index].start_tick <= span.start_tick:
+            current_tempo = tempo_events[tempo_index].bpm
+            tempo_index += 1
+        contexts.append(
+            _MeasureContext(
+                time_signature=active_meter,
+                key=key_events.get(span.start_tick, active_key),
+                tempo_bpm=_rounded_tempo(current_tempo),
+            )
+        )
+        active_key = contexts[-1].key
+
+    meter_header = contexts[0].time_signature if pickup_suffix is None else f"{contexts[0].time_signature},{pickup_suffix}"
+    return contexts, meter_header
+
+
+def _measure_prefix(
+    index: int,
+    contexts: list[_MeasureContext],
+    *,
+    include_initial: bool = False,
+) -> list[str]:
+    """Return visible commands at a measure boundary."""
+
+    context = contexts[index]
+    if index == 0:
+        if not include_initial:
+            return []
+        return [_key_command(context.key), f"4={context.tempo_bpm}", context.time_signature]
+    previous = contexts[index - 1]
+    output: list[str] = []
+    if context.time_signature != previous.time_signature:
+        output.append(context.time_signature)
+    if context.key != previous.key:
+        output.append(_key_command(context.key))
+    if context.tempo_bpm != previous.tempo_bpm:
+        output.append(f"4={context.tempo_bpm}")
+    return output
 
 
 def _duration_options(quarter_ticks: int, note: str) -> list[tuple[int, list[str]]]:
@@ -821,6 +1036,72 @@ def _validate_explicit_ties(voice: ScoreVoice) -> None:
 
 
 def _fixed_measure_spans(score: Score) -> list[_MeasureSpan]:
+    """Return the score's authoritative measure timeline.
+
+    MusicXML normalization stores the real measure boundaries in metadata.  A
+    fixed grid is still used for old Score JSON, but once a timeline is
+    present it must be consumed verbatim: silently rebuilding it from the
+    initial meter would lose pickup bars and meter changes.
+    """
+
+    if "timeline_measures" in score.metadata:
+        values = score.metadata.get("timeline_measures")
+        if not isinstance(values, list) or not values:
+            raise JianpuSerializationError("metadata.timeline_measures must be a non-empty list")
+        spans: list[_MeasureSpan] = []
+        previous_end = 0
+        for index, value in enumerate(values):
+            if not isinstance(value, Mapping):
+                raise JianpuSerializationError(f"timeline measure {index} must be an object")
+            try:
+                start = int(value["start_tick"])
+                duration = int(value["duration_tick"])
+                end = int(value["end_tick"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise JianpuSerializationError(
+                    f"timeline measure {index} must contain integer start_tick, duration_tick, and end_tick"
+                ) from exc
+            if start < 0 or duration <= 0 or end != start + duration:
+                raise JianpuSerializationError(
+                    f"invalid timeline measure {index}: start={start}, duration={duration}, end={end}"
+                )
+            if index == 0 and start != 0:
+                raise JianpuSerializationError(f"measure timeline starts at {start}, expected score tick 0")
+            if index and start != previous_end:
+                relation = "overlap" if start < previous_end else "gap"
+                raise JianpuSerializationError(
+                    f"measure timeline has an illegal {relation} between ticks {previous_end} and {start}"
+                )
+            time_signature: str | None = None
+            if value.get("time_signature") is not None:
+                try:
+                    time_signature = normalize_time_signature(str(value["time_signature"]))
+                except ValueError as exc:
+                    raise JianpuSerializationError(
+                        f"timeline measure {index} has an unsupported time signature"
+                    ) from exc
+            number = value.get("number")
+            if number is not None:
+                try:
+                    number = int(number)
+                except (TypeError, ValueError) as exc:
+                    raise JianpuSerializationError(f"timeline measure {index} has an invalid number") from exc
+            spans.append(
+                _MeasureSpan(
+                    start,
+                    end,
+                    number=number,
+                    time_signature=time_signature,
+                    is_pickup=bool(value.get("is_pickup", False)),
+                )
+            )
+            previous_end = end
+        if previous_end != score.total_ticks:
+            raise JianpuSerializationError(
+                f"measure timeline ends at {previous_end}, expected Score total_ticks {score.total_ticks}"
+            )
+        return spans
+
     numerator, denominator = _time_signature_values(score.time_signature)
     bar_ticks = round(numerator * score.quarter_ticks * 4 / denominator)
     if bar_ticks <= 0:
@@ -828,7 +1109,7 @@ def _fixed_measure_spans(score: Score) -> list[_MeasureSpan]:
     spans: list[_MeasureSpan] = []
     cursor = 0
     while cursor < score.total_ticks:
-        spans.append(_MeasureSpan(cursor, min(score.total_ticks, cursor + bar_ticks)))
+        spans.append(_MeasureSpan(cursor, min(score.total_ticks, cursor + bar_ticks), time_signature=score.time_signature))
         cursor += bar_ticks
     return spans
 
@@ -1040,13 +1321,14 @@ def score_to_jianpu(score: Score) -> str:
     """Serialize a 12/48 TPQ Score into notation-preserving jianpu-ly input."""
 
     spans = _fixed_measure_spans(score)
+    contexts, meter_header = _measure_contexts(score, spans)
     title = sanitize_title(score.title)
-    key = normalize_key(score.key)
+    key = contexts[0].key
     lines = [
         f"title={title}",
         _key_command(key),
-        f"4={round(score.bpm)}",
-        normalize_time_signature(score.time_signature),
+        f"4={contexts[0].tempo_bpm}",
+        meter_header,
         "",
     ]
     serialization_voices = _serialization_voices(score.voices)
@@ -1060,10 +1342,11 @@ def score_to_jianpu(score: Score) -> str:
                 # the score context for later parts so compound meters (and
                 # their key/tempo context) are not reset to the vendor
                 # defaults when a new voice starts.
-                lines.extend([_key_command(key), f"4={round(score.bpm)}", normalize_time_signature(score.time_signature)])
+                lines.extend([_key_command(key), f"4={contexts[0].tempo_bpm}", meter_header])
         output: list[str] = []
-        for span, slices in zip(spans, bars):
-            output.extend(_serialize_measure(slices, span, key, score.quarter_ticks))
+        for index, (span, slices, context) in enumerate(zip(spans, bars, contexts)):
+            output.extend(_measure_prefix(index, contexts))
+            output.extend(_serialize_measure(slices, span, context.key, score.quarter_ticks))
         lines.append(" ".join(output))
         if voice_index + 1 < len(serialization_voices):
             lines.append("NextPart")
