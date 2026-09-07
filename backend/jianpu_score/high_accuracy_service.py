@@ -688,11 +688,23 @@ class HighAccuracyArtifactService:
             except (MusicXMLStandardizationError, OSError, ValueError) as exc:
                 raise fail("musicxml_standardize", exc) from exc
             source_count = int(alignment_report.get("source_note_count", -1))
-            if source_count != len(materialized) or source_count != int(performance_metadata.get("note_count", -1)):
+            # Production reports always carry the explicit accounting fields.
+            # Keep the service boundary compatible with older test/draft
+            # adapters that supplied only source_note_count until the next
+            # artifact schema version.
+            accounted_value = alignment_report.get("accounted_source_count", source_count)
+            unresolved_value = alignment_report.get("unresolved_count", 0)
+            accounted_count = int(accounted_value)
+            unresolved_count = int(unresolved_value)
+            if (
+                accounted_count != len(materialized)
+                or accounted_count != int(performance_metadata.get("note_count", -1))
+                or unresolved_count != 0
+            ):
                 raise fail(
                     "musicxml_standardize",
-                    f"alignment source count {source_count} does not match input/performance "
-                    f"{len(materialized)}/{performance_metadata.get('note_count')}",
+                    f"alignment accounted source count {accounted_count} does not match input/performance "
+                    f"{len(materialized)}/{performance_metadata.get('note_count')} or has unresolved={unresolved_count}",
                 )
             if score.quarter_ticks != SCORE_TICKS_PER_QUARTER:
                 raise fail(
@@ -707,6 +719,8 @@ class HighAccuracyArtifactService:
             manifest["stages"]["musicxml_standardize"] = {
                 "status": "completed",
                 "alignment_source_count": source_count,
+                "alignment_accounted_source_count": accounted_count,
+                "alignment_unresolved_count": unresolved_count,
             }
 
             try:

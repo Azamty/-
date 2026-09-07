@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import tempfile
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,6 +176,23 @@ class _RawEvent:
     dots: int
     measure_number: int | None
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _LogicalPitchUnit:
+    """One pitched MusicXML note after collapsing a tie chain.
+
+    Matching performance metadata against individual MusicXML fragments made
+    adaptive quantization look like missing notes.  A unit is the smallest
+    auditable thing that can be matched: one pitch slot and its complete tie
+    chain.  The worker events remain the source of truth for Score timing.
+    """
+
+    unit_id: int
+    pitch: int
+    start_tick: int
+    end_tick: int
+    chain: tuple[tuple[_RawEvent, int], ...]
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -376,201 +394,442 @@ def _worker_raw_events(payload: WorkerPayload) -> tuple[list[_RawEvent], list[di
     return events, diagnostics
 
 
+def _tie_at(event: _RawEvent, pitch_index: int) -> str | None:
+    return event.tie_types[pitch_index] if pitch_index < len(event.tie_types) else event.tie
+
+
+def _logical_pitch_units(events: list[_RawEvent]) -> list[_LogicalPitchUnit]:
+    """Collapse each MusicXML pitch-slot tie chain into one matching unit."""
+
+    slots = [(event, pitch_index, pitch) for event in events for pitch_index, pitch in enumerate(event.pitches)]
+    starts: dict[tuple[str, int, str, int, int], list[tuple[_RawEvent, int]]] = {}
+    for event, pitch_index, pitch in slots:
+        starts.setdefault(
+            (event.part_group, event.staff, event.voice, pitch, event.start_tick),
+            [],
+        ).append((event, pitch_index))
+    successors: dict[tuple[str, int], tuple[_RawEvent, int]] = {}
+    for event, pitch_index, pitch in slots:
+        if _tie_at(event, pitch_index) not in {"start", "continue"}:
+            continue
+        choices = [
+            candidate
+            for candidate in starts.get(
+                (event.part_group, event.staff, event.voice, pitch, event.end_tick),
+                [],
+            )
+            if _tie_at(candidate[0], candidate[1]) in {"stop", "continue"}
+        ]
+        if choices:
+            successors[(event.event_id, pitch_index)] = min(
+                choices,
+                key=lambda value: (value[0].end_tick, value[0].event_id, value[1]),
+            )
+    predecessor_keys = {
+        (value[0].event_id, value[1])
+        for value in successors.values()
+    }
+    consumed: set[tuple[str, int]] = set()
+    units: list[_LogicalPitchUnit] = []
+
+    def append_chain(chain: list[tuple[_RawEvent, int]], pitch: int) -> None:
+        unit_id = len(units)
+        units.append(
+            _LogicalPitchUnit(
+                unit_id=unit_id,
+                pitch=pitch,
+                start_tick=chain[0][0].start_tick,
+                end_tick=chain[-1][0].end_tick,
+                chain=tuple(chain),
+            )
+        )
+
+    for event, pitch_index, pitch in sorted(
+        slots,
+        key=lambda value: (value[0].start_tick, value[0].end_tick, value[0].event_id, value[1]),
+    ):
+        key = (event.event_id, pitch_index)
+        if key in consumed or key in predecessor_keys:
+            continue
+        chain: list[tuple[_RawEvent, int]] = []
+        current: tuple[_RawEvent, int] | None = (event, pitch_index)
+        while current is not None:
+            current_key = (current[0].event_id, current[1])
+            if current_key in consumed or current_key in {(item[0].event_id, item[1]) for item in chain}:
+                break
+            chain.append(current)
+            consumed.add(current_key)
+            current = successors.get(current_key)
+        append_chain(chain, pitch)
+    for event, pitch_index, pitch in slots:
+        if (event.event_id, pitch_index) not in consumed:
+            append_chain([(event, pitch_index)], pitch)
+    return units
+
+
+def _alignment_source_item(source: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "source_index": int(source["source_index"]),
+        "source_midi": int(source["midi"]),
+        "source_start_tick_480": int(source["start_tick_480"]),
+        "source_end_tick_480": int(source["end_tick_480"]),
+        "source_start_tick": int(source["start_tick"]),
+        "source_end_tick": int(source["end_tick"]),
+    }
+
+
+def _alignment_musicxml_item(
+    source: Mapping[str, Any],
+    unit: _LogicalPitchUnit,
+    *,
+    reason: str,
+    evidence: str,
+    score_end_tick: int | None = None,
+    category: str = "matched",
+) -> dict[str, Any]:
+    first_event = unit.chain[0][0]
+    chain_end = unit.end_tick
+    final_end = chain_end if score_end_tick is None else score_end_tick
+    result = _alignment_source_item(source)
+    result.update(
+        {
+            "musicxml_event_id": first_event.event_id,
+            "musicxml_event_ids": [item[0].event_id for item in unit.chain],
+            "musicxml_start_tick": first_event.start_tick,
+            "musicxml_end_tick": first_event.end_tick,
+            "musicxml_chain_end_tick": chain_end,
+            "score_start_tick": unit.start_tick,
+            "score_end_tick": final_end,
+            "source_to_score_movement_start_ticks": unit.start_tick - int(source["start_tick"]),
+            "source_to_score_movement_end_ticks": final_end - int(source["end_tick"]),
+            "musicxml_to_score_movement_start_ticks": unit.start_tick - first_event.start_tick,
+            "musicxml_to_score_movement_end_ticks": final_end - chain_end,
+            "reason": reason,
+            "matching_evidence": evidence,
+            "accounting_category": category,
+        }
+    )
+    return result
+
+
+def _source_onset_groups(source_notes: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
+    """Cluster source onsets within one 48-TPQ tick for chord evidence."""
+
+    by_start: dict[int, list[dict[str, Any]]] = {}
+    for source in sorted(source_notes, key=lambda value: (int(value["start_tick"]), int(value["source_index"]))):
+        start = int(source["start_tick"])
+        group_start = next((candidate for candidate in reversed(sorted(by_start)) if start - candidate <= 1), start)
+        by_start.setdefault(group_start, []).append(source)
+    return by_start
+
+
+def _nearest_gap(values: list[int], position: int) -> int:
+    if len(values) < 2:
+        return 48
+    index = bisect_left(values, position)
+    candidates: list[int] = []
+    if index:
+        candidates.append(abs(position - values[index - 1]))
+    if index < len(values):
+        candidates.append(abs(values[index] - position))
+    candidates = [value for value in candidates if value > 0]
+    return min(candidates, default=48)
+
+
+def _match_source_pitch(
+    source_rows: list[dict[str, Any]],
+    unit_rows: list[_LogicalPitchUnit],
+    *,
+    source_group_by_index: dict[int, list[dict[str, Any]]],
+    unit_starts_by_pitch: dict[int, list[int]],
+) -> tuple[dict[int, tuple[_LogicalPitchUnit, dict[str, Any]]], dict[int, int], list[dict[str, Any]] | None]:
+    """Monotonic sequence alignment for one MIDI pitch.
+
+    XML units may be skipped (ornaments, rests and notation fragments), but a
+    source note may not be skipped unless it is an overlapping duplicate with
+    explicit evidence that the same logical XML unit already accounts for it.
+    This keeps a distant same-pitch note from being silently attached to a
+    later occurrence.
+    """
+
+    # Same-onset unisons can come from different piano staves.  Keep the
+    # longest span first on both sides so duration ordering stays stable while
+    # the DP handles the genuinely sequential part of the stream.
+    source_rows = sorted(source_rows, key=lambda value: (int(value["start_tick"]), -int(value["end_tick"]), int(value["source_index"])))
+    unit_rows = sorted(unit_rows, key=lambda value: (value.start_tick, -value.end_tick, value.unit_id))
+    unit_starts = unit_starts_by_pitch.get(source_rows[0]["midi"], [])
+    source_starts = sorted({int(item["start_tick"]) for item in source_rows})
+    m = len(unit_rows)
+
+    def group_support(source: Mapping[str, Any], unit: _LogicalPitchUnit) -> tuple[int, int]:
+        cohort = source_group_by_index[int(source["source_index"])]
+        source_counts: dict[int, int] = {}
+        for item in cohort:
+            source_counts[int(item["midi"])] = source_counts.get(int(item["midi"]), 0) + 1
+        support = 0
+        for pitch, count in source_counts.items():
+            starts = unit_starts_by_pitch.get(pitch, [])
+            left = bisect_left(starts, unit.start_tick - 48)
+            right = bisect_right(starts, unit.start_tick + 48)
+            support += min(count, max(0, right - left))
+        return support, len(cohort)
+
+    def option(source: Mapping[str, Any], unit: _LogicalPitchUnit) -> dict[str, Any] | None:
+        distance = abs(unit.start_tick - int(source["start_tick"]))
+        unit_window = min(24, max(6, _nearest_gap(unit_starts, unit.start_tick) // 2 + 6))
+        source_window = min(24, max(6, _nearest_gap(source_starts, int(source["start_tick"])) // 2 + 6))
+        ordinary_window = min(unit_window, source_window)
+        support, cohort_count = group_support(source, unit)
+        source_duration = max(1, int(source["end_tick"]) - int(source["start_tick"]))
+        unit_duration = max(1, unit.end_tick - unit.start_tick)
+        overlap = max(
+            0,
+            min(int(source["end_tick"]), unit.end_tick) - max(int(source["start_tick"]), unit.start_tick),
+        )
+        overlap_ratio = overlap / min(source_duration, unit_duration)
+        duration_supported = distance <= 48 and overlap_ratio >= 0.9 and abs(unit.end_tick - int(source["end_tick"])) <= 6
+        if distance <= ordinary_window:
+            evidence = "adaptive_quantization_window"
+        elif distance <= 48 and cohort_count >= 2 and support >= min(cohort_count, 3):
+            evidence = "chord_onset_group_quantization_window"
+        elif duration_supported:
+            evidence = "duration_overlap_quantization_window"
+        else:
+            return None
+        cost = distance / 6.0 + abs(unit_duration - source_duration) / 24.0
+        if overlap == 0:
+            cost += min(2.0, distance / 48.0)
+        if distance > 24:
+            cost -= min(2.0, support / 10.0)
+        return {
+            "cost": cost,
+            "distance": distance,
+            "evidence": evidence,
+            "support": support,
+            "cohort_count": cohort_count,
+        }
+
+    # Exact duplicate/overlap merging is considered only if a full matching
+    # pass cannot account for all source rows.  This protects real polyphony
+    # whenever MuseScore emitted separate XML units.
+    active_rows = list(source_rows)
+    merged_into: dict[int, int] = {}
+    duplicate_candidates: list[tuple[int, int, int]] = []
+    for left_index, left in enumerate(source_rows):
+        for right_index in range(left_index + 1, len(source_rows)):
+            right = source_rows[right_index]
+            if int(left["end_tick"]) <= int(right["start_tick"]) or int(right["end_tick"]) <= int(left["start_tick"]):
+                continue
+            shared = []
+            for unit in unit_rows:
+                if option(left, unit) is None or option(right, unit) is None:
+                    continue
+                left_duration = max(1, int(left["end_tick"]) - int(left["start_tick"]))
+                right_duration = max(1, int(right["end_tick"]) - int(right["start_tick"]))
+                left_overlap = max(
+                    0,
+                    min(int(left["end_tick"]), unit.end_tick) - max(int(left["start_tick"]), unit.start_tick),
+                )
+                right_overlap = max(
+                    0,
+                    min(int(right["end_tick"]), unit.end_tick) - max(int(right["start_tick"]), unit.start_tick),
+                )
+                same_onset = abs(int(left["start_tick"]) - int(right["start_tick"])) <= 1
+                unit_covers_both = (
+                    left_overlap / min(left_duration, max(1, unit.end_tick - unit.start_tick)) >= 0.9
+                    and right_overlap / min(right_duration, max(1, unit.end_tick - unit.start_tick)) >= 0.9
+                )
+                if same_onset or unit_covers_both:
+                    shared.append(unit)
+            if shared:
+                duplicate_candidates.append((int(right["source_index"]), int(left["source_index"]), len(shared)))
+
+    def run_dp(rows: list[dict[str, Any]]) -> list[tuple[dict[str, Any], _LogicalPitchUnit, dict[str, Any]]] | None:
+        count = len(rows)
+        inf = float("inf")
+        costs = [[inf] * (m + 1) for _ in range(count + 1)]
+        choices: list[list[tuple[str, int, int, dict[str, Any] | None] | None]] = [
+            [None] * (m + 1) for _ in range(count + 1)
+        ]
+        for column in range(m + 1):
+            costs[0][column] = 0.0
+        for row in range(1, count + 1):
+            for column in range(1, m + 1):
+                if costs[row][column - 1] <= costs[row][column]:
+                    costs[row][column] = costs[row][column - 1]
+                    choices[row][column] = ("skip_unit", row, column - 1, None)
+                match_option = option(rows[row - 1], unit_rows[column - 1])
+                if match_option is None:
+                    continue
+                candidate_cost = costs[row - 1][column - 1] + float(match_option["cost"])
+                if candidate_cost < costs[row][column]:
+                    costs[row][column] = candidate_cost
+                    choices[row][column] = ("match", row - 1, column - 1, match_option)
+        if not math.isfinite(costs[count][m]):
+            return None
+        row, column = count, m
+        result: list[tuple[dict[str, Any], _LogicalPitchUnit, dict[str, Any]]] = []
+        while row:
+            choice = choices[row][column]
+            if choice is None:
+                return None
+            if choice[0] == "skip_unit":
+                column = choice[2]
+                continue
+            result.append((rows[choice[1]], unit_rows[choice[2]], choice[3] or {}))
+            row -= 1
+            column -= 1
+        result.reverse()
+        return result
+
+    matched_rows = run_dp(active_rows)
+    while matched_rows is None and duplicate_candidates:
+        duplicate_source_index, primary_source_index, _ = duplicate_candidates.pop(0)
+        remove_at = next(
+            (index for index, row in enumerate(active_rows) if int(row["source_index"]) == duplicate_source_index),
+            None,
+        )
+        if remove_at is None:
+            continue
+        active_rows.pop(remove_at)
+        merged_into[duplicate_source_index] = primary_source_index
+        matched_rows = run_dp(active_rows)
+    if matched_rows is None:
+        return {}, merged_into, None
+    matched = {int(source["source_index"]): (unit, option_data) for source, unit, option_data in matched_rows}
+    return matched, merged_into, matched_rows
+
+
 def _align_source_notes(
     events: list[_RawEvent],
     source_notes: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Align source notes without undoing MuseScore's notation decisions.
+    """Align source notes to logical MusicXML pitch units.
 
-    Normal matches retain the MusicXML start/end selected by MuseScore.  The
-    only span restoration is the observed same-pitch-overlap case where an
-    XML note ends at the next overlapping source onset, or where such a source
-    note is absent altogether.  A non-overlapping source note that cannot be
-    matched is a hard error; silently producing a score with a missing pitch
-    would violate the performance-to-score roundtrip contract.  Every report
-    movement is ``final Score tick - source performance tick``; the separate
-    MusicXML movement fields make the importer change auditable as well.
+    MuseScore is allowed to move starts and ends during adaptive quantization;
+    this function records those movements and never replaces them with source
+    performance timing.  Tied XML fragments are first collapsed into one unit,
+    then each MIDI pitch is aligned by a monotonic sequence DP.  The only
+    source-side accounting other than a match is an explicitly evidenced
+    overlapping duplicate that maps to a unit already matched by its primary
+    source note.  Otherwise the source note is unresolved and the stage fails.
     """
 
-    report: list[dict[str, Any]] = []
-    used: set[tuple[str, int]] = set()
-    overlap_indices: set[int] = set()
-    unmatched: list[dict[str, int]] = []
-    for left_index, left in enumerate(source_notes):
-        for right_index, right in enumerate(source_notes):
-            if left_index == right_index or left["midi"] != right["midi"]:
-                continue
-            if left["start_tick"] < right["start_tick"] < left["end_tick"]:
-                overlap_indices.add(int(left["source_index"]))
-                overlap_indices.add(int(right["source_index"]))
-
-    def tie_at(event: _RawEvent, pitch_index: int) -> str | None:
-        if pitch_index < len(event.tie_types):
-            return event.tie_types[pitch_index]
-        return event.tie
-
-    def extend_tie_chain(event: _RawEvent, pitch_index: int) -> tuple[list[tuple[_RawEvent, int]], int]:
-        chain: list[tuple[_RawEvent, int]] = [(event, pitch_index)]
-        current = event
-        current_pitch_index = pitch_index
-        while tie_at(current, current_pitch_index) in {"start", "continue"}:
-            candidates: list[tuple[_RawEvent, int]] = []
-            for candidate in events:
-                if candidate.part_group != current.part_group or candidate.staff != current.staff or candidate.voice != current.voice:
-                    continue
-                if candidate.start_tick != current.end_tick:
-                    continue
-                for candidate_pitch_index, pitch in enumerate(candidate.pitches):
-                    if pitch != event.pitches[pitch_index] or (candidate.event_id, candidate_pitch_index) in used:
-                        continue
-                    if tie_at(candidate, candidate_pitch_index) in {"stop", "continue"}:
-                        candidates.append((candidate, candidate_pitch_index))
-            if not candidates:
-                break
-            next_event, next_pitch_index = min(candidates, key=lambda value: (value[0].end_tick, value[0].event_id, value[1]))
-            used.add((next_event.event_id, next_pitch_index))
-            chain.append((next_event, next_pitch_index))
-            current = next_event
-            current_pitch_index = next_pitch_index
-        return chain, chain[-1][0].end_tick
-
+    if not source_notes:
+        return []
+    units = _logical_pitch_units(events)
+    units_by_pitch: dict[int, list[_LogicalPitchUnit]] = {}
+    for unit in units:
+        units_by_pitch.setdefault(unit.pitch, []).append(unit)
+    for rows in units_by_pitch.values():
+        rows.sort(key=lambda value: (value.start_tick, value.end_tick, value.unit_id))
+    source_by_pitch: dict[int, list[dict[str, Any]]] = {}
     for source in source_notes:
+        source_by_pitch.setdefault(int(source["midi"]), []).append(source)
+    source_groups = _source_onset_groups(source_notes)
+    source_group_by_index = {
+        int(source["source_index"]): group
+        for group in source_groups.values()
+        for source in group
+    }
+    unit_starts_by_pitch = {
+        pitch: [unit.start_tick for unit in rows]
+        for pitch, rows in units_by_pitch.items()
+    }
+    matched: dict[int, tuple[_LogicalPitchUnit, dict[str, Any]]] = {}
+    merged: dict[int, int] = {}
+    unresolved: list[dict[str, Any]] = []
+    for pitch, rows in source_by_pitch.items():
+        pitch_matched, pitch_merged, _ = _match_source_pitch(
+            rows,
+            units_by_pitch.get(pitch, []),
+            source_group_by_index=source_group_by_index,
+            unit_starts_by_pitch=unit_starts_by_pitch,
+        )
+        matched.update(pitch_matched)
+        merged.update(pitch_merged)
+        accounted = set(pitch_matched) | set(pitch_merged)
+        unresolved.extend(source for source in rows if int(source["source_index"]) not in accounted)
+
+    reports: list[dict[str, Any]] = []
+    for source in sorted(source_notes, key=lambda value: int(value["source_index"])):
         source_index = int(source["source_index"])
-        source_overlaps = source_index in overlap_indices
-        overlap_starts = [
-            other["start_tick"]
-            for other in source_notes
-            if other["midi"] == source["midi"]
-            and other["start_tick"] > source["start_tick"]
-            and other["start_tick"] < source["end_tick"]
-        ]
-        candidates: list[tuple[float, _RawEvent, int]] = []
-        for event in events:
-            for pitch_index, pitch in enumerate(event.pitches):
-                if pitch != source["midi"] or (event.event_id, pitch_index) in used:
-                    continue
-                distance = abs(event.start_tick - source["start_tick"])
-                if distance <= 4:
-                    candidates.append((float(distance), event, pitch_index))
-        if candidates:
-            _distance, event, pitch_index = min(candidates, key=lambda value: (value[0], value[1].event_id, value[2]))
-            used.add((event.event_id, pitch_index))
-            original_start = event.start_tick
-            original_end = event.end_tick
-            tie_chain, alignment_end = extend_tie_chain(event, pitch_index)
-            original_chain_end = tie_chain[-1][0].end_tick
-            reason = "matched_musicxml_event"
-            # A regular adaptive-quantized match is deliberately untouched.
-            # Restore only a single-pitch event cut off at the next overlapping
-            # source onset; this is the exact failure observed in the phase 4
-            # same-pitch probe.
+        if source_index in matched:
+            unit, option = matched[source_index]
+            score_end = unit.end_tick
+            reason = "matched_musicxml_tie_chain" if len(unit.chain) > 1 else "matched_musicxml_event"
+            overlap_starts = [
+                int(other["start_tick"])
+                for other in source_notes
+                if int(other["source_index"]) != source_index
+                and int(other["midi"]) == int(source["midi"])
+                and int(source["start_tick"]) < int(other["start_tick"]) < int(source["end_tick"])
+            ]
+            # Keep the historical, narrowly evidenced same-pitch overlap
+            # repair.  It is only allowed when the XML note ends exactly at
+            # the next source onset; ordinary adaptive timing is untouched.
             if (
-                source_overlaps
-                and all(len(item[0].pitches) == 1 for item in tie_chain)
-                and alignment_end < source["end_tick"]
-                and any(abs(alignment_end - start) <= 1 for start in overlap_starts)
+                overlap_starts
+                and all(len(item[0].pitches) == 1 for item in unit.chain)
+                and unit.end_tick < int(source["end_tick"])
+                and any(abs(unit.end_tick - start) <= 1 for start in overlap_starts)
             ):
-                tie_chain[-1][0].end_tick = max(tie_chain[-1][0].start_tick + 1, source["end_tick"])
-                alignment_end = tie_chain[-1][0].end_tick
+                score_end = max(unit.start_tick + 1, int(source["end_tick"]))
+                unit.chain[-1][0].end_tick = score_end
                 reason = "musescore_truncated_source_span_restored"
-            elif len(tie_chain) > 1:
-                reason = "matched_musicxml_tie_chain"
-            report.append(
-                {
-                    "source_index": source_index,
-                    "source_midi": source["midi"],
-                    "source_start_tick_480": source["start_tick_480"],
-                    "source_end_tick_480": source["end_tick_480"],
-                    "source_start_tick": source["start_tick"],
-                    "source_end_tick": source["end_tick"],
-                    "musicxml_event_id": event.event_id,
-                    "musicxml_event_ids": [item[0].event_id for item in tie_chain],
-                    "musicxml_start_tick": original_start,
-                    "musicxml_end_tick": original_end,
-                    "musicxml_chain_end_tick": original_chain_end,
-                    "score_start_tick": event.start_tick,
-                    "score_end_tick": alignment_end,
-                    "source_to_score_movement_start_ticks": event.start_tick - source["start_tick"],
-                    "source_to_score_movement_end_ticks": alignment_end - source["end_tick"],
-                    "musicxml_to_score_movement_start_ticks": event.start_tick - original_start,
-                    "musicxml_to_score_movement_end_ticks": alignment_end - original_chain_end,
-                    "reason": reason,
-                }
+            reports.append(
+                _alignment_musicxml_item(
+                    source,
+                    unit,
+                    reason=reason,
+                    evidence=str(option.get("evidence", "monotonic_pitch_alignment")),
+                    score_end_tick=score_end,
+                )
             )
-        else:
-            if not source_overlaps:
-                report.append(
-                    {
-                        "source_index": source_index,
-                        "source_midi": source["midi"],
-                        "source_start_tick_480": source["start_tick_480"],
-                        "source_end_tick_480": source["end_tick_480"],
-                        "source_start_tick": source["start_tick"],
-                        "source_end_tick": source["end_tick"],
-                        "musicxml_event_id": None,
-                        "score_start_tick": None,
-                        "score_end_tick": None,
-                        "source_to_score_movement_start_ticks": None,
-                        "source_to_score_movement_end_ticks": None,
-                        "musicxml_to_score_movement_start_ticks": None,
-                        "musicxml_to_score_movement_end_ticks": None,
-                        "reason": "missing_from_musicxml_unmatched",
-                    }
-                )
-                unmatched.append(
-                    {
-                        "source_index": source_index,
-                        "midi": int(source["midi"]),
-                    }
-                )
+        elif source_index in merged:
+            primary_index = merged[source_index]
+            primary = matched.get(primary_index)
+            if primary is None:
+                unresolved.append(source)
                 continue
-            restored = _RawEvent(
-                event_id=f"restored-source-{source_index}",
-                part_group="restored-source",
-                part_id="restored-source",
-                staff=1,
-                voice="restored",
-                start_tick=source["start_tick"],
-                end_tick=max(source["start_tick"] + 1, source["end_tick"]),
-                pitches=[source["midi"]],
-                kind="note",
-                tie=None,
-                tie_types=[],
-                tuplet_actual=None,
-                tuplet_normal=None,
-                dots=0,
-                measure_number=None,
-                metadata={"alignment_reason": "missing_from_musicxml_restored_from_performance_metadata"},
+            item = _alignment_musicxml_item(
+                source,
+                primary[0],
+                reason="merged_overlapping_duplicate_source_note",
+                evidence="same_pitch_source_overlap_shared_musicxml_unit",
+                category="merged",
             )
-            events.append(restored)
-            report.append(
+            item["merged_into_source_index"] = primary_index
+            reports.append(item)
+        else:
+            item = _alignment_source_item(source)
+            item.update(
                 {
-                    "source_index": source_index,
-                    "source_midi": source["midi"],
-                    "source_start_tick_480": source["start_tick_480"],
-                    "source_end_tick_480": source["end_tick_480"],
-                    "source_start_tick": source["start_tick"],
-                    "source_end_tick": source["end_tick"],
                     "musicxml_event_id": None,
-                    "score_start_tick": restored.start_tick,
-                    "score_end_tick": restored.end_tick,
-                    "source_to_score_movement_start_ticks": 0,
-                    "source_to_score_movement_end_ticks": 0,
+                    "musicxml_event_ids": [],
+                    "score_start_tick": None,
+                    "score_end_tick": None,
+                    "source_to_score_movement_start_ticks": None,
+                    "source_to_score_movement_end_ticks": None,
                     "musicxml_to_score_movement_start_ticks": None,
                     "musicxml_to_score_movement_end_ticks": None,
-                    "reason": "missing_from_musicxml_restored_from_performance_metadata",
+                    "reason": "unresolved_source_note",
+                    "matching_evidence": "no safe monotonic MusicXML candidate",
+                    "accounting_category": "unresolved",
                 }
             )
-    if unmatched:
+            reports.append(item)
+    if unresolved:
+        unique_unresolved = {int(item["source_index"]): item for item in unresolved}
         details = "; ".join(
-            f"index={item['source_index']},midi={item['midi']}"
-            for item in unmatched
+            f"index={int(item['source_index'])},midi={int(item['midi'])}"
+            for item in sorted(unique_unresolved.values(), key=lambda value: int(value["source_index"]))
         )
         raise MusicXMLStandardizationError(
-            "performance metadata contains source notes missing from MusicXML "
-            f"and not eligible for overlap restoration: count={len(unmatched)}; {details}"
+            "performance metadata contains source notes unresolved after logical MusicXML matching: "
+            f"count={len(unique_unresolved)}; {details}"
         )
-    return report
+    return reports
 
 
 def _allocate_lanes(events: Iterable[_RawEvent]) -> list[list[_RawEvent]]:
@@ -979,6 +1238,24 @@ def standardize_musicxml_payload(
     raw_events, diagnostics = _worker_raw_events(payload)
     source_notes = _source_notes(performance_metadata)
     alignment = _align_source_notes(raw_events, source_notes) if source_notes else []
+    logical_units = _logical_pitch_units(raw_events)
+    matched_musicxml_event_ids = {
+        event_id
+        for item in alignment
+        for event_id in item.get("musicxml_event_ids", [])
+    }
+    musicxml_extras = [
+        {
+            "unit_id": unit.unit_id,
+            "pitch": unit.pitch,
+            "start_tick": unit.start_tick,
+            "end_tick": unit.end_tick,
+            "musicxml_event_ids": [item[0].event_id for item in unit.chain],
+            "reason": "musicxml_logical_unit_not_referenced_by_source_metadata",
+        }
+        for unit in logical_units
+        if not any(event.event_id in matched_musicxml_event_ids for event, _ in unit.chain)
+    ]
 
     grouped: dict[tuple[str, int, str], list[_RawEvent]] = {}
     for event in raw_events:
@@ -1061,16 +1338,64 @@ def standardize_musicxml_payload(
         {"start_tick": _quarter_to_tick(item["offset_quarter"]), "key": _normalize_worker_key(item["key"]), "sharps": item["sharps"]}
         for item in conductor["key_events"]
     ]
+    matched_count = sum(item.get("accounting_category") == "matched" for item in alignment)
+    merged_count = sum(item.get("accounting_category") == "merged" for item in alignment)
+    dropped_count = sum(item.get("accounting_category") == "dropped" for item in alignment)
+    unresolved_count = sum(item.get("accounting_category") == "unresolved" for item in alignment)
+    movement_starts = [
+        int(item["source_to_score_movement_start_ticks"])
+        for item in alignment
+        if item.get("source_to_score_movement_start_ticks") is not None
+    ]
+    movement_ends = [
+        int(item["source_to_score_movement_end_ticks"])
+        for item in alignment
+        if item.get("source_to_score_movement_end_ticks") is not None
+    ]
+    movement_summary = {
+        "start_ticks": {
+            "count": len(movement_starts),
+            "min": min(movement_starts) if movement_starts else None,
+            "max": max(movement_starts) if movement_starts else None,
+            "mean": (sum(movement_starts) / len(movement_starts)) if movement_starts else None,
+            "absolute_max": max((abs(value) for value in movement_starts), default=0),
+        },
+        "end_ticks": {
+            "count": len(movement_ends),
+            "min": min(movement_ends) if movement_ends else None,
+            "max": max(movement_ends) if movement_ends else None,
+            "mean": (sum(movement_ends) / len(movement_ends)) if movement_ends else None,
+            "absolute_max": max((abs(value) for value in movement_ends), default=0),
+        },
+    }
     report: dict[str, Any] = {
         "schema_version": "1.0",
         "source_musicxml": payload.source_path,
         "music21_version": payload.music21_version,
         "source_note_count": len(source_notes),
+        "accounted_source_count": matched_count + merged_count + dropped_count,
+        "matched_count": matched_count,
+        "merged_count": merged_count,
+        "dropped_count": dropped_count,
+        "unresolved_count": unresolved_count,
+        "alignment_summary": {
+            "matched": matched_count,
+            "merged": merged_count,
+            "dropped": dropped_count,
+            "unresolved": unresolved_count,
+            "accounted_source_count": matched_count + merged_count + dropped_count,
+            "movement": movement_summary,
+            "musicxml_extra_count": len(musicxml_extras),
+        },
         "musicxml_event_count": len(raw_events),
+        "musicxml_logical_unit_count": len(logical_units),
+        "musicxml_matched_logical_unit_count": len(logical_units) - len(musicxml_extras),
+        "musicxml_extra_count": len(musicxml_extras),
+        "musicxml_extras": musicxml_extras,
         "score_voice_count": len(voices),
         "source_to_score": alignment,
         "repairs": diagnostics + lane_reasons,
-        "source_note_policy": "performance metadata restores only proven same-pitch overlap truncation or omission when supplied",
+        "source_note_policy": "performance metadata is used only for auditable source-to-MusicXML alignment; XML pitch/timing remains authoritative",
         "alignment_tick_semantics": "source_to_score_movement_* = final Score tick - source performance tick; musicxml_to_score_movement_* = final Score tick - MusicXML tick",
         "score_grid_precision_policy": "48 TPQ accepts exact 1/32, dotted, and supported triplet values; other fractional values are rejected explicitly",
         "conductor_reconciliation": conductor["reconciliation"],
@@ -1081,7 +1406,7 @@ def standardize_musicxml_payload(
     if lane_reasons:
         warnings.append("Overlapping MusicXML events were preserved in additional ScoreVoice lanes")
     if any(item.get("reason") not in {"matched_musicxml_event", "matched_musicxml_tie_chain"} for item in alignment):
-        warnings.append("Source performance alignment changed or restored note spans; inspect alignment_report.json")
+        warnings.append("Source performance alignment contains quantization movement or explicit accounting; inspect alignment_report.json")
     metadata: dict[str, Any] = {
         "notation_engine": "musescore-midi-import",
         "score_normalizer": "music21",
