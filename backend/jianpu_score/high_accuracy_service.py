@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 from typing import Any, Iterable, Mapping
 
@@ -140,8 +141,67 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     _atomic_write_bytes(path, (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
-def _prepare_output_dir(output_dir: str | Path, *, overwrite: bool) -> Path:
-    destination = Path(output_dir).expanduser().resolve()
+def _is_link_or_reparse(path: Path) -> bool:
+    """Identify links and Windows reparse points without following them."""
+
+    if path.is_symlink():
+        return True
+    try:
+        attributes = int(getattr(path.lstat(), "st_file_attributes", 0))
+    except OSError:
+        return False
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _reject_reparse_components(path: Path) -> None:
+    """Reject an output path that would resolve through an unexpected link."""
+
+    current = Path(path.anchor) if path.anchor else Path()
+    for component in path.parts[1:] if path.anchor else path.parts:
+        current /= component
+        # Do not gate this on ``exists``: a broken symlink is still a path
+        # redirection and must not be resolved and recreated outside root.
+        if _is_link_or_reparse(current):
+            raise ValueError(f"output path cannot contain a symlink or reparse point: {current}")
+
+
+def _owned_manifest(destination: Path, *, instrument_id: str, variant: str) -> Path:
+    """Return a matching service manifest or reject an unowned directory."""
+
+    manifest_path = destination / "manifest.json"
+    if _is_link_or_reparse(manifest_path) or not manifest_path.is_file():
+        raise ValueError(
+            f"refusing overwrite of unowned output directory; expected a regular service manifest: {destination}"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"refusing overwrite; manifest.json is not valid JSON: {manifest_path}") from exc
+    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != SERVICE_SCHEMA_VERSION:
+        raise ValueError(
+            f"refusing overwrite; manifest schema does not match {SERVICE_SCHEMA_VERSION!r}: {manifest_path}"
+        )
+    if manifest.get("instrument_id") != instrument_id or manifest.get("variant") != variant:
+        raise ValueError(
+            "refusing overwrite; manifest instrument_id/variant does not match the requested build: "
+            f"expected {instrument_id!r}/{variant!r}, got "
+            f"{manifest.get('instrument_id')!r}/{manifest.get('variant')!r}"
+        )
+    return manifest_path
+
+
+def _prepare_output_dir(
+    output_dir: str | Path,
+    *,
+    overwrite: bool,
+    instrument_id: str,
+    variant: str,
+) -> Path:
+    unresolved = Path(output_dir).expanduser()
+    if not unresolved.is_absolute():
+        unresolved = Path.cwd() / unresolved
+    _reject_reparse_components(unresolved)
+    destination = unresolved.resolve()
     if destination == destination.parent:
         raise ValueError("output directory must not be a filesystem root")
     if destination.exists() and not destination.is_dir():
@@ -153,10 +213,13 @@ def _prepare_output_dir(output_dir: str | Path, *, overwrite: bool) -> Path:
                 f"output directory is not empty; use a new directory or overwrite=True: {destination}"
             )
         if overwrite:
+            if entries:
+                _owned_manifest(destination, instrument_id=instrument_id, variant=variant)
             for entry in entries:
-                if entry.is_symlink() or entry.is_file():
+                if _is_link_or_reparse(entry) or entry.is_file():
                     entry.unlink()
                 elif entry.is_dir():
+                    _reject_reparse_components(entry)
                     shutil.rmtree(entry)
     else:
         destination.mkdir(parents=True, exist_ok=True)
@@ -453,7 +516,12 @@ class HighAccuracyArtifactService:
         safe_instrument = _safe_component(instrument, fallback="instrument")
         safe_variant = _safe_component(variant, fallback="source")
         safe_title = str(title).strip() or instrument
-        destination = _prepare_output_dir(output_dir, overwrite=overwrite)
+        destination = _prepare_output_dir(
+            output_dir,
+            overwrite=overwrite,
+            instrument_id=instrument,
+            variant=variant,
+        )
         manifest_path = _safe_child(destination, "manifest.json")
         manifest = _manifest_base(
             instrument_id=instrument,

@@ -214,6 +214,46 @@ def test_output_overwrite_is_explicit_and_removes_stale_files(tmp_path: Path) ->
     assert len(list(replaced.output_dir.glob("*.manifest.json"))) == 0
 
 
+def test_overwrite_refuses_unowned_directory_and_preserves_sentinel(tmp_path: Path) -> None:
+    kwargs = _valid_build_kwargs(tmp_path, is_drum=True)
+    destination = Path(kwargs["output_dir"])
+    destination.mkdir(parents=True)
+    sentinel = destination / "do-not-delete.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    kwargs["overwrite"] = True
+
+    with pytest.raises(ValueError, match="unowned output directory"):
+        service_module.HighAccuracyArtifactService().build(**kwargs)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (destination / "manifest.json").exists()
+
+
+def test_overwrite_refuses_manifest_for_another_instrument(tmp_path: Path) -> None:
+    kwargs = _valid_build_kwargs(tmp_path, is_drum=True)
+    destination = Path(kwargs["output_dir"])
+    destination.mkdir(parents=True)
+    sentinel = destination / "do-not-delete.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    (destination / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": service_module.SERVICE_SCHEMA_VERSION,
+                "instrument_id": "another-instrument",
+                "variant": "source",
+            }
+        ),
+        encoding="utf-8",
+    )
+    kwargs["overwrite"] = True
+
+    with pytest.raises(ValueError, match="does not match"):
+        service_module.HighAccuracyArtifactService().build(**kwargs)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert (destination / "manifest.json").is_file()
+
+
 @pytest.mark.skipif(not EXTERNAL_READY, reason="pinned notation toolchain is unavailable")
 def test_real_stage56_service_produces_complete_bundle_and_verifies_final_midi(tmp_path: Path) -> None:
     kwargs = _valid_build_kwargs(tmp_path)
