@@ -355,14 +355,17 @@ def _align_source_notes(
     Normal matches retain the MusicXML start/end selected by MuseScore.  The
     only span restoration is the observed same-pitch-overlap case where an
     XML note ends at the next overlapping source onset, or where such a source
-    note is absent altogether.  Every report movement is ``final Score tick -
-    source performance tick``; the separate MusicXML movement fields make the
-    importer change auditable as well.
+    note is absent altogether.  A non-overlapping source note that cannot be
+    matched is a hard error; silently producing a score with a missing pitch
+    would violate the performance-to-score roundtrip contract.  Every report
+    movement is ``final Score tick - source performance tick``; the separate
+    MusicXML movement fields make the importer change auditable as well.
     """
 
     report: list[dict[str, Any]] = []
     used: set[tuple[str, int]] = set()
     overlap_indices: set[int] = set()
+    unmatched: list[dict[str, int]] = []
     for left_index, left in enumerate(source_notes):
         for right_index, right in enumerate(source_notes):
             if left_index == right_index or left["midi"] != right["midi"]:
@@ -435,7 +438,7 @@ def _align_source_notes(
                 source_overlaps
                 and all(len(item[0].pitches) == 1 for item in tie_chain)
                 and alignment_end < source["end_tick"]
-                and any(alignment_end <= start for start in overlap_starts)
+                and any(abs(alignment_end - start) <= 1 for start in overlap_starts)
             ):
                 tie_chain[-1][0].end_tick = max(tie_chain[-1][0].start_tick + 1, source["end_tick"])
                 alignment_end = tie_chain[-1][0].end_tick
@@ -481,7 +484,13 @@ def _align_source_notes(
                         "source_to_score_movement_end_ticks": None,
                         "musicxml_to_score_movement_start_ticks": None,
                         "musicxml_to_score_movement_end_ticks": None,
-                        "reason": "missing_from_musicxml_not_restored",
+                        "reason": "missing_from_musicxml_unmatched",
+                    }
+                )
+                unmatched.append(
+                    {
+                        "source_index": source_index,
+                        "midi": int(source["midi"]),
                     }
                 )
                 continue
@@ -522,6 +531,15 @@ def _align_source_notes(
                     "reason": "missing_from_musicxml_restored_from_performance_metadata",
                 }
             )
+    if unmatched:
+        details = "; ".join(
+            f"index={item['source_index']},midi={item['midi']}"
+            for item in unmatched
+        )
+        raise MusicXMLStandardizationError(
+            "performance metadata contains source notes missing from MusicXML "
+            f"and not eligible for overlap restoration: count={len(unmatched)}; {details}"
+        )
     return report
 
 
@@ -693,24 +711,61 @@ def _source_key_signature(performance_metadata: Mapping[str, Any] | None) -> str
     return _normalize_worker_key(str(performance_metadata["key"]))
 
 
-def _key_sharps(value: str) -> int:
-    return {
-        "C": 0,
-        "G": 1,
-        "D": 2,
-        "A": 3,
-        "E": 4,
-        "B": 5,
-        "F#": 6,
-        "C#": 7,
-        "F": -1,
-        "Bb": -2,
-        "Eb": -3,
-        "Ab": -4,
-        "Db": -5,
-        "Gb": -6,
-        "Cb": -7,
-    }.get(value.removesuffix("m"), 0)
+_KEY_SIGNATURE_SHARPS = {
+    # Major key signatures.  The application whitelist includes both the
+    # sharp and flat spellings below, so keep the mapping explicit rather
+    # than deriving it from a root with the accidental removed.
+    "C": 0,
+    "C#": 7,
+    "Db": -5,
+    "D": 2,
+    "Eb": -3,
+    "E": 4,
+    "F": -1,
+    "F#": 6,
+    "Gb": -6,
+    "G": 1,
+    "Ab": -4,
+    "A": 3,
+    "Bb": -2,
+    "B": 5,
+    # Relative minor key signatures.  Dbm/Gbm are accepted by the app for
+    # display, but MIDI emits their enharmonic C#m/F#m spellings; the same
+    # values are used when no emitted spelling is supplied.
+    "Cm": -3,
+    "C#m": 4,
+    "Dbm": 4,
+    "Dm": -1,
+    "Ebm": -6,
+    "Em": 1,
+    "Fm": -4,
+    "F#m": 3,
+    "Gbm": 3,
+    "Gm": -2,
+    "Abm": -7,
+    "Am": 0,
+    "Bbm": -5,
+    "Bm": 2,
+}
+
+
+def _key_sharps(value: str, *, emitted_key: str | None = None) -> int:
+    """Return the MIDI-compatible signature while preserving display spelling.
+
+    ``value`` is the user/analysis key that should remain visible in Score.
+    Performance MIDI stores an enharmonic ``emitted_key`` for the two
+    application keys that mido cannot encode (Dbm and Gbm); use it only for
+    the numeric signature and never replace the display key with it.
+    """
+
+    display_key = _normalize_worker_key(value)
+    signature_key = _normalize_worker_key(emitted_key) if emitted_key else display_key
+    try:
+        return _KEY_SIGNATURE_SHARPS[signature_key]
+    except KeyError as exc:
+        raise MusicXMLStandardizationError(
+            f"unsupported key signature for {display_key!r} (emitted key {signature_key!r})"
+        ) from exc
 
 
 def _source_time_signature(performance_metadata: Mapping[str, Any] | None) -> tuple[str, int, int] | None:
@@ -829,11 +884,14 @@ def _reconcile_conductor_metadata(
         if xml_initial is None or _normalize_worker_key(str(xml_initial["key"])) != source_key:
             if xml_initial is not None:
                 key_events = [item for item in key_events if abs(float(item["offset_quarter"])) > 1e-9]
+            emitted_key = None
+            if performance_metadata and isinstance(performance_metadata.get("emitted_key"), str):
+                emitted_key = _normalize_worker_key(str(performance_metadata["emitted_key"]))
             key_events.append(
                 {
                     "offset_quarter": 0.0,
                     "key": source_key,
-                    "sharps": int(performance_metadata.get("key_sharps", _key_sharps(source_key))) if performance_metadata else _key_sharps(source_key),
+                    "sharps": _key_sharps(source_key, emitted_key=emitted_key),
                 }
             )
             reconciliation.append(
@@ -843,6 +901,7 @@ def _reconcile_conductor_metadata(
                     "musicxml_value": xml_initial["key"] if xml_initial else None,
                     "production_value": source_key,
                     "final_value": source_key,
+                    "emitted_value": emitted_key,
                     "reason": "production_metadata_backfilled_changed_initial_key",
                 }
             )

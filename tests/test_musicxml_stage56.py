@@ -17,6 +17,7 @@ from backend.jianpu_score.musicxml_standardize import (
     WorkerPickup,
     WorkerTempo,
     WorkerTimeSignature,
+    _key_sharps,
     standardize_musicxml_payload,
     standardize_musicxml,
     write_standardized_score,
@@ -208,6 +209,112 @@ def test_alignment_keeps_normal_musicxml_adaptive_timing() -> None:
     assert alignment["source_to_score_movement_end_ticks"] == 3
     assert alignment["musicxml_to_score_movement_start_ticks"] == 0
     assert alignment["musicxml_to_score_movement_end_ticks"] == 0
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("C", 0),
+        ("C#", 7),
+        ("Db", -5),
+        ("D", 2),
+        ("Eb", -3),
+        ("E", 4),
+        ("F", -1),
+        ("F#", 6),
+        ("Gb", -6),
+        ("G", 1),
+        ("Ab", -4),
+        ("A", 3),
+        ("Bb", -2),
+        ("B", 5),
+        ("Cm", -3),
+        ("C#m", 4),
+        ("Dbm", 4),
+        ("Dm", -1),
+        ("Ebm", -6),
+        ("Em", 1),
+        ("Fm", -4),
+        ("F#m", 3),
+        ("Gbm", 3),
+        ("Gm", -2),
+        ("Abm", -7),
+        ("Am", 0),
+        ("Bbm", -5),
+        ("Bm", 2),
+    ],
+)
+def test_key_signature_sharps_cover_all_application_keys(key: str, expected: int) -> None:
+    assert _key_sharps(key) == expected
+
+
+def test_key_signature_uses_midi_emitted_enharmonic_key_without_changing_display() -> None:
+    assert _key_sharps("Dbm", emitted_key="C#m") == 4
+    assert _key_sharps("Gbm", emitted_key="F#m") == 3
+    assert _key_sharps("F#m") == 3
+    assert _key_sharps("Cm") == -3
+    assert _key_sharps("Am") == 0
+
+
+def test_production_emitted_key_only_controls_signature_number() -> None:
+    score, report = standardize_musicxml_payload(
+        _manual_payload(),
+        performance_metadata={
+            "key": "Dbm",
+            "emitted_key": "C#m",
+            "time_signature": "4/4",
+        },
+    )
+
+    assert score.key == "Dbm"
+    assert score.metadata["key_signature_events"][0]["key"] == "Dbm"
+    assert score.metadata["key_signature_events"][0]["sharps"] == 4
+    assert any(
+        item.get("emitted_value") == "C#m"
+        for item in report["conductor_reconciliation"]
+        if item["field"] == "key"
+    )
+
+
+def test_unmatched_non_overlapping_source_note_is_an_explicit_error() -> None:
+    with pytest.raises(
+        MusicXMLStandardizationError,
+        match=r"count=1; index=17,midi=127",
+    ):
+        standardize_musicxml_payload(
+            _manual_payload(),
+            performance_metadata={
+                "notes": [
+                    {"index": 17, "midi": 127, "start_tick": 0, "end_tick": 480}
+                ]
+            },
+        )
+
+
+def test_early_musicxml_end_is_not_treated_as_overlap_truncation() -> None:
+    payload = _manual_payload()
+    payload.parts[0].events = [
+        WorkerEvent(event_id="early", kind="note", offset_quarter=0, duration_quarter=0.5, pitches=[60]),
+        WorkerEvent(event_id="next", kind="note", offset_quarter=1, duration_quarter=1, pitches=[60]),
+    ]
+    source = {
+        "notes": [
+            {"index": 0, "midi": 60, "start_tick": 0, "end_tick": 960},
+            {"index": 1, "midi": 60, "start_tick": 480, "end_tick": 1440},
+        ]
+    }
+    score, report = standardize_musicxml_payload(payload, performance_metadata=source)
+
+    first = next(
+        event
+        for voice in score.voices
+        for event in voice.events
+        if event.midi == 60 and event.start_tick == 0
+    )
+    first_alignment = next(item for item in report["source_to_score"] if item["source_index"] == 0)
+    assert first.duration_tick == 24
+    assert first_alignment["reason"] == "matched_musicxml_event"
+    assert first_alignment["source_to_score_movement_end_ticks"] == -72
 
 
 @pytest.mark.parametrize("second_start", [1, 3])
