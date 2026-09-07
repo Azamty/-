@@ -197,7 +197,12 @@ def test_render_failure_keeps_score_and_alignment(monkeypatch: pytest.MonkeyPatc
         return MusicXMLArtifact(Path(midi_path), Path(musicxml_path), "stage56", ("fake-musescore",))
 
     score = Score.model_validate(json.loads(STAGE56_SCORE.read_text(encoding="utf-8")))
-    report = {"source_note_count": 12, "source_to_score": []}
+    report = {
+        "source_note_count": 12,
+        "accounted_source_count": 12,
+        "unresolved_count": 0,
+        "source_to_score": [],
+    }
 
     monkeypatch.setattr(service_module, "convert_performance_midi", fake_convert)
     monkeypatch.setattr(service_module, "standardize_musicxml", lambda *_args, **_kwargs: (score, report))
@@ -212,6 +217,25 @@ def test_render_failure_keeps_score_and_alignment(monkeypatch: pytest.MonkeyPatc
     assert (destination / "stage56.score.json").is_file()
     assert (destination / "stage56.alignment_report.json").is_file()
     assert _manifest(destination)["failure"]["stage"] == "render"
+
+
+def test_service_rejects_alignment_report_without_accounting_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fake_convert(midi_path, musicxml_path, **_kwargs):
+        shutil.copyfile(STAGE56_MUSICXML, musicxml_path)
+        return MusicXMLArtifact(Path(midi_path), Path(musicxml_path), "stage56", ("fake-musescore",))
+
+    score = Score.model_validate(json.loads(STAGE56_SCORE.read_text(encoding="utf-8")))
+    report = {"source_note_count": 12, "source_to_score": []}
+    monkeypatch.setattr(service_module, "convert_performance_midi", fake_convert)
+    monkeypatch.setattr(service_module, "standardize_musicxml", lambda *_args, **_kwargs: (score, report))
+
+    with pytest.raises(service_module.HighAccuracyServiceError, match="missing required integer fields") as raised:
+        service_module.HighAccuracyArtifactService().build(**_valid_build_kwargs(tmp_path))
+
+    assert raised.value.stage == "musicxml_standardize"
 
 
 def test_output_overwrite_is_explicit_and_removes_stale_files(tmp_path: Path) -> None:

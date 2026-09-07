@@ -9,6 +9,14 @@ from backend.jianpu_score.musicxml_standardize import (
     MusicXMLStandardizationError,
     _RawEvent,
     _align_source_notes,
+    WorkerEvent,
+    WorkerKeySignature,
+    WorkerMeasure,
+    WorkerPart,
+    WorkerPayload,
+    WorkerTempo,
+    WorkerTimeSignature,
+    standardize_musicxml_payload,
 )
 
 
@@ -105,3 +113,64 @@ def test_anonymous_alignment_rejects_distant_same_pitch_without_evidence() -> No
     events, sources = _case("distant_same_pitch_is_unresolved")
     with pytest.raises(MusicXMLStandardizationError, match=r"count=1; index=0,midi=60"):
         _align_source_notes(events, sources)
+
+
+def test_scattered_chord_does_not_supply_long_distance_support() -> None:
+    events, sources = _case("scattered_chord_does_not_support_remote_pitch")
+    with pytest.raises(MusicXMLStandardizationError, match=r"count=1; index=0,midi=60"):
+        _align_source_notes(events, sources)
+
+
+def test_partial_chord_match_reports_unreferenced_units_by_unit_id() -> None:
+    event = WorkerEvent(
+        event_id="partial-chord",
+        kind="chord",
+        offset_quarter=0,
+        duration_quarter=1,
+        pitches=[60, 64, 67],
+        tie_types=[None, None, None],
+    )
+    measure = WorkerMeasure(
+        part_index=0,
+        number=1,
+        start_quarter=0,
+        duration_quarter=4,
+        end_quarter=4,
+        time_signature="4/4",
+    )
+    payload = WorkerPayload(
+        schema_version="1.0",
+        worker="music21",
+        music21_version="9.9.2",
+        source_path="anonymous.xml",
+        title="anonymous",
+        highest_time_quarter=4,
+        parts=[
+            WorkerPart(
+                part_id="p1",
+                name="anonymous",
+                highest_time_quarter=4,
+                events=[event],
+                measures=[measure],
+            )
+        ],
+        measures=[measure],
+        tempo_events=[WorkerTempo(offset_quarter=0, bpm=120)],
+        time_signature_events=[WorkerTimeSignature(offset_quarter=0, ratio="4/4", numerator=4, denominator=4)],
+        key_signature_events=[WorkerKeySignature(offset_quarter=0, key="C", sharps=0)],
+    )
+    score, report = standardize_musicxml_payload(
+        payload,
+        performance_metadata={
+            "notes": [{"index": 0, "midi": 60, "start_tick": 0, "end_tick": 480}]
+        },
+    )
+
+    assert score is not None
+    assert report["musicxml_logical_unit_count"] == 3
+    assert report["musicxml_matched_logical_unit_count"] == 1
+    assert report["musicxml_extra_count"] == 2
+    assert {item["pitch"] for item in report["musicxml_extras"]} == {64, 67}
+    assert report["source_to_score"][0]["musicxml_unit_id"] not in {
+        item["unit_id"] for item in report["musicxml_extras"]
+    }

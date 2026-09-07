@@ -493,6 +493,7 @@ def _alignment_musicxml_item(
     result = _alignment_source_item(source)
     result.update(
         {
+            "musicxml_unit_id": unit.unit_id,
             "musicxml_event_id": first_event.event_id,
             "musicxml_event_ids": [item[0].event_id for item in unit.chain],
             "musicxml_start_tick": first_event.start_tick,
@@ -569,8 +570,12 @@ def _match_source_pitch(
         support = 0
         for pitch, count in source_counts.items():
             starts = unit_starts_by_pitch.get(pitch, [])
-            left = bisect_left(starts, unit.start_tick - 48)
-            right = bisect_right(starts, unit.start_tick + 48)
+            # Long-distance matching is permitted only when the other chord
+            # pitches share this exact quantized onset cluster.  A broad
+            # +/-48 window would let dense nearby passages provide accidental
+            # support for a wrong repeated pitch.
+            left = bisect_left(starts, unit.start_tick - 1)
+            right = bisect_right(starts, unit.start_tick + 1)
             support += min(count, max(0, right - left))
         return support, len(cohort)
 
@@ -1239,10 +1244,10 @@ def standardize_musicxml_payload(
     source_notes = _source_notes(performance_metadata)
     alignment = _align_source_notes(raw_events, source_notes) if source_notes else []
     logical_units = _logical_pitch_units(raw_events)
-    matched_musicxml_event_ids = {
-        event_id
+    matched_musicxml_unit_ids = {
+        int(item["musicxml_unit_id"])
         for item in alignment
-        for event_id in item.get("musicxml_event_ids", [])
+        if item.get("musicxml_unit_id") is not None
     }
     musicxml_extras = [
         {
@@ -1254,7 +1259,7 @@ def standardize_musicxml_payload(
             "reason": "musicxml_logical_unit_not_referenced_by_source_metadata",
         }
         for unit in logical_units
-        if not any(event.event_id in matched_musicxml_event_ids for event, _ in unit.chain)
+        if unit.unit_id not in matched_musicxml_unit_ids
     ]
 
     grouped: dict[tuple[str, int, str], list[_RawEvent]] = {}

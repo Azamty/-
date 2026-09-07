@@ -687,15 +687,29 @@ class HighAccuracyArtifactService:
                 )
             except (MusicXMLStandardizationError, OSError, ValueError) as exc:
                 raise fail("musicxml_standardize", exc) from exc
-            source_count = int(alignment_report.get("source_note_count", -1))
-            # Production reports always carry the explicit accounting fields.
-            # Keep the service boundary compatible with older test/draft
-            # adapters that supplied only source_note_count until the next
-            # artifact schema version.
-            accounted_value = alignment_report.get("accounted_source_count", source_count)
-            unresolved_value = alignment_report.get("unresolved_count", 0)
-            accounted_count = int(accounted_value)
-            unresolved_count = int(unresolved_value)
+            required_alignment_fields = ("source_note_count", "accounted_source_count", "unresolved_count")
+            missing_alignment_fields = [
+                name for name in required_alignment_fields if name not in alignment_report
+            ]
+            if missing_alignment_fields:
+                raise fail(
+                    "musicxml_standardize",
+                    "alignment report is missing required integer fields: "
+                    + ", ".join(missing_alignment_fields),
+                )
+            values = {
+                name: alignment_report[name]
+                for name in required_alignment_fields
+            }
+            if any(isinstance(value, bool) or not isinstance(value, int) for value in values.values()):
+                raise fail(
+                    "musicxml_standardize",
+                    "alignment report required fields must be integers: "
+                    + ", ".join(required_alignment_fields),
+                )
+            source_count = values["source_note_count"]
+            accounted_count = values["accounted_source_count"]
+            unresolved_count = values["unresolved_count"]
             if (
                 accounted_count != len(materialized)
                 or accounted_count != int(performance_metadata.get("note_count", -1))

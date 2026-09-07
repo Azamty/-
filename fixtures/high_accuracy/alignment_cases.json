@@ -61,6 +61,19 @@
       "sources": [
         {"source_index": 0, "midi": 60, "start_tick": 144, "end_tick": 168}
       ]
+    },
+    {
+      "name": "scattered_chord_does_not_support_remote_pitch",
+      "events": [
+        {"event_id": "scattered-60", "start_tick": 48, "end_tick": 96, "pitches": [60], "tie_types": [null]},
+        {"event_id": "scattered-64", "start_tick": 0, "end_tick": 48, "pitches": [64], "tie_types": [null]},
+        {"event_id": "scattered-67", "start_tick": 12, "end_tick": 60, "pitches": [67], "tie_types": [null]}
+      ],
+      "sources": [
+        {"source_index": 0, "midi": 60, "start_tick": 0, "end_tick": 48},
+        {"source_index": 1, "midi": 64, "start_tick": 0, "end_tick": 48},
+        {"source_index": 2, "midi": 67, "start_tick": 0, "end_tick": 48}
+      ]
     }
   ]
 }
