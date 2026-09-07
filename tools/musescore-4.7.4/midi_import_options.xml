@@ -7,9 +7,12 @@
   <Duplets>true</Duplets>
   <Triplets>true</Triplets>
   <Quadruplets>true</Quadruplets>
-  <Quintuplets>true</Quintuplets>
-  <Septuplets>true</Septuplets>
-  <Nonuplets>true</Nonuplets>
+  <!-- 48 TPQ can represent binary durations and 3:2 tuplets exactly. -->
+  <!-- 5:4, 7:4 and 9:8 tuplets are disabled: the Score normalizer must
+       reject their non-integral tick values instead of silently rounding. -->
+  <Quintuplets>false</Quintuplets>
+  <Septuplets>false</Septuplets>
+  <Nonuplets>false</Nonuplets>
   <!-- Keep performance timing for the importer's adaptive decisions. -->
   <HumanPerformance>true</HumanPerformance>
   <MeasureCount2xLess>false</MeasureCount2xLess>

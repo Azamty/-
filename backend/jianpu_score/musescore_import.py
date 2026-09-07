@@ -10,10 +10,17 @@ import subprocess
 from typing import Mapping
 import xml.etree.ElementTree as ET
 
-from .high_accuracy import MUSESCORE_CLI_LOCK, MUSESCORE_VERSION, ROOT, resolve_musescore
+from .high_accuracy import (
+    MUSESCORE_CLI_LOCK,
+    MUSESCORE_IMPORT_PROFILE_SHA256,
+    MUSESCORE_IMPORT_PROFILE_PATH,
+    MUSESCORE_VERSION,
+    resolve_musescore,
+    validate_musescore_import_profile,
+)
 
 
-DEFAULT_PROFILE = ROOT / "tools" / "musescore-4.7.4" / "midi_import_options.xml"
+DEFAULT_PROFILE = MUSESCORE_IMPORT_PROFILE_PATH
 
 
 class MuseScoreImportError(RuntimeError):
@@ -55,6 +62,13 @@ def convert_performance_midi(
         raise MuseScoreImportError(f"MuseScore {MUSESCORE_VERSION} executable is unavailable")
     if not profile.is_file():
         raise MuseScoreImportError(f"MuseScore MIDI import profile does not exist: {profile}")
+    try:
+        validate_musescore_import_profile(
+            profile,
+            expected_sha256=MUSESCORE_IMPORT_PROFILE_SHA256 if profile == DEFAULT_PROFILE.resolve() else None,
+        )
+    except ValueError as exc:
+        raise MuseScoreImportError(str(exc)) from exc
     if source == destination:
         raise MuseScoreImportError("MusicXML output must not overwrite the performance MIDI")
     if destination.exists() and not overwrite:

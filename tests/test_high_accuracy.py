@@ -8,6 +8,8 @@ from backend.jianpu_score.high_accuracy import (
     MUSIC21_VERSION,
     MUSESCORE_RELEASE_SHA256,
     MUSESCORE_RELEASE_URL,
+    MUSESCORE_IMPORT_PROFILE,
+    MUSESCORE_IMPORT_PROFILE_SHA256,
     get_high_accuracy_capabilities,
 )
 
@@ -34,6 +36,9 @@ def test_stage_a_fixture_is_deterministic_and_covers_notation_boundaries() -> No
         "requires_adaptive_quantization": True,
         "minimum_score_ticks_per_quarter": 48,
         "voice_count": 4,
+        "musescore_profile_sha256": "86742B91922F921F725A1A5810572AB458EB7FB7AAC46FC683C92352B837C9FF",
+        "disabled_musescore_tuplets": ["Quintuplets", "Septuplets", "Nonuplets"],
+        "required_musescore_tuplet": [3, 2],
     }
     assert fixture["voice_stress"]["source"]["time_signature"] == "4/4"
     assert fixture["voice_stress"]["source"]["duration_ticks"] == 3840
@@ -49,6 +54,9 @@ def test_high_accuracy_toolchain_contract_is_pinned() -> None:
     assert capabilities["musescore"]["download_url"] == MUSESCORE_RELEASE_URL
     assert capabilities["musescore"]["download_sha256"] == MUSESCORE_RELEASE_SHA256
     assert capabilities["runtime"]["score_ticks_per_quarter"] == 48
+    assert capabilities["runtime"]["musescore_import_profile"] == MUSESCORE_IMPORT_PROFILE
+    assert capabilities["runtime"]["musescore_import_profile_sha256"] == MUSESCORE_IMPORT_PROFILE_SHA256
+    assert capabilities["musescore"]["import_profile_available"] is True
 
 
 def test_high_accuracy_capability_does_not_claim_ready_when_a_tool_is_missing(monkeypatch) -> None:

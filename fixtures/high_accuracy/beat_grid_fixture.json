@@ -48,7 +48,22 @@
     "requires_meter": "6/8",
     "requires_adaptive_quantization": true,
     "minimum_score_ticks_per_quarter": 48,
-    "voice_count": 4
+    "voice_count": 4,
+    "musescore_profile_sha256": "86742B91922F921F725A1A5810572AB458EB7FB7AAC46FC683C92352B837C9FF",
+    "disabled_musescore_tuplets": ["Quintuplets", "Septuplets", "Nonuplets"],
+    "required_musescore_tuplet": [3, 2]
+  },
+  "tuplet_stress": {
+    "ticks_per_quarter": 480,
+    "tempo_bpm": 120.0,
+    "time_signature": "4/4",
+    "duration_ticks": 1920,
+    "groups": [
+      {"channel": 0, "count": 5, "pitch": 60},
+      {"channel": 1, "count": 7, "pitch": 67},
+      {"channel": 2, "count": 9, "pitch": 74}
+    ],
+    "expected_enabled_ratios": [[5, 4], [7, 8], [9, 8]]
   },
   "voice_stress": {
     "source": {

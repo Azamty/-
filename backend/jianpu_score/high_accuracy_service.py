@@ -26,7 +26,12 @@ from typing import Any, Iterable, Mapping
 import mido
 
 from .domain import MusicAnalysis, NoteEvent, Score
-from .high_accuracy import BEATNET_VERSION, MUSESCORE_VERSION
+from .high_accuracy import (
+    BEATNET_VERSION,
+    MUSESCORE_IMPORT_PROFILE,
+    MUSESCORE_IMPORT_PROFILE_SHA256,
+    MUSESCORE_VERSION,
+)
 from .musescore_import import MusicXMLArtifact, MuseScoreImportError, convert_performance_midi
 from .musicxml_standardize import MusicXMLStandardizationError, standardize_musicxml
 from .performance_midi import build_performance_midi
@@ -484,6 +489,8 @@ def _manifest_base(
         "beat_engine": BEAT_ENGINE,
         "beatnet_version": BEATNET_VERSION,
         "musescore_version": MUSESCORE_VERSION,
+        "musescore_import_profile": MUSESCORE_IMPORT_PROFILE,
+        "musescore_import_profile_sha256": MUSESCORE_IMPORT_PROFILE_SHA256,
         "score_ticks_per_quarter": SCORE_TICKS_PER_QUARTER,
         "stages": {},
         "artifacts": [],
@@ -610,6 +617,8 @@ class HighAccuracyArtifactService:
                 "beat_engine": BEAT_ENGINE,
                 "beatnet_version": BEATNET_VERSION,
                 "musescore_version": MUSESCORE_VERSION,
+                "musescore_import_profile": MUSESCORE_IMPORT_PROFILE,
+                "musescore_import_profile_sha256": MUSESCORE_IMPORT_PROFILE_SHA256,
                 "score_ticks_per_quarter": SCORE_TICKS_PER_QUARTER,
             }
             # Keep the complete Unicode title in JSON while recording the

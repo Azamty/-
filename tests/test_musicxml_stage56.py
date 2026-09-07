@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -27,13 +28,43 @@ from backend.jianpu_score.musicxml_standardize import (
 )
 from backend.jianpu_score.musescore_import import MuseScoreImportError, convert_performance_midi
 import backend.jianpu_score.musescore_import as musescore_import
-from backend.jianpu_score.high_accuracy import resolve_musescore, resolve_notation_python
+from backend.jianpu_score.high_accuracy import (
+    MUSESCORE_IMPORT_PROFILE_EXPECTED,
+    MUSESCORE_IMPORT_PROFILE_SHA256,
+    resolve_musescore,
+    resolve_notation_python,
+    validate_musescore_import_profile,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "fixtures" / "high_accuracy" / "beat_grid_fixture.json"
 PROFILE = ROOT / "tools" / "musescore-4.7.4" / "midi_import_options.xml"
 EXTERNAL_READY = resolve_musescore() is not None and resolve_notation_python().is_file() and PROFILE.is_file()
+
+
+def test_musescore_profile_pins_exact_48_tpq_tuplet_policy() -> None:
+    details = validate_musescore_import_profile(PROFILE, expected_sha256=MUSESCORE_IMPORT_PROFILE_SHA256)
+
+    assert details["options"] == MUSESCORE_IMPORT_PROFILE_EXPECTED
+    assert details["tuplets"] == {
+        "Duplets": True,
+        "Triplets": True,
+        "Quadruplets": True,
+        "Quintuplets": False,
+        "Septuplets": False,
+        "Nonuplets": False,
+    }
+
+
+def _musicxml_actual_tuplet_ratios(path: Path) -> set[tuple[int, int]]:
+    ratios: set[tuple[int, int]] = set()
+    for modification in ET.parse(path).getroot().findall(".//time-modification"):
+        actual = modification.findtext("actual-notes")
+        normal = modification.findtext("normal-notes")
+        if actual and normal:
+            ratios.add((int(actual), int(normal)))
+    return ratios
 
 
 def _manual_payload() -> WorkerPayload:
@@ -496,7 +527,7 @@ def test_musescore_cli_calls_are_serialized_within_one_process(
     source_a = tmp_path / "a.mid"
     source_b = tmp_path / "b.mid"
     executable.write_bytes(b"stub")
-    profile.write_text("<MidiOptions />", encoding="utf-8")
+    profile.write_text(PROFILE.read_text(encoding="utf-8"), encoding="utf-8")
     source_a.write_bytes(b"MThd")
     source_b.write_bytes(b"MThd")
     xml = (
@@ -656,3 +687,32 @@ def test_stage56_cli_smoke_writes_independent_outputs(tmp_path: Path) -> None:
     summary = json.loads(result.stdout.strip().splitlines()[-1])
     assert summary["score_ticks_per_quarter"] == 48
     assert musicxml.is_file() and score_json.is_file() and alignment_json.is_file()
+    ratios = _musicxml_actual_tuplet_ratios(musicxml)
+    assert (3, 2) in ratios
+    assert all(actual not in {5, 7, 9} for actual, _normal in ratios)
+
+
+@pytest.mark.skipif(not EXTERNAL_READY, reason="pinned MuseScore and notation environment are unavailable")
+def test_musescore_profile_disables_nonrepresentable_tuplets_causally(tmp_path: Path) -> None:
+    from scripts.high_accuracy_fixture_smoke import (
+        _convert,
+        _musicxml_tuplet_ratios,
+        _write_enabled_unsupported_tuplet_profile,
+        _write_tuplet_stress_midi,
+    )
+
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    stress_midi = tmp_path / "tuplet-policy-stress.mid"
+    disabled_musicxml = tmp_path / "disabled.musicxml"
+    _write_tuplet_stress_midi(stress_midi, fixture["tuplet_stress"])
+    _convert(resolve_musescore(), PROFILE, stress_midi, disabled_musicxml, tmp_path)
+    disabled_ratios = _musicxml_tuplet_ratios(disabled_musicxml)
+    assert all(actual not in {5, 7, 9} for actual, _normal in disabled_ratios)
+
+    enabled_profile = tmp_path / "unsupported-enabled.xml"
+    enabled_musicxml = tmp_path / "enabled.musicxml"
+    _write_enabled_unsupported_tuplet_profile(PROFILE, enabled_profile)
+    _convert(resolve_musescore(), enabled_profile, stress_midi, enabled_musicxml, tmp_path)
+    enabled_ratios = _musicxml_tuplet_ratios(enabled_musicxml)
+    expected_enabled = {tuple(item) for item in fixture["tuplet_stress"]["expected_enabled_ratios"]}
+    assert expected_enabled.issubset(enabled_ratios)

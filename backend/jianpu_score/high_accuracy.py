@@ -9,6 +9,7 @@ explicit instead of silently selecting the legacy quantizer.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,17 +17,32 @@ import shutil
 import subprocess
 import threading
 from typing import Any, Iterable
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[2]
 BEATNET_VERSION = "1.1.3"
 MUSIC21_VERSION = "9.9.2"
 MUSESCORE_VERSION = "4.7.4"
+MUSESCORE_IMPORT_PROFILE_PATH = ROOT / "tools" / "musescore-4.7.4" / "midi_import_options.xml"
 MUSESCORE_RELEASE_URL = (
     "https://ftp.osuosl.org/pub/musescore-nightlies/windows/4x/stable/"
     "MuseScore-Studio-4.7.4.260706075-x86_64.msi"
 )
 MUSESCORE_RELEASE_SHA256 = "64FE70E5CB9FFE159D047D1E88DB567BD101F60D36B0DE28FEB674716929A378"
+MUSESCORE_IMPORT_PROFILE = "adaptive-1/32-binary-triplet-tuplets-4-voices"
+MUSESCORE_IMPORT_PROFILE_SHA256 = "86742B91922F921F725A1A5810572AB458EB7FB7AAC46FC683C92352B837C9FF"
+MUSESCORE_IMPORT_PROFILE_EXPECTED: dict[str, str] = {
+    "QuantValue": "3",  # shortest import unit: 1/32 note
+    "VoiceCount": "3",  # MuseScore's value is zero-based: four voices
+    "Duplets": "true",
+    "Triplets": "true",
+    "Quadruplets": "true",
+    "Quintuplets": "false",
+    "Septuplets": "false",
+    "Nonuplets": "false",
+    "HumanPerformance": "true",
+}
 # MuseScore Studio shares per-user crashpad state between headless invocations.
 # The importer and the capability probe use this same process-wide lock so no
 # MuseScore CLI entry point can overlap another one in this worker process.
@@ -80,6 +96,54 @@ def resolve_musescore() -> Path | None:
         if path.is_file():
             return path
     return None
+
+
+def validate_musescore_import_profile(
+    profile: str | Path,
+    *,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Validate the pinned MIDI importer options before invoking MuseScore.
+
+    The score normalizer uses 48 ticks per quarter, so only binary durations
+    and 3:2 tuplets can be represented exactly.  A profile that enables
+    5:4, 7:4, or 9:8 searches is therefore rejected at the boundary instead
+    of allowing MuseScore to produce values that would later be rounded.
+    """
+
+    path = Path(profile).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"MuseScore MIDI import profile does not exist: {path}")
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise ValueError(f"MuseScore MIDI import profile is invalid: {path}: {exc}") from exc
+    if root.tag.rsplit("}", 1)[-1] != "MidiOptions":
+        raise ValueError(f"MuseScore MIDI import profile has unexpected root: {root.tag!r}")
+    values = {
+        child.tag.rsplit("}", 1)[-1]: (child.text or "").strip().lower()
+        for child in root
+        if child.tag.rsplit("}", 1)[-1] in MUSESCORE_IMPORT_PROFILE_EXPECTED
+    }
+    mismatches = {
+        name: {"expected": expected, "actual": values.get(name)}
+        for name, expected in MUSESCORE_IMPORT_PROFILE_EXPECTED.items()
+        if values.get(name) != expected
+    }
+    # Git may normalize this tracked XML between LF and CRLF on Windows;
+    # pin the content hash independently of that transport detail.
+    profile_bytes = path.read_bytes().replace(bytes((13, 10)), bytes((10,)))
+    digest = hashlib.sha256(profile_bytes).hexdigest().upper()
+    if expected_sha256 and digest != expected_sha256.upper():
+        mismatches["sha256"] = {"expected": expected_sha256.upper(), "actual": digest}
+    if mismatches:
+        raise ValueError(f"MuseScore MIDI import profile does not match the pinned exact-grid policy: {mismatches}")
+    return {
+        "path": os.fspath(path),
+        "sha256": digest,
+        "options": values,
+        "tuplets": {name: values[name] == "true" for name in ("Duplets", "Triplets", "Quadruplets", "Quintuplets", "Septuplets", "Nonuplets")},
+    }
 
 
 def _package_probe(python: Path, packages: tuple[str, ...], *, label: str) -> tuple[bool, str | None, dict[str, str]]:
@@ -188,6 +252,32 @@ def get_high_accuracy_capabilities() -> dict[str, Any]:
             "download_sha256": MUSESCORE_RELEASE_SHA256,
         }
     )
+    try:
+        profile_details = validate_musescore_import_profile(
+            MUSESCORE_IMPORT_PROFILE_PATH,
+            expected_sha256=MUSESCORE_IMPORT_PROFILE_SHA256,
+        )
+        profile_ok = True
+        profile_reason = None
+    except ValueError as exc:
+        profile_details = {
+            "path": os.fspath(MUSESCORE_IMPORT_PROFILE_PATH),
+            "sha256": None,
+            "options": {},
+            "tuplets": {},
+        }
+        profile_ok = False
+        profile_reason = str(exc)
+    muse_details.update(
+        {
+            "import_profile": profile_details,
+            "import_profile_available": profile_ok,
+            "import_profile_reason": profile_reason,
+        }
+    )
+    if muse_ok and not profile_ok:
+        muse_ok = False
+        muse_reason = f"MuseScore import profile is unavailable or invalid: {profile_reason}"
 
     available = beatnet_ok and notation_ok and muse_ok
     return {
@@ -201,6 +291,7 @@ def get_high_accuracy_capabilities() -> dict[str, Any]:
             "notation_engine": "musescore-midi-import",
             "beat_engine": "beatnet",
             "score_ticks_per_quarter": 48,
-            "musescore_import_profile": "adaptive-1/32-tuplets-4-voices",
+            "musescore_import_profile": MUSESCORE_IMPORT_PROFILE,
+            "musescore_import_profile_sha256": MUSESCORE_IMPORT_PROFILE_SHA256,
         },
     }
