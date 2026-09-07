@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0",
+  "name": "jianpu-high-accuracy-local-benchmark",
+  "created_for": "stage10 acceptance",
+  "cases": [
+    {
+      "id": "pjs001",
+      "title": "PJS 日语歌声 001",
+      "language": "ja",
+      "license": "CC BY-SA 4.0",
+      "input": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs001/pjs001_song.wav",
+      "reference_midi": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs001/pjs001.mid",
+      "reference_midi_reliable": true,
+      "beat_annotation": null,
+      "evaluation_policy": "reference_metrics",
+      "notes": "同源歌声、MIDI、MusicXML；未把 phoneme .lab 误当作拍点标注。"
+    },
+    {
+      "id": "pjs002",
+      "title": "PJS 日语歌声 002",
+      "language": "ja",
+      "license": "CC BY-SA 4.0",
+      "input": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs002/pjs002_song.wav",
+      "reference_midi": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs002/pjs002.mid",
+      "reference_midi_reliable": true,
+      "beat_annotation": null,
+      "evaluation_policy": "reference_metrics",
+      "notes": "小样本登记；不会伪造完整语料结果。"
+    },
+    {
+      "id": "pjs003",
+      "title": "PJS 日语歌声 003",
+      "language": "ja",
+      "license": "CC BY-SA 4.0",
+      "input": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs003/pjs003_song.wav",
+      "reference_midi": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs003/pjs003.mid",
+      "reference_midi_reliable": true,
+      "beat_annotation": null,
+      "evaluation_policy": "reference_metrics",
+      "notes": "PJS 官方小样本。"
+    },
+    {
+      "id": "pjs004",
+      "title": "PJS 日语歌声 004",
+      "language": "ja",
+      "license": "CC BY-SA 4.0",
+      "input": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs004/pjs004_song.wav",
+      "reference_midi": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs004/pjs004.mid",
+      "reference_midi_reliable": true,
+      "beat_annotation": null,
+      "evaluation_policy": "reference_metrics",
+      "notes": "PJS 官方小样本。"
+    },
+    {
+      "id": "pjs005",
+      "title": "PJS 日语歌声 005",
+      "language": "ja",
+      "license": "CC BY-SA 4.0",
+      "input": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs005/pjs005_song.wav",
+      "reference_midi": ".cache/high-accuracy-benchmarks/pjs/selected/PJS_corpus_ver1.1/pjs005/pjs005.mid",
+      "reference_midi_reliable": true,
+      "beat_annotation": null,
+      "evaluation_policy": "reference_metrics",
+      "notes": "PJS 官方小样本。"
+    },
+    {
+      "id": "luv-letter",
+      "title": "Luv Letter（本机完整性候选）",
+      "language": "instrumental",
+      "license": "user-provided-local",
+      "input": "E:/edge/first/Luv Letter.mp3",
+      "reference_midi": "E:/edge/first/Luv Letter.mid",
+      "reference_midi_reliable": false,
+      "beat_annotation": null,
+      "evaluation_policy": "integrity_and_manual_listening_only",
+      "notes": "同名 MIDI 仅作版本/时长核对候选；没有可靠音频对齐标注，不用于 pitch/rhythm/20% 精度结论。"
+    }
+  ]
+}

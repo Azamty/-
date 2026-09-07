@@ -205,6 +205,22 @@ input[type="range"] { width: 70px; accent-color: var(--coral); }
 .score-card small { display: block; margin-top: 4px; color: #727b73; font-size: 9px; }
 .download-line { display: inline-flex; margin-top: 17px; color: var(--coral-dark); font-size: 10px; text-decoration: none; }
 .download-line:hover { text-decoration: underline; }
+.high-accuracy-meta { display: grid; gap: 10px; margin: 18px 0 4px; }
+.engine-readout, .track-failure-list, .score-refusal { display: grid; gap: 4px; padding: 12px 14px; border-left: 4px solid var(--sage); background: #eef0df; }
+.engine-readout span, .track-failure-list strong, .score-refusal strong { color: var(--ink); font-size: 11px; }
+.engine-readout strong { color: var(--coral-dark); font-family: var(--mono); font-size: 11px; }
+.engine-readout small, .track-failure-list span, .score-refusal span { color: #657269; font-family: var(--mono); font-size: 9px; line-height: 1.6; }
+.track-failure-list { border-left-color: var(--coral); background: #fff0dc; }
+.score-refusal { border-left-color: #b67f3c; background: #fbefc8; }
+.artifact-download-panel { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
+.artifact-download-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; margin-top: 12px; }
+.artifact-download-card { display: grid; gap: 5px; min-height: 58px; padding: 12px 13px; color: var(--ink); text-decoration: none; background: #fff8e9; border: 1px solid rgba(201, 84, 59, .34); }
+.artifact-download-card:hover { border-color: var(--coral); background: #fff3d8; }
+.artifact-download-card strong { font-size: 11px; }
+.artifact-download-card small { overflow: hidden; color: #727b73; font-family: var(--mono); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-download-card.support { border-color: var(--line); background: #eeeadd; }
+.support-artifacts { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 10px; }
+.support-artifacts summary { cursor: pointer; color: #727b73; font-family: var(--mono); font-size: 9px; }
 .muted-line { color: #6c776e; margin-left: 18px; }
 .vocal-listen { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 21px; }
 .vocal-listen > div { display: grid; gap: 8px; padding: 14px; background: #e8e0cf; border-left: 4px solid var(--sage); }

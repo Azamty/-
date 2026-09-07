@@ -163,3 +163,26 @@ CUDA、medium 模型和 MuScriptor 的非商业许可证限制。
 ```
 
 验收 JSON 默认写入被忽略的 `artifacts\review\stageC-api\smoke.json`。
+
+## V2 高精度链路（Stage10）
+
+当前网页只走 `/api/v2/...`。`/api/jobs` 和 `backend/jianpu_score/pipeline.py` 仍保留一个版本周期，便于 Git 回退和对照；它们不是当前网页入口。V2 生产任务使用 BeatNet → 480 PPQ performance MIDI → MuseScore MIDI 导入 → MusicXML → music21 48 TPQ Score → jianpu-ly/LilyPond，运行时不会调用旧的 `quantize_events` 均匀网格量化器。
+
+V2 每个有音高乐器的最终结果都登记 `score.mid`、MusicXML、alignment report、performance MIDI、Score JSON、JLY、LilyPond、分页 SVG、纵向长图 SVG 和高精度 manifest；网页将长图排在分页结果之前，并将最终文件和人声 GAME 原始/清理后音符放在醒目的下载区域。鼓组只提供 MIDI。BeatNet、MuseScore、MusicXML 标准化或单轨失败会保留诊断清单和日志；部分失败显示轨道与阶段，全部失败会明确拒绝简谱，不会静默回退旧链路。结果区显示 `notation_engine`、`beat_engine`、版本和 48 TPQ。
+
+先准备隔离工具链并检查能力：
+
+```powershell
+.\scripts\install_high_accuracy.ps1
+.\scripts\check_toolchain.ps1
+```
+
+BeatNet 使用独立 `.venv-model-beatnet`，MusicXML worker 使用独立 `.venv-notation`；MuseScore 4.7.4 的固定 MSI 和校验文件位于本地忽略目录 `.cache\packages`，项目解包目录是 `tools\musescore-4.7.4`，也支持已安装的 `C:\Program Files\MuseScore 4\bin\MuseScore4.exe`。MuseScore 可以直接启动检查：`& 'C:\Program Files\MuseScore 4\bin\MuseScore4.exe'`；服务内的 CLI 调用从启动到退出串行执行。
+
+可重复的候选登记和指标验收见 [docs/high-accuracy-acceptance.md](docs/high-accuracy-acceptance.md)：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\high_accuracy_benchmark.py --check
+```
+
+登记表包含 PJS `pjs001`–`pjs005` 和本机 `E:\edge\first\Luv Letter.mp3`，但不提交音频。Luv Letter 的同名 MIDI 目前只用于版本/时长核对和人工听谱，因缺少可靠的音频对齐标注，不用于 pitch/rhythm 或“精度提升20%”结论；脚本没有结果目录时保持所有指标为 `null`。

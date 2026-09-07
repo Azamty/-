@@ -106,3 +106,27 @@ def test_synth_pause_contract_destroys_worklet_queue_and_resumes_from_offset() -
     assert "playbackPosition(audioNow, synthOriginRef.current, synthDurationRef.current)" in source
     assert 'synthPaused ? "播放"' in source
     assert "synthPlaying || synthPaused ? synthTime : originalTime" in source
+
+
+def test_high_accuracy_result_contract_keeps_long_score_first_and_exposes_diagnostics() -> None:
+    source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+    styles = (ROOT / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert "notation_engine" in source
+    assert "beat_engine" in source
+    assert "beatnet_version" in source
+    assert "musescore_version" in source
+    assert "score_ticks_per_quarter" in source
+    assert "track_failures" in source
+    assert "部分乐器未完成" in source
+    assert "当前没有可生成的简谱" in source
+    assert "instrument_musicxml" in source
+    assert "instrument_alignment_report" in source
+    assert "instrument_performance_midi" in source
+    assert "vocal_raw_notes" in source
+    assert "vocal_cleaned_notes" in source
+    assert "high_accuracy_manifest" in source
+    assert "high_accuracy_log" in source
+    assert "纵向长图 SVG · 默认预览" in source
+    assert "artifact-download-panel" in styles
+    assert ".support-artifacts" in styles

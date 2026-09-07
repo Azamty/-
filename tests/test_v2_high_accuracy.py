@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from typing import Any, ClassVar
@@ -22,6 +23,7 @@ from backend.jianpu_score.models.adapter import EngineResult
 from backend.jianpu_score.render import JIANPU, LILYPOND
 from backend.job_manager import JobManager
 from backend.muscriptor_v2 import stable_track_id
+from backend.v2_job_manager import V2JobService
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = ROOT / "tools" / "musescore-4.7.4" / "midi_import_options.xml"
@@ -32,6 +34,19 @@ REAL_READY = (
     and JIANPU.is_file()
     and LILYPOND.is_file()
 )
+
+
+def test_current_v2_web_service_does_not_call_legacy_uniform_quantizer() -> None:
+    """The webpage's /api/v2 path must stay on the high-accuracy service.
+
+    The legacy /api/jobs pipeline remains available for one rollback cycle, so
+    this assertion is deliberately scoped to V2JobService rather than the
+    whole repository.
+    """
+
+    source = inspect.getsource(V2JobService)
+    assert "quantize_events" not in source
+    assert "run_pipeline" not in source
 
 
 class FakeHighAccuracyService:
