@@ -75,11 +75,19 @@ def _duration_details(element: Any) -> dict[str, Any]:
     duration = element.duration
     tuplets = list(getattr(duration, "tuplets", ()) or ())
     tuplet = tuplets[0] if tuplets else None
+    tuplet_type = getattr(tuplet, "type", None) if tuplet is not None else None
+    if tuplet_type not in {"start", "stop", "continue"}:
+        tuplet_type = None
     return {
         "duration_quarter": _number(duration.quarterLength),
         "dots": int(getattr(duration, "dots", 0) or 0),
         "tuplet_actual": int(getattr(tuplet, "numberNotesActual", 0) or 0) or None,
         "tuplet_normal": int(getattr(tuplet, "numberNotesNormal", 0) or 0) or None,
+        # music21 preserves MusicXML's explicit <tuplet type="start|stop">
+        # on the duration Tuplet.  Keep it so a single logical group may be
+        # split into rests, chords, tie fragments, or more than three XML
+        # events without guessing from event count later.
+        "tuplet_type": tuplet_type,
         "grace": bool(getattr(duration, "isGrace", False)),
     }
 

@@ -181,6 +181,9 @@ class ScoreNote(BaseModel):
     tie_types: list[str | None] = Field(default_factory=list)
     tuplet_actual: int | None = Field(default=None, gt=0)
     tuplet_normal: int | None = Field(default=None, gt=0)
+    # MusicXML's explicit tuplet boundary.  ``None`` is the ordinary middle
+    # event in a group (music21 leaves the boundary type unset there).
+    tuplet_type: str | None = None
     dots: int = Field(default=0, ge=0)
     measure_number: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -216,6 +219,13 @@ class ScoreNote(BaseModel):
     def validate_tie_types(cls, value: list[str | None]) -> list[str | None]:
         if any(item is not None and item not in {"start", "stop", "continue"} for item in value):
             raise ValueError("tie_types must contain start, stop, or continue")
+        return value
+
+    @field_validator("tuplet_type")
+    @classmethod
+    def validate_tuplet_type(cls, value: str | None) -> str | None:
+        if value is not None and value not in {"start", "stop", "continue"}:
+            raise ValueError("tuplet_type must be start, stop, continue, or null")
         return value
 
 

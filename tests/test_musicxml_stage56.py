@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -36,6 +37,7 @@ from backend.jianpu_score.high_accuracy import (
     resolve_notation_python,
     validate_musescore_import_profile,
 )
+from scripts.musicxml_score_worker import _duration_details
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +58,27 @@ def test_musescore_profile_pins_exact_48_tpq_tuplet_policy() -> None:
         "Septuplets": False,
         "Nonuplets": False,
     }
+
+
+@pytest.mark.parametrize("boundary", ["start", "stop", "continue", None])
+def test_music21_worker_preserves_explicit_tuplet_boundary(boundary: str | None) -> None:
+    tuplet = SimpleNamespace(
+        numberNotesActual=3,
+        numberNotesNormal=2,
+        type=boundary,
+    )
+    duration = SimpleNamespace(
+        quarterLength=1 / 6,
+        dots=0,
+        tuplets=[tuplet],
+        isGrace=False,
+    )
+
+    details = _duration_details(SimpleNamespace(duration=duration))
+
+    assert details["tuplet_actual"] == 3
+    assert details["tuplet_normal"] == 2
+    assert details["tuplet_type"] == boundary
 
 
 def _musicxml_actual_tuplet_ratios(path: Path) -> set[tuple[int, int]]:

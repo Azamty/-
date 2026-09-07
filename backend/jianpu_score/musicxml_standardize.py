@@ -61,6 +61,7 @@ class WorkerEvent(BaseModel):
     tie_types: list[str | None] = Field(default_factory=list)
     tuplet_actual: int | None = Field(default=None, gt=0)
     tuplet_normal: int | None = Field(default=None, gt=0)
+    tuplet_type: str | None = None
     dots: int = Field(default=0, ge=0)
     grace: bool = False
     voice: str = "1"
@@ -72,6 +73,13 @@ class WorkerEvent(BaseModel):
     def validate_pitches(cls, value: list[int]) -> list[int]:
         if any(pitch < 0 or pitch > 127 for pitch in value):
             raise ValueError("worker pitches must be MIDI values between 0 and 127")
+        return value
+
+    @field_validator("tuplet_type")
+    @classmethod
+    def validate_tuplet_type(cls, value: str | None) -> str | None:
+        if value is not None and value not in {"start", "stop", "continue"}:
+            raise ValueError("tuplet_type must be start, stop, continue, or null")
         return value
 
 
@@ -176,6 +184,9 @@ class _RawEvent:
     dots: int
     measure_number: int | None
     metadata: dict[str, Any]
+    # Optional for hand-built alignment fixtures written before explicit
+    # MusicXML tuplet boundaries were carried through the worker.
+    tuplet_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -386,6 +397,7 @@ def _worker_raw_events(payload: WorkerPayload) -> tuple[list[_RawEvent], list[di
                     tie_types=list(item.tie_types),
                     tuplet_actual=item.tuplet_actual,
                     tuplet_normal=item.tuplet_normal,
+                    tuplet_type=item.tuplet_type,
                     dots=item.dots,
                     measure_number=item.measure_number,
                     metadata={"musicxml_event_id": item.event_id},
@@ -561,6 +573,7 @@ def _normalize_tied_event_voices(events: list[_RawEvent]) -> list[dict[str, Any]
                     tie_types=tie_types,
                     tuplet_actual=event.tuplet_actual,
                     tuplet_normal=event.tuplet_normal,
+                    tuplet_type=event.tuplet_type,
                     dots=event.dots,
                     measure_number=event.measure_number,
                     metadata=metadata,
@@ -1076,6 +1089,7 @@ def _score_voice_events(
                 tie_types=list(event.tie_types),
                 tuplet_actual=event.tuplet_actual,
                 tuplet_normal=event.tuplet_normal,
+                tuplet_type=event.tuplet_type,
                 dots=event.dots,
                 measure_number=event.measure_number,
                 metadata=dict(event.metadata),

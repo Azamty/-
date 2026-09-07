@@ -526,6 +526,7 @@ class _Slice:
     tie_after: frozenset[int] = frozenset()
     tuplet_actual: int | None = None
     tuplet_normal: int | None = None
+    tuplet_type: str | None = None
     dots: int = 0
 
     @property
@@ -1144,6 +1145,19 @@ def _slice_voice_events(voice: ScoreVoice, spans: list[_MeasureSpan]) -> list[li
                     tie_after=frozenset(pitches if not is_last and pitches else tie_after),
                     tuplet_actual=event.tuplet_actual,
                     tuplet_normal=event.tuplet_normal,
+                    # A boundary belongs to the first/last slice when a
+                    # MusicXML event itself crosses a barline.  Keeping it
+                    # on the wrong fragment would make a legal cross-bar
+                    # group appear unclosed to the serializer.
+                    tuplet_type=(
+                        event.tuplet_type
+                        if (
+                            (event.tuplet_type == "start" and is_first)
+                            or (event.tuplet_type == "stop" and is_last)
+                            or event.tuplet_type == "continue"
+                        )
+                        else None
+                    ),
                     dots=event.dots if is_first and is_last else 0,
                 )
             )
@@ -1190,38 +1204,127 @@ def _slice_tokens(
     return tokens
 
 
-def _explicit_tuplet_groups(slices: list[_Slice]) -> dict[int, tuple[int, int]]:
-    groups: dict[int, tuple[int, int]] = {}
-    covered: set[int] = set()
-    for start in range(max(0, len(slices) - 2)):
-        if start in covered:
+def _validate_tuplet_ratio(item: _Slice) -> tuple[int, int] | None:
+    supplied = item.tuplet_actual is not None or item.tuplet_normal is not None
+    if not supplied:
+        return None
+    if item.tuplet_actual is None or item.tuplet_normal is None:
+        raise JianpuSerializationError("tuplet_actual and tuplet_normal must be supplied together")
+    ratio = (item.tuplet_actual, item.tuplet_normal)
+    if ratio != (3, 2):
+        raise JianpuSerializationError(
+            f"jianpu-ly serializer only supports explicit 3:2 tuplets, got {ratio[0]}:{ratio[1]}"
+        )
+    return ratio
+
+
+def _explicit_tuplet_groups(slices: list[_Slice]) -> dict[int, tuple[tuple[int, int], int]]:
+    """Return ``start -> (ratio, exclusive end)`` for explicit tuplets.
+
+    MusicXML can split one 3:2 group into any number of note, chord, rest, or
+    tie fragments.  In particular a start/stop pair may surround four
+    fragments (the Luv Letter import has 4,8,4,8 actual ticks).  The old
+    implementation assumed exactly three events and therefore rejected a
+    legal group at the final fragment.  Explicit MusicXML boundaries are the
+    authority; without them we retain the legacy, conservative three-slice
+    inference because a longer unbounded run is ambiguous.
+    """
+
+    groups: dict[int, tuple[tuple[int, int], int]] = {}
+    marked = [(_validate_tuplet_ratio(item), item.tuplet_type) for item in slices]
+    open_start: int | None = None
+    open_ratio: tuple[int, int] | None = None
+
+    for index, (ratio, boundary) in enumerate(marked):
+        if boundary == "start":
+            if open_start is not None:
+                raise JianpuSerializationError(
+                    f"nested/overlapping explicit tuplets at tick {slices[index].start_tick}"
+                )
+            if ratio is None:
+                raise JianpuSerializationError(
+                    f"tuplet start at tick {slices[index].start_tick} has no 3:2 ratio"
+                )
+            open_start, open_ratio = index, ratio
+        elif boundary == "stop" and open_start is None:
+            raise JianpuSerializationError(
+                f"tuplet stop at tick {slices[index].start_tick} has no matching start"
+            )
+
+        if open_start is not None:
+            if ratio is None or ratio != open_ratio:
+                raise JianpuSerializationError(
+                    f"explicit tuplet at tick {slices[index].start_tick} has a gap or inconsistent ratio"
+                )
+            if index and slices[index - 1].end_tick != slices[index].start_tick:
+                raise JianpuSerializationError(
+                    f"explicit tuplet has a timeline gap before tick {slices[index].start_tick}"
+                )
+            if boundary == "stop":
+                assert open_ratio is not None
+                groups[open_start] = (open_ratio, index + 1)
+                open_start = None
+                open_ratio = None
+        elif ratio is not None:
+            # Boundary-free records are handled below as the old Score JSON
+            # compatibility path.  A ``continue`` without an open group is
+            # not enough evidence to infer where that group starts.
+            if boundary == "continue":
+                raise JianpuSerializationError(
+                    f"unanchored explicit tuplet at tick {slices[index].start_tick}"
+                )
+
+    if open_start is not None:
+        raise JianpuSerializationError(
+            f"explicit tuplet at tick {slices[open_start].start_tick} has no stop boundary"
+        )
+
+    boundary_indices = {
+        index
+        for index, (_ratio, boundary) in enumerate(marked)
+        if boundary in {"start", "stop", "continue"}
+    }
+    covered = {index for start, (_ratio, end) in groups.items() for index in range(start, end)}
+    if boundary_indices & covered:
+        # Every boundary event must be inside the group that owns it.  This
+        # also catches a malformed stop after a previous group was closed.
+        if boundary_indices - covered:
+            index = min(boundary_indices - covered)
+            raise JianpuSerializationError(
+                f"explicit tuplet boundary at tick {slices[index].start_tick} is not part of a complete group"
+            )
+
+    # Legacy Score JSON has ratios but no MusicXML boundary metadata.  Only a
+    # complete, contiguous three-slice run is safe to infer.  Longer runs are
+    # deliberately rejected rather than arbitrarily grouping the first three.
+    consumed = set(covered)
+    index = 0
+    while index < len(slices):
+        if index in consumed or marked[index][0] is None or marked[index][1] is not None:
+            index += 1
             continue
-        group = slices[start : start + 3]
-        # The first time-modification event is the reliable group anchor.  Do
-        # not absorb a preceding rest because two later notes share a ratio.
-        if not group or group[0].tuplet_actual is None and group[0].tuplet_normal is None:
-            continue
+        run_start = index
+        group = slices[run_start : run_start + 3]
         if len(group) != 3 or any(left.end_tick != right.start_tick for left, right in pairwise(group)):
-            continue
-        explicit = [(item.tuplet_actual, item.tuplet_normal) for item in group if item.tuplet_actual is not None or item.tuplet_normal is not None]
-        if len(explicit) < 2:
-            continue
-        if any(actual is None or normal is None for actual, normal in explicit):
-            raise JianpuSerializationError("tuplet_actual and tuplet_normal must be supplied together")
-        ratio = explicit[0]
-        if any(value != ratio for value in explicit):
-            raise JianpuSerializationError("a tuplet group contains inconsistent actual/normal ratios")
-        if ratio != (3, 2):
+            bad = slices[run_start]
             raise JianpuSerializationError(
-                f"jianpu-ly serializer only supports explicit 3:2 tuplets, got {ratio[0]}:{ratio[1]}"
+                f"explicit tuplet at tick {bad.start_tick} does not form a complete three-note group"
             )
-        groups[start] = ratio
-        covered.update(range(start, start + 3))
-    for index, item in enumerate(slices):
-        if (item.tuplet_actual is not None or item.tuplet_normal is not None) and index not in covered:
+        explicit = [marked[run_start + offset][0] for offset in range(3) if marked[run_start + offset][0] is not None]
+        ratio = explicit[0] if explicit else None
+        # Older Score JSON (including the checked-in stage56 fixture) may
+        # carry the ratio only on two of three fragments.  The contiguous
+        # three-slice shape plus two matching ratio slots is the narrow
+        # compatibility inference; a longer boundary-free run is rejected.
+        if len(explicit) < 2 or any(value != ratio for value in explicit):
+            bad = slices[run_start]
             raise JianpuSerializationError(
-                f"explicit tuplet at tick {item.start_tick} does not form a complete three-note group"
+                f"explicit tuplet at tick {bad.start_tick} does not form a complete three-note group"
             )
+        assert ratio is not None
+        groups[run_start] = (ratio, run_start + 3)
+        consumed.update(range(run_start, run_start + 3))
+        index = run_start + 3
     return groups
 
 
@@ -1244,8 +1347,15 @@ def _serialize_measure(
     span: _MeasureSpan,
     key: str,
     quarter_ticks: int,
+    *,
+    explicit_groups: Mapping[int, tuple[tuple[int, int], int]] | None = None,
+    global_offset: int = 0,
 ) -> list[str]:
-    explicit_groups = _explicit_tuplet_groups(slices)
+    if explicit_groups is None:
+        local_groups = _explicit_tuplet_groups(slices)
+        explicit_groups = {
+            start: (ratio, end) for start, (ratio, end) in local_groups.items()
+        }
     output: list[str] = []
     index = 0
     cursor = span.start_tick
@@ -1253,31 +1363,41 @@ def _serialize_measure(
         item = slices[index]
         if item.start_tick != cursor:
             raise JianpuSerializationError(f"measure serializer gap at tick {cursor}")
-        if index in explicit_groups:
-            ratio = explicit_groups[index]
-            group = slices[index : index + 3]
-            output.append(f"{ratio[0]}[")
-            for group_index, member in enumerate(group):
-                nominal = Fraction(member.duration_tick * ratio[0], ratio[1])
-                if nominal.denominator != 1:
-                    raise JianpuSerializationError(
-                        f"tuplet note at tick {member.start_tick} is not exact at {quarter_ticks} TPQ"
-                    )
-                output.extend(
-                    _slice_tokens(
-                        member,
-                        key,
-                        quarter_ticks,
-                        duration_tick=int(nominal),
-                        dots=member.dots,
-                        include_tie=group_index < 2,
-                    )
+        global_index = global_offset + index
+        group_info = next(
+            (
+                (start, ratio, end)
+                for start, (ratio, end) in explicit_groups.items()
+                if start <= global_index < end
+            ),
+            None,
+        )
+        if group_info is not None:
+            start, ratio, end = group_info
+            if global_index == start:
+                output.append(f"{ratio[0]}[")
+            nominal = Fraction(item.duration_tick * ratio[0], ratio[1])
+            if nominal.denominator != 1:
+                raise JianpuSerializationError(
+                    f"tuplet note at tick {item.start_tick} is not exact at {quarter_ticks} TPQ"
                 )
-            output.append("]")
-            if group[-1].tie_after and group[-1].pitches:
-                output.append("~")
-            cursor = group[-1].end_tick
-            index += 3
+            is_last = global_index + 1 == end
+            output.extend(
+                _slice_tokens(
+                    item,
+                    key,
+                    quarter_ticks,
+                    duration_tick=int(nominal),
+                    dots=item.dots,
+                    include_tie=not is_last,
+                )
+            )
+            if is_last:
+                output.append("]")
+                if item.tie_after and item.pitches:
+                    output.append("~")
+            cursor = item.end_tick
+            index += 1
             continue
         if _legacy_triplet(slices, index, quarter_ticks, span.end_tick):
             group = slices[index : index + 3]
@@ -1344,9 +1464,22 @@ def score_to_jianpu(score: Score) -> str:
                 # defaults when a new voice starts.
                 lines.extend([_key_command(key), f"4={contexts[0].tempo_bpm}", meter_header])
         output: list[str] = []
+        flattened = [item for bar in bars for item in bar]
+        global_tuplet_groups = _explicit_tuplet_groups(flattened)
+        slice_offset = 0
         for index, (span, slices, context) in enumerate(zip(spans, bars, contexts)):
             output.extend(_measure_prefix(index, contexts))
-            output.extend(_serialize_measure(slices, span, context.key, score.quarter_ticks))
+            output.extend(
+                _serialize_measure(
+                    slices,
+                    span,
+                    context.key,
+                    score.quarter_ticks,
+                    explicit_groups=global_tuplet_groups,
+                    global_offset=slice_offset,
+                )
+            )
+            slice_offset += len(slices)
         lines.append(" ".join(output))
         if voice_index + 1 < len(serialization_voices):
             lines.append("NextPart")

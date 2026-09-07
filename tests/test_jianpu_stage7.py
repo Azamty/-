@@ -107,6 +107,125 @@ def test_explicit_tuplet_metadata_takes_precedence_over_legacy_shape() -> None:
     assert "3[" in score_to_jianpu(score)
 
 
+def _tuple_fragment_score(
+    fragments: list[tuple[int, int, int | None, str | None]],
+    *,
+    title: str,
+) -> Score:
+    """Build one bar with explicit MusicXML-shaped tuplet fragments."""
+
+    events: list[ScoreNote] = []
+    cursor = 0
+    for duration, midi, actual, boundary in fragments:
+        events.append(
+            ScoreNote(
+                start_tick=cursor,
+                duration_tick=duration,
+                midi=midi,
+                tuplet_actual=actual,
+                tuplet_normal=2 if actual is not None else None,
+                tuplet_type=boundary,
+            )
+        )
+        cursor += duration
+    if cursor < 192:
+        events.append(ScoreNote(start_tick=cursor, duration_tick=192 - cursor, midi=None))
+    return Score(
+        title=title,
+        bpm=96,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=192,
+        voices=[ScoreVoice(voice_id="tuplet", events=events)],
+    )
+
+
+def test_explicit_tuplet_boundary_accepts_four_note_rest_fragments() -> None:
+    # MuseScore/music21 emits this shape for a legal 3:2 group: a 4-tick
+    # rest, 8-tick note, 4-tick rest, and 8-tick note.  It is one group by
+    # MusicXML start/stop boundaries even though it has four events.
+    score = _tuple_fragment_score(
+        [
+            (4, None, 3, "start"),
+            (8, 80, 3, None),
+            (4, None, 3, None),
+            (8, 77, 3, "stop"),
+        ],
+        title="explicit four-fragment triplet",
+    )
+
+    jianpu = score_to_jianpu(score)
+
+    assert jianpu.count("3[") == 1
+    assert jianpu.count("]") == 1
+    assert "d0" in jianpu and "s#5'" in jianpu
+
+
+def test_explicit_tuplet_boundary_accepts_chord_and_rest_members() -> None:
+    score = _tuple_fragment_score(
+        [
+            (8, None, 3, "start"),
+            (8, 60, 3, None),
+            (8, 64, 3, "stop"),
+        ],
+        title="explicit rest chord triplet",
+    )
+    # Make the middle event a chord without changing its timeline.
+    score.voices[0].events[1].chord_pitches = [60, 64, 67]
+
+    jianpu = score_to_jianpu(score)
+
+    assert "3[" in jianpu and "]" in jianpu
+    assert "135" in jianpu
+
+
+def test_explicit_tuplet_boundary_can_cross_a_measure() -> None:
+    events = [
+        ScoreNote(start_tick=0, duration_tick=144, midi=None),
+        ScoreNote(start_tick=144, duration_tick=36, midi=None),
+        ScoreNote(start_tick=180, duration_tick=6, midi=None),
+        ScoreNote(start_tick=186, duration_tick=8, midi=60, tuplet_actual=3, tuplet_normal=2, tuplet_type="start"),
+        ScoreNote(start_tick=194, duration_tick=8, midi=None, tuplet_actual=3, tuplet_normal=2),
+        ScoreNote(start_tick=202, duration_tick=8, midi=62, tuplet_actual=3, tuplet_normal=2, tuplet_type="stop"),
+        ScoreNote(start_tick=210, duration_tick=144, midi=None),
+        ScoreNote(start_tick=354, duration_tick=24, midi=None),
+        ScoreNote(start_tick=378, duration_tick=6, midi=None),
+    ]
+    score = Score(
+        title="cross measure triplet",
+        bpm=96,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=384,
+        voices=[ScoreVoice(voice_id="cross", events=events)],
+    )
+
+    jianpu = score_to_jianpu(score)
+    lines = [line for line in jianpu.splitlines() if "3[" in line or "]" in line]
+
+    assert lines
+    assert "3[" in lines[0].split("|")[0]
+    assert "]" in lines[0].split("|")[1]
+
+
+def test_explicit_tuplet_boundary_rejects_incomplete_or_ambiguous_groups() -> None:
+    incomplete = _tuple_fragment_score(
+        [(8, 60, 3, "start"), (8, 62, 3, None)],
+        title="incomplete explicit triplet",
+    )
+    with pytest.raises(JianpuSerializationError, match="gap or inconsistent ratio|no stop boundary"):
+        score_to_jianpu(incomplete)
+
+    ambiguous = _tuple_fragment_score(
+        [(8, 60, 3, None), (8, 62, 3, None), (8, 64, 3, None), (8, 65, 3, None)],
+        title="ambiguous unbounded triplet",
+    )
+    with pytest.raises(JianpuSerializationError, match="complete three-note group"):
+        score_to_jianpu(ambiguous)
+
+
 def test_partial_chord_tie_is_split_into_safe_parts() -> None:
     score = Score(
         title="partial chord tie",
