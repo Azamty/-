@@ -81,8 +81,12 @@ def render_score(score: Score, output_dir: str | Path, *, basename: str = "score
     lilypond_path = destination / f"{safe_name}.ly"
     prefix = destination / safe_name
     log_path = destination / f"{safe_name}.lilypond.log"
+    render_suffixes = {".jly", ".ly", ".svg", ".mid", ".midi", ".log"}
     for path in destination.glob(f"{safe_name}*"):
-        if path.is_file():
+        # Keep adjacent score/diagnostic JSON and source artifacts.  The
+        # service writes those before rendering so a later LilyPond failure
+        # still leaves the completed standardization prefix available.
+        if path.is_file() and path.suffix.lower() in render_suffixes:
             path.unlink()
 
     jly_text = score_to_jianpu(score)
