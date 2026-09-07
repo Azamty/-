@@ -928,15 +928,7 @@ def _partial_tie_pitches(voice: ScoreVoice) -> set[int]:
 
     special: set[int] = set()
     for event in voice.events:
-        pitches = _event_pitches(event)
-        if len(pitches) <= 1:
-            continue
-        before, after = _event_tie_sets(event)
-        all_pitches = frozenset(pitches)
-        if before and before != all_pitches:
-            special.update(before)
-        if after and after != all_pitches:
-            special.update(after)
+        special.update(_partial_tie_pitches_for_event(event))
     return special
 
 
@@ -975,15 +967,16 @@ def _chord_split_records(
     The vendor's simple-chord grammar has one accidental state for a token.
     An accidental on a later figure can therefore be applied to an earlier
     figure (the B-flat-minor ``6,,#1,3,`` case is a concrete example).  Such a
-    chord is rendered as one lane per pitch by ``_serialization_voices``.  A
-    lane contains rests at the other events, so this preserves the original
-    voice timeline without duplicating unrelated notes.
+    chord is rendered with one lane per pitch by ``_serialization_voices``.
+    Those lanes are local to the tie-connected component and are reused by
+    later unsafe chords; other events remain in the base voice or become rests
+    in a supplemental lane.
     """
 
     normalized_keys = tuple(dict.fromkeys(normalize_key(key) for key in keys))
     records: list[dict[str, Any]] = []
     for voice in voices:
-        for event in voice.events:
+        for event_index, event in enumerate(voice.events):
             pitches = _event_pitches(event)
             if len(pitches) <= 1:
                 continue
@@ -999,6 +992,7 @@ def _chord_split_records(
                 records.append(
                     {
                         "voice_id": voice.voice_id,
+                        "event_index": event_index,
                         "start_tick": event.start_tick,
                         "duration_tick": event.duration_tick,
                         "pitches": sorted(pitches),
@@ -1009,6 +1003,121 @@ def _chord_split_records(
                 )
                 break
     return records
+
+
+def _partial_tie_indices(voice: ScoreVoice) -> set[int]:
+    """Return events whose chord tie needs independent pitch lanes."""
+
+    return {
+        index
+        for index, event in enumerate(voice.events)
+        if _partial_tie_pitches_for_event(event)
+    }
+
+
+def _partial_tie_pitches_for_event(event: ScoreNote) -> set[int]:
+    pitches = _event_pitches(event)
+    if len(pitches) <= 1:
+        return set()
+    before, after = _event_tie_sets(event)
+    all_pitches = frozenset(pitches)
+    special: set[int] = set()
+    if before and before != all_pitches:
+        special.update(before)
+    if after and after != all_pitches:
+        special.update(after)
+    return special
+
+
+def _chord_lane_plan(
+    voice: ScoreVoice,
+    keys: Iterable[str],
+) -> tuple[dict[int, dict[int, int]], set[int], int, list[dict[str, Any]]]:
+    """Build minimal pitch-to-lane assignments for one source voice.
+
+    A plan is made per tie-connected component containing an unsafe chord (or
+    a partial chord tie).  Lane numbers are local slots: slot zero is the
+    original voice, and the remaining slots are reusable supplemental voices.
+    This keeps ordinary melodic events in the base voice and prevents one
+    isolated chord from turning every pitch in a long part into its own lane.
+    """
+
+    unsafe_records = _chord_split_records([voice], keys)
+    unsafe_indices = {int(record["event_index"]) for record in unsafe_records}
+    if not unsafe_indices:
+        return {}, set(), 0, unsafe_records
+    seed_indices = unsafe_indices | _partial_tie_indices(voice)
+
+    events = voice.events
+    tie_sets = [_event_tie_sets(event) for event in events]
+    edges: dict[int, set[int]] = {index: set() for index in range(len(events))}
+    for index in range(len(events) - 1):
+        if tie_sets[index][1] & tie_sets[index + 1][0]:
+            edges[index].add(index + 1)
+            edges[index + 1].add(index)
+
+    components: list[set[int]] = []
+    unvisited = set(seed_indices)
+    while unvisited:
+        root = min(unvisited)
+        unvisited.remove(root)
+        component = {root}
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            for neighbor in edges[current]:
+                if neighbor in component:
+                    continue
+                component.add(neighbor)
+                unvisited.discard(neighbor)
+                stack.append(neighbor)
+        components.append(component)
+
+    assignments: dict[int, dict[int, int]] = {}
+    split_indices: set[int] = set()
+    component_lane_count: dict[int, int] = {}
+    for component in components:
+        max_size = max(len(_event_pitches(events[index])) for index in component)
+        lane_count = max(1, max_size)
+        component_lane_count.update({index: lane_count for index in component})
+        split_indices.update(component)
+        active: dict[int, int] = {}
+        for index in sorted(component):
+            pitches = sorted(_event_pitches(events[index]))
+            before, after = tie_sets[index]
+            assignment: dict[int, int] = {}
+            used: set[int] = set()
+            for pitch in pitches:
+                if pitch in before:
+                    if pitch not in active:
+                        raise JianpuSerializationError(
+                            f"cannot assign tied chord pitch {pitch} at tick {events[index].start_tick}"
+                        )
+                    assignment[pitch] = active[pitch]
+                    used.add(active[pitch])
+            for pitch in pitches:
+                if pitch in assignment:
+                    continue
+                slot = next((candidate for candidate in range(lane_count) if candidate not in used), None)
+                if slot is None:
+                    raise JianpuSerializationError(
+                        f"chord at tick {events[index].start_tick} needs more than {lane_count} lanes"
+                    )
+                assignment[pitch] = slot
+                used.add(slot)
+            assignments[index] = assignment
+            active = {pitch: assignment[pitch] for pitch in after if pitch in assignment}
+
+    for record in unsafe_records:
+        event_index = int(record["event_index"])
+        assignment = assignments.get(event_index, {})
+        record["lane_assignments"] = [
+            {"pitch": pitch, "lane": assignment[pitch]}
+            for pitch in sorted(assignment)
+        ]
+        record["component_lane_count"] = component_lane_count.get(event_index, 1)
+    maximum_lane_count = max(component_lane_count.values(), default=1)
+    return assignments, split_indices, maximum_lane_count, unsafe_records
 
 
 def _serialization_voices(
@@ -1029,28 +1138,36 @@ def _serialization_voices(
     result: list[ScoreVoice] = []
     normalized_keys = tuple(dict.fromkeys(normalize_key(key) for key in (keys or ())))
     for voice in voices:
-        unsafe_chords = _chord_split_records([voice], normalized_keys)
-        if unsafe_chords:
-            # A simple-chord token is the only place where jianpu-ly can
-            # silently change an individual pitch.  Split the complete voice
-            # into pitch lanes for that voice.  Every lane has the original
-            # event boundaries and carries only its selected pitch; other
-            # events become rests, so unrelated notes are never duplicated.
-            pitches = sorted({pitch for event in voice.events for pitch in _event_pitches(event)})
+        assignments, split_indices, lane_count, _unsafe_records = _chord_lane_plan(voice, normalized_keys)
+        if split_indices:
             label = voice.label or voice.voice_id
-            for pitch in pitches:
-                lane_events = []
-                for event in voice.events:
-                    event_pitches = list(_event_pitches(event))
-                    lane_events.append(
-                        _copy_event_for_pitches(event, [pitch] if pitch in event_pitches else [])
+            lane_events: list[list[ScoreNote]] = [[] for _ in range(lane_count)]
+            used_lanes: set[int] = set()
+            for index, event in enumerate(voice.events):
+                assignment = assignments.get(index)
+                if assignment is None:
+                    lane_events[0].append(event)
+                    for lane in range(1, lane_count):
+                        lane_events[lane].append(_copy_event_for_pitches(event, []))
+                    continue
+                by_lane: dict[int, list[int]] = {}
+                for pitch, lane in assignment.items():
+                    by_lane.setdefault(lane, []).append(pitch)
+                    used_lanes.add(lane)
+                for lane in range(lane_count):
+                    lane_events[lane].append(
+                        _copy_event_for_pitches(event, sorted(by_lane.get(lane, [])))
                     )
+            result.append(voice.model_copy(update={"events": lane_events[0]}))
+            for lane in range(1, lane_count):
+                if lane not in used_lanes:
+                    continue
                 result.append(
                     voice.model_copy(
                         update={
-                            "voice_id": f"{voice.voice_id}:chord-{pitch}",
-                            "label": f"{label} chord pitch {pitch}",
-                            "events": lane_events,
+                            "voice_id": f"{voice.voice_id}:chord-lane-{lane}",
+                            "label": f"{label} chord lane {lane}",
+                            "events": lane_events[lane],
                         }
                     )
                 )
@@ -1527,14 +1644,37 @@ def jianpu_serialization_diagnostics(score: Score) -> dict[str, Any]:
 
     spans = _fixed_measure_spans(score)
     contexts, _meter_header = _measure_contexts(score, spans)
-    records = _chord_split_records(score.voices, [context.key for context in contexts])
-    lane_count = sum(len(item["pitches"]) for item in records)
+    keys = [context.key for context in contexts]
+    records: list[dict[str, Any]] = []
+    per_voice: list[dict[str, Any]] = []
+    actual_added_lane_count = 0
+    for voice in score.voices:
+        assignments, _split_indices, _lane_count, voice_records = _chord_lane_plan(voice, keys)
+        used_lanes = {
+            lane
+            for assignment in assignments.values()
+            for lane in assignment.values()
+            if lane > 0
+        }
+        actual_added_lane_count += len(used_lanes)
+        records.extend(voice_records)
+        per_voice.append(
+            {
+                "voice_id": voice.voice_id,
+                "occurrence_count": len(voice_records),
+                "actual_added_lane_count": len(used_lanes),
+                "occurrences": voice_records,
+            }
+        )
     return {
         "schema_version": "1.0",
+        "occurrence_count": len(records),
+        "actual_added_lane_count": actual_added_lane_count,
         "chord_voice_split_count": len(records),
-        "chord_voice_split_lane_count": lane_count,
+        "chord_voice_split_lane_count": actual_added_lane_count,
         "chord_voice_splits": records,
-        "strategy": "one_next_part_per_pitch_for_non_leading_accidental_chords",
+        "voices": per_voice,
+        "strategy": "minimal_reusable_pitch_lanes_for_non_leading_accidental_chords",
     }
 
 

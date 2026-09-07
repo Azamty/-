@@ -161,7 +161,7 @@ def test_b_flat_minor_nonleading_accidental_chord_splits_without_pitch_or_timing
 
     diagnostics = jianpu_serialization_diagnostics(score)
     assert diagnostics["chord_voice_split_count"] == 1
-    assert diagnostics["chord_voice_split_lane_count"] == 3
+    assert diagnostics["chord_voice_split_lane_count"] == 2
     assert diagnostics["chord_voice_splits"][0]["reason"] == "non_leading_accidental_in_simple_chord"
     jianpu = score_to_jianpu(score)
     assert "6,,#1,3," not in jianpu
@@ -186,6 +186,140 @@ def test_b_flat_minor_nonleading_accidental_chord_splits_without_pitch_or_timing
     assert {46, 50, 53, 60} <= set(intervals)
     assert all(intervals[pitch] == [(0, 384)] for pitch in (46, 50, 53))
     assert intervals[60] == [(0, 1536)]
+
+
+@pytest.mark.skipif(
+    not render_module.JIANPU.is_file() or not render_module.LILYPOND.is_file(),
+    reason="pinned jianpu-ly or LilyPond is unavailable",
+)
+def test_unsafe_chord_lanes_reuse_while_base_keeps_melody(tmp_path: Path) -> None:
+    score = Score(
+        title="reusable chord lanes",
+        bpm=68,
+        key="Bbm",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=384,
+        voices=[
+            ScoreVoice(
+                voice_id="melody",
+                events=[
+                    ScoreNote(start_tick=0, duration_tick=48, midi=60),
+                    ScoreNote(start_tick=48, duration_tick=48, midi=46, chord_pitches=[46, 50, 53]),
+                    ScoreNote(start_tick=96, duration_tick=48, midi=62),
+                    ScoreNote(start_tick=144, duration_tick=48, midi=50, chord_pitches=[50, 54, 57]),
+                    ScoreNote(start_tick=192, duration_tick=192, midi=None),
+                ],
+            )
+        ],
+    )
+
+    diagnostics = jianpu_serialization_diagnostics(score)
+    assert diagnostics["occurrence_count"] == 2
+    assert diagnostics["actual_added_lane_count"] == 2
+    assert diagnostics["voices"][0]["actual_added_lane_count"] == 2
+    assert [item["lane_assignments"] for item in diagnostics["chord_voice_splits"]] == [
+        [
+            {"pitch": 46, "lane": 0},
+            {"pitch": 50, "lane": 1},
+            {"pitch": 53, "lane": 2},
+        ],
+        [
+            {"pitch": 50, "lane": 0},
+            {"pitch": 54, "lane": 1},
+            {"pitch": 57, "lane": 2},
+        ],
+    ]
+    assert score_to_jianpu(score).count("NextPart") == 2
+
+    artifacts = render_score(score, tmp_path, basename="reusable-chord-lanes")
+    midi = mido.MidiFile(artifacts.midi_path)
+    intervals: dict[int, list[tuple[int, int]]] = {}
+    for track in midi.tracks:
+        absolute = 0
+        active: dict[int, list[int]] = {}
+        for message in track:
+            absolute += message.time
+            if message.type == "note_on" and message.velocity:
+                active.setdefault(message.note, []).append(absolute)
+            elif message.type in {"note_off", "note_on"} and not message.velocity:
+                starts = active.get(message.note, [])
+                if starts:
+                    intervals.setdefault(message.note, []).append((starts.pop(0), absolute))
+
+    for values in intervals.values():
+        values.sort()
+    assert intervals[60] == [(0, 384)]
+    assert intervals[62] == [(768, 1152)]
+    assert intervals[46] == [(384, 768)]
+    assert intervals[50] == [(384, 768), (1152, 1536)]
+    assert intervals[53] == [(384, 768)]
+    assert intervals[54] == [(1152, 1536)]
+    assert intervals[57] == [(1152, 1536)]
+
+
+@pytest.mark.skipif(
+    not render_module.JIANPU.is_file() or not render_module.LILYPOND.is_file(),
+    reason="pinned jianpu-ly or LilyPond is unavailable",
+)
+def test_unsafe_chord_tie_chain_stays_on_the_same_reusable_lanes(tmp_path: Path) -> None:
+    score = Score(
+        title="tied unsafe chord",
+        bpm=80,
+        key="Bbm",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=192,
+        voices=[
+            ScoreVoice(
+                voice_id="tied-chord",
+                events=[
+                    ScoreNote(start_tick=0, duration_tick=48, midi=60),
+                    ScoreNote(
+                        start_tick=48,
+                        duration_tick=48,
+                        midi=46,
+                        chord_pitches=[46, 50, 53],
+                        tie_types=["start", "start", "start"],
+                    ),
+                    ScoreNote(
+                        start_tick=96,
+                        duration_tick=48,
+                        midi=46,
+                        chord_pitches=[46, 50, 53],
+                        tie_types=["stop", "stop", "stop"],
+                    ),
+                    ScoreNote(start_tick=144, duration_tick=48, midi=None),
+                ],
+            )
+        ],
+    )
+
+    diagnostics = jianpu_serialization_diagnostics(score)
+    assert diagnostics["actual_added_lane_count"] == 2
+    assignments = [item["lane_assignments"] for item in diagnostics["chord_voice_splits"]]
+    assert assignments[0] == assignments[1]
+    jianpu = score_to_jianpu(score)
+    assert jianpu.count("~") == 3
+
+    artifacts = render_score(score, tmp_path, basename="tied-unsafe-chord")
+    midi = mido.MidiFile(artifacts.midi_path)
+    intervals: dict[int, list[tuple[int, int]]] = {}
+    for track in midi.tracks:
+        absolute = 0
+        active: dict[int, list[int]] = {}
+        for message in track:
+            absolute += message.time
+            if message.type == "note_on" and message.velocity:
+                active.setdefault(message.note, []).append(absolute)
+            elif message.type in {"note_off", "note_on"} and not message.velocity:
+                starts = active.get(message.note, [])
+                if starts:
+                    intervals.setdefault(message.note, []).append((starts.pop(0), absolute))
+
+    for values in intervals.values():
+        values.sort()
+    assert all(intervals[pitch] == [(384, 1152)] for pitch in (46, 50, 53))
 
 
 def test_explicit_tuplet_ratio_is_required_to_be_three_over_two() -> None:
