@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 from typing import Any, Iterable
 
 
@@ -26,6 +27,10 @@ MUSESCORE_RELEASE_URL = (
     "MuseScore-Studio-4.7.4.260706075-x86_64.msi"
 )
 MUSESCORE_RELEASE_SHA256 = "64FE70E5CB9FFE159D047D1E88DB567BD101F60D36B0DE28FEB674716929A378"
+# MuseScore Studio shares per-user crashpad state between headless invocations.
+# The importer and the capability probe use this same process-wide lock so no
+# MuseScore CLI entry point can overlap another one in this worker process.
+MUSESCORE_CLI_LOCK = threading.Lock()
 
 
 def _env_python(name: str) -> Path:
@@ -118,18 +123,19 @@ def _command_probe(path: Path | None, *, label: str, expected_version: str | Non
     details: dict[str, Any] = {"path": os.fspath(path) if path else None, "version": None}
     if path is None or not path.is_file():
         return False, f"{label} executable is missing", details
-    try:
-        result = subprocess.run(
-            [os.fspath(path), "--version"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"{label} version probe failed: {exc}", details
+    with MUSESCORE_CLI_LOCK:
+        try:
+            result = subprocess.run(
+                [os.fspath(path), "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"{label} version probe failed: {exc}", details
     output = "\n".join(filter(None, (result.stdout, result.stderr))).strip()
     details["version_output"] = output[:500]
     if result.returncode:

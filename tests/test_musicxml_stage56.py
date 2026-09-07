@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -23,6 +25,7 @@ from backend.jianpu_score.musicxml_standardize import (
     write_standardized_score,
 )
 from backend.jianpu_score.musescore_import import MuseScoreImportError, convert_performance_midi
+import backend.jianpu_score.musescore_import as musescore_import
 from backend.jianpu_score.high_accuracy import resolve_musescore, resolve_notation_python
 
 
@@ -441,6 +444,72 @@ def test_musescore_adapter_reports_missing_pinned_executable_without_fallback(tm
             tmp_path / "output.musicxml",
             musescore_path=tmp_path / "missing-MuseScore4.exe",
         )
+
+
+def test_musescore_cli_calls_are_serialized_within_one_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    executable = tmp_path / "MuseScore4.exe"
+    profile = tmp_path / "profile.xml"
+    source_a = tmp_path / "a.mid"
+    source_b = tmp_path / "b.mid"
+    executable.write_bytes(b"stub")
+    profile.write_text("<MidiOptions />", encoding="utf-8")
+    source_a.write_bytes(b"MThd")
+    source_b.write_bytes(b"MThd")
+    xml = (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<score-partwise version='3.1'><part-list></part-list><part id='P1'>"
+        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
+        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
+        "</part></score-partwise>"
+    )
+    active = 0
+    maximum_active = 0
+    state_lock = threading.Lock()
+    intervals: list[tuple[int, int]] = []
+
+    def fake_run(command, **_kwargs):
+        nonlocal active, maximum_active
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            started = active
+        assert musescore_import.MUSESCORE_CLI_LOCK.locked()
+        try:
+            destination = Path(command[command.index("-o") + 1])
+            destination.write_text(xml, encoding="utf-8")
+        finally:
+            with state_lock:
+                active -= 1
+                intervals.append((started, active))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(musescore_import.subprocess, "run", fake_run)
+    barrier = threading.Barrier(2)
+
+    def convert(source: Path, destination: Path) -> object:
+        barrier.wait(timeout=2)
+        return convert_performance_midi(
+            source,
+            destination,
+            instrument_id=source.stem,
+            musescore_path=executable,
+            profile_path=profile,
+            overwrite=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(convert, source_a, tmp_path / "a.musicxml"),
+            pool.submit(convert, source_b, tmp_path / "b.musicxml"),
+        ]
+        artifacts = [future.result(timeout=5) for future in futures]
+
+    assert len(artifacts) == 2
+    assert maximum_active == 1
+    assert len(intervals) == 2
+    assert intervals == [(1, 0), (1, 0)]
 
 
 def test_drum_performance_is_explicitly_midi_only(tmp_path: Path) -> None:

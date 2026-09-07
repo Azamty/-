@@ -10,7 +10,7 @@ import subprocess
 from typing import Mapping
 import xml.etree.ElementTree as ET
 
-from .high_accuracy import MUSESCORE_VERSION, ROOT, resolve_musescore
+from .high_accuracy import MUSESCORE_CLI_LOCK, MUSESCORE_VERSION, ROOT, resolve_musescore
 
 
 DEFAULT_PROFILE = ROOT / "tools" / "musescore-4.7.4" / "midi_import_options.xml"
@@ -72,23 +72,24 @@ def convert_performance_midi(
         os.fspath(destination),
         os.fspath(source),
     )
-    try:
-        completed = subprocess.run(
-            list(command),
-            cwd=destination.parent,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_sec,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise MuseScoreImportError(
-            f"MuseScore {MUSESCORE_VERSION} timed out after {timeout_sec}s for {source.name}"
-        ) from exc
-    except OSError as exc:
-        raise MuseScoreImportError(f"MuseScore could not start: {exc}") from exc
+    with MUSESCORE_CLI_LOCK:
+        try:
+            completed = subprocess.run(
+                list(command),
+                cwd=destination.parent,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise MuseScoreImportError(
+                f"MuseScore {MUSESCORE_VERSION} timed out after {timeout_sec}s for {source.name}"
+            ) from exc
+        except OSError as exc:
+            raise MuseScoreImportError(f"MuseScore could not start: {exc}") from exc
     if completed.returncode:
         detail = (completed.stderr or completed.stdout).strip()
         raise MuseScoreImportError(
