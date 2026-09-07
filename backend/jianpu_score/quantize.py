@@ -612,13 +612,24 @@ def _format_duration(
     if duration_tick <= 0:
         return []
     if dots:
-        matching = [
-            tokens
-            for ticks, tokens in _duration_options(quarter_ticks, note)
-            if ticks == duration_tick and any(token.endswith("." * dots) for token in tokens)
-        ]
-        if matching:
-            return list(matching[0])
+        if dots > 3:
+            raise JianpuSerializationError(f"jianpu-ly supports at most three dots, got {dots}")
+        prefixes = {4: "", 8: "q", 16: "s", 32: "d", 64: "h"}
+        for denominator in (1, 2, 4, 8, 16, 32, 64):
+            base = Fraction(quarter_ticks * 4, denominator)
+            duration = base * Fraction(2 ** (dots + 1) - 1, 2**dots)
+            if duration.denominator != 1 or int(duration) != duration_tick:
+                continue
+            if denominator <= 2:
+                if duration_tick % quarter_ticks:
+                    continue
+                dash_count = duration_tick // quarter_ticks - 1
+                return [note, *("-" for _ in range(dash_count))]
+            return [f"{prefixes[denominator]}{note}{'.' * dots}"]
+        raise JianpuSerializationError(
+            f"explicit dots={dots} do not match duration {duration_tick} ticks "
+            f"with quarter_ticks={quarter_ticks}"
+        )
     options = _duration_options(quarter_ticks, note)
     groups: list[list[str]] = []
     remaining = duration_tick
@@ -679,6 +690,112 @@ def _event_tie_sets(event: ScoreNote) -> tuple[frozenset[int], frozenset[int]]:
     if event.tie == "continue":
         return frozenset(pitches), frozenset(pitches)
     return frozenset(), frozenset()
+
+
+def _event_tie_map(event: ScoreNote) -> dict[int, str | None]:
+    """Return tie metadata keyed by MIDI pitch without losing None slots."""
+
+    pitches = _event_pitches(event)
+    if not pitches:
+        return {}
+    if event.tie_types:
+        if len(event.tie_types) != len(pitches):
+            raise JianpuSerializationError(
+                f"tie_types length {len(event.tie_types)} does not match {len(pitches)} pitches at {event.start_tick}"
+            )
+        return dict(zip(pitches, event.tie_types))
+    return {pitch: event.tie for pitch in pitches}
+
+
+def _partial_tie_pitches(voice: ScoreVoice) -> set[int]:
+    """Find chord pitches whose tie cannot be represented by one chord tie."""
+
+    special: set[int] = set()
+    for event in voice.events:
+        pitches = _event_pitches(event)
+        if len(pitches) <= 1:
+            continue
+        before, after = _event_tie_sets(event)
+        all_pitches = frozenset(pitches)
+        if before and before != all_pitches:
+            special.update(before)
+        if after and after != all_pitches:
+            special.update(after)
+    return special
+
+
+def _copy_event_for_pitches(event: ScoreNote, selected: list[int]) -> ScoreNote:
+    """Make a lane event while retaining the original timeline and notation."""
+
+    if not selected:
+        return event.model_copy(
+            update={
+                "midi": None,
+                "chord_pitches": [],
+                "tie": None,
+                "tie_types": [],
+            }
+        )
+    tie_map = _event_tie_map(event)
+    tie_types = [tie_map.get(pitch) for pitch in selected]
+    present = [value for value in tie_types if value is not None]
+    tie = present[0] if len(present) == len(tie_types) and present and all(value == present[0] for value in present) else None
+    return event.model_copy(
+        update={
+            "midi": min(selected),
+            "chord_pitches": list(selected),
+            "tie": tie,
+            "tie_types": tie_types,
+        }
+    )
+
+
+def _serialization_voices(voices: list[ScoreVoice]) -> list[ScoreVoice]:
+    """Split partial chord ties into safe jianpu-ly parts.
+
+    jianpu-ly's ``~`` applies to every note in a chord.  A MusicXML chord
+    whose tie applies to only some pitches therefore needs independent parts
+    for those pitches; emitting one chord-level tie would incorrectly tie the
+    untied notes as well.
+    """
+
+    result: list[ScoreVoice] = []
+    for voice in voices:
+        special = sorted(_partial_tie_pitches(voice))
+        if not special:
+            result.append(voice)
+            continue
+        base_events: list[ScoreNote] = []
+        for event in voice.events:
+            pitches = list(_event_pitches(event))
+            base_events.append(_copy_event_for_pitches(event, [pitch for pitch in pitches if pitch not in special]))
+        base_has_notes = any(event.midi is not None for event in base_events)
+        label = voice.label or voice.voice_id
+        if base_has_notes:
+            result.append(
+                voice.model_copy(
+                    update={
+                        "voice_id": f"{voice.voice_id}:untied",
+                        "label": f"{label} untied pitches",
+                        "events": base_events,
+                    }
+                )
+            )
+        for pitch in special:
+            lane_events = []
+            for event in voice.events:
+                pitches = list(_event_pitches(event))
+                lane_events.append(_copy_event_for_pitches(event, [pitch] if pitch in pitches else []))
+            result.append(
+                voice.model_copy(
+                    update={
+                        "voice_id": f"{voice.voice_id}:tie-{pitch}",
+                        "label": f"{label} tie pitch {pitch}",
+                        "events": lane_events,
+                    }
+                )
+            )
+    return result
 
 
 def _validate_explicit_ties(voice: ScoreVoice) -> None:
@@ -932,9 +1049,10 @@ def score_to_jianpu(score: Score) -> str:
         normalize_time_signature(score.time_signature),
         "",
     ]
-    voice_bars = [_slice_voice_events(voice, spans) for voice in score.voices]
-    for voice_index, (voice, bars) in enumerate(zip(score.voices, voice_bars)):
-        if len(score.voices) > 1:
+    serialization_voices = _serialization_voices(score.voices)
+    voice_bars = [_slice_voice_events(voice, spans) for voice in serialization_voices]
+    for voice_index, (voice, bars) in enumerate(zip(serialization_voices, voice_bars)):
+        if len(serialization_voices) > 1:
             label = sanitize_title(voice.label or voice.voice_id).replace("=", " ")
             lines.append(f"instrument={label}")
             if voice_index:
@@ -947,6 +1065,6 @@ def score_to_jianpu(score: Score) -> str:
         for span, slices in zip(spans, bars):
             output.extend(_serialize_measure(slices, span, key, score.quarter_ticks))
         lines.append(" ".join(output))
-        if voice_index + 1 < len(score.voices):
+        if voice_index + 1 < len(serialization_voices):
             lines.append("NextPart")
     return "\n".join(lines) + "\n"

@@ -9,20 +9,33 @@ uniform quantizer.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import math
 import os
-from pathlib import Path
 import subprocess
 import tempfile
-from typing import Any, Iterable, Literal, Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .domain import Score, ScoreNote, ScoreVoice, TempoEvent, normalize_key, normalize_time_signature, sanitize_title
-from .high_accuracy import MUSIC21_VERSION, MUSESCORE_VERSION, ROOT, resolve_notation_python
-
+from .domain import (
+    Score,
+    ScoreNote,
+    ScoreVoice,
+    TempoEvent,
+    normalize_key,
+    normalize_time_signature,
+    sanitize_title,
+)
+from .high_accuracy import (
+    MUSESCORE_VERSION,
+    MUSIC21_VERSION,
+    ROOT,
+    resolve_notation_python,
+)
 
 WORKER_SCHEMA_VERSION = "1.0"
 SCORE_QUARTER_TICKS = 48
@@ -43,7 +56,7 @@ class WorkerEvent(BaseModel):
     duration_quarter: float = Field(ge=0)
     pitches: list[int] = Field(default_factory=list)
     tie: str | None = None
-    tie_types: list[str] = Field(default_factory=list)
+    tie_types: list[str | None] = Field(default_factory=list)
     tuplet_actual: int | None = Field(default=None, gt=0)
     tuplet_normal: int | None = Field(default=None, gt=0)
     dots: int = Field(default=0, ge=0)
@@ -155,7 +168,7 @@ class _RawEvent:
     pitches: list[int]
     kind: str
     tie: str | None
-    tie_types: list[str]
+    tie_types: list[str | None]
     tuplet_actual: int | None
     tuplet_normal: int | None
     dots: int
@@ -298,8 +311,8 @@ def _source_notes(performance_metadata: Mapping[str, Any] | None) -> list[dict[s
                 "midi": midi,
                 "start_tick_480": start_480,
                 "end_tick_480": end_480,
-                "start_tick": int(round(start_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS)),
-                "end_tick": int(round(end_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS)),
+                "start_tick": round(start_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS),
+                "end_tick": round(end_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS),
                 "voice_id": value.get("voice_id"),
             }
         )
@@ -601,7 +614,9 @@ def _score_voice_events(
                 staff=staff,
                 source_voice=event.voice,
                 tie=event.tie,
-                tie_types=[value for value in event.tie_types if value],
+                # Keep one tie slot per chord pitch.  None means that pitch
+                # has no tie and is deliberately not removed or re-indexed.
+                tie_types=list(event.tie_types),
                 tuplet_actual=event.tuplet_actual,
                 tuplet_normal=event.tuplet_normal,
                 dots=event.dots,

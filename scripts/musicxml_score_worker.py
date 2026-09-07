@@ -10,11 +10,11 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
-from pathlib import Path
+import math
 import re
 import sys
+from pathlib import Path
 from typing import Any
-
 
 EXPECTED_MUSIC21 = "9.9.2"
 SCHEMA_VERSION = "1.0"
@@ -25,31 +25,50 @@ def _number(value: Any, default: float = 0.0) -> float:
         result = float(value)
     except (TypeError, ValueError):
         return default
-    return result if result == result and abs(result) != float("inf") else default
+    return result if math.isfinite(result) else default
 
 
 def _offset_in_hierarchy(element: Any, parent: Any) -> float:
     try:
         return _number(element.getOffsetInHierarchy(parent))
-    except Exception:
+    except Exception:  # noqa: BLE001 - music21 adapters may raise library-specific exceptions
         return _number(element.offset)
 
 
 def _context(element: Any, class_name: str) -> Any | None:
     try:
         return element.getContextByClass(class_name)
-    except Exception:
+    except Exception:  # noqa: BLE001 - music21 adapters may raise library-specific exceptions
         return None
 
 
 def _pitch_midi(pitch: Any) -> int:
-    return max(0, min(127, int(round(float(pitch.midi)))))
+    return max(0, min(127, round(float(pitch.midi))))
 
 
 def _tie_type(value: Any) -> str | None:
     tie = getattr(value, "tie", None)
     kind = getattr(tie, "type", None)
     return str(kind) if kind in {"start", "stop", "continue"} else None
+
+
+def _ordered_pitch_ties(values: Any) -> tuple[list[int], list[str | None]]:
+    """Sort chord pitches while keeping each pitch's tie slot attached."""
+
+    pitch_ties: dict[int, str | None] = {}
+    for value in values:
+        pitch = _pitch_midi(value.pitch)
+        tie = _tie_type(value)
+        if pitch in pitch_ties:
+            previous = pitch_ties[pitch]
+            if previous is not None and tie is not None and previous != tie:
+                raise ValueError(f"duplicate chord pitch {pitch} has conflicting tie types")
+            if previous is None:
+                pitch_ties[pitch] = tie
+        else:
+            pitch_ties[pitch] = tie
+    pitches = sorted(pitch_ties)
+    return pitches, [pitch_ties[pitch] for pitch in pitches]
 
 
 def _duration_details(element: Any) -> dict[str, Any]:
@@ -91,12 +110,16 @@ def _event_record(element: Any, *, part: Any, part_index: int, event_index: int)
         tie_types: list[str] = []
     elif isinstance(element, chord.Chord):
         kind = "chord"
-        pitches = sorted({_pitch_midi(value) for value in element.pitches})
-        tie_types = [_tie_type(value) or "" for value in element.notes]
+        # Sort pitch and tie together.  A chord tie is attached to each
+        # music21 note, so filtering empty ties after sorting would shift a
+        # C-only tie onto the E or G slot.  Duplicate MIDI pitches are
+        # collapsed only after their tie metadata has been reconciled.
+        pitches, tie_types = _ordered_pitch_ties(element.notes)
     elif isinstance(element, note.Note):
         kind = "note"
         pitches = [_pitch_midi(element.pitch)]
-        tie_types = [_tie_type(element) or ""]
+        note_tie = _tie_type(element)
+        tie_types = [] if note_tie is None else [note_tie]
     else:
         return None
 
@@ -110,8 +133,8 @@ def _event_record(element: Any, *, part: Any, part_index: int, event_index: int)
     except (TypeError, ValueError):
         staff_number = 1
     measure_number = getattr(measure, "number", None)
-    normalized_ties = [value for value in tie_types if value]
-    tie = normalized_ties[0] if normalized_ties and all(value == normalized_ties[0] for value in normalized_ties) else None
+    present_ties = [value for value in tie_types if value is not None]
+    tie = present_ties[0] if present_ties and len(present_ties) == len(tie_types) and all(value == present_ties[0] for value in present_ties) else None
     return {
         "event_id": f"p{part_index}:e{event_index}",
         "kind": kind,
@@ -119,7 +142,7 @@ def _event_record(element: Any, *, part: Any, part_index: int, event_index: int)
         **details,
         "pitches": pitches,
         "tie": tie,
-        "tie_types": normalized_ties,
+        "tie_types": tie_types,
         "voice": voice_id,
         "staff": staff_number,
         "measure_number": int(measure_number) if isinstance(measure_number, int) else None,
@@ -195,7 +218,7 @@ def _key_signature_records(score: Any) -> list[dict[str, Any]]:
         try:
             as_key = item.asKey()
             name = str(as_key.tonic.name) + ("m" if as_key.mode == "minor" else "")
-        except Exception:
+        except Exception:  # noqa: BLE001 - malformed key objects remain diagnosable as text
             name = str(item)
         result.append(
             {
@@ -301,6 +324,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - CLI must report any worker failure as JSON-process failure
         print(f"musicxml-worker-failed: {exc}", file=sys.stderr)
         raise SystemExit(1)

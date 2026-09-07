@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import math
 import re
+from itertools import pairwise
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
 
 MAJOR_KEYS = frozenset({"C", "C#", "Db", "D", "Eb", "E", "F", "F#", "Gb", "G", "Ab", "A", "Bb", "B"})
 MINOR_KEYS = frozenset(f"{root}m" for root in MAJOR_KEYS)
@@ -37,7 +37,7 @@ def normalize_key(value: str) -> str:
     """Return a jianpu-safe key from the explicit supported whitelist."""
 
     if not isinstance(value, str):
-        raise ValueError("key must be a string")
+        raise ValueError("key must be a string")  # noqa: TRY004 - preserve public validation error type
     text = value.strip()
     match = _KEY_PATTERN.fullmatch(text)
     if not match:
@@ -61,7 +61,7 @@ def relative_major_key(value: str) -> str:
 
 def normalize_time_signature(value: str) -> str:
     if not isinstance(value, str):
-        raise ValueError("time_signature must be a string")
+        raise ValueError("time_signature must be a string")  # noqa: TRY004 - preserve public validation error type
     text = value.strip()
     if text not in VALID_TIME_SIGNATURES:
         raise ValueError(f"unsupported time signature: {value!r}; choose one of {sorted(VALID_TIME_SIGNATURES)}")
@@ -101,7 +101,7 @@ class NoteEvent(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def validate_interval(self) -> "NoteEvent":
+    def validate_interval(self) -> NoteEvent:
         if self.end_sec <= self.start_sec:
             raise ValueError("end_sec must be greater than start_sec")
         return self
@@ -141,7 +141,7 @@ class MusicAnalysis(BaseModel):
     def validate_beat_times(cls, value: list[float]) -> list[float]:
         if any(not math.isfinite(beat) for beat in value):
             raise ValueError("beat_times must contain only finite values")
-        if any(right <= left for left, right in zip(value, value[1:])):
+        if any(right <= left for left, right in pairwise(value)):
             raise ValueError("beat_times must be strictly increasing")
         return value
 
@@ -176,7 +176,9 @@ class ScoreNote(BaseModel):
     staff: int | None = Field(default=None, ge=1)
     source_voice: str | None = None
     tie: str | None = None
-    tie_types: list[str] = Field(default_factory=list)
+    # One entry per chord pitch when notation supplies per-pitch ties.  None
+    # is an intentional placeholder and must not be filtered or re-indexed.
+    tie_types: list[str | None] = Field(default_factory=list)
     tuplet_actual: int | None = Field(default=None, gt=0)
     tuplet_normal: int | None = Field(default=None, gt=0)
     dots: int = Field(default=0, ge=0)
@@ -211,8 +213,8 @@ class ScoreNote(BaseModel):
 
     @field_validator("tie_types")
     @classmethod
-    def validate_tie_types(cls, value: list[str]) -> list[str]:
-        if any(item not in {"start", "stop", "continue"} for item in value):
+    def validate_tie_types(cls, value: list[str | None]) -> list[str | None]:
+        if any(item is not None and item not in {"start", "stop", "continue"} for item in value):
             raise ValueError("tie_types must contain start, stop, or continue")
         return value
 
@@ -264,7 +266,7 @@ class Score(BaseModel):
         return normalize_time_signature(value)
 
     @model_validator(mode="after")
-    def validate_voice_timelines(self) -> "Score":
+    def validate_voice_timelines(self) -> Score:
         for voice in self.voices:
             cursor = 0
             for event in voice.events:
