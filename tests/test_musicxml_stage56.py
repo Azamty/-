@@ -19,6 +19,7 @@ from backend.jianpu_score.musicxml_standardize import (
     WorkerPickup,
     WorkerTempo,
     WorkerTimeSignature,
+    _normalize_worker_key,
     _key_sharps,
     standardize_musicxml_payload,
     standardize_musicxml,
@@ -257,6 +258,47 @@ def test_key_signature_uses_midi_emitted_enharmonic_key_without_changing_display
     assert _key_sharps("F#m") == 3
     assert _key_sharps("Cm") == -3
     assert _key_sharps("Am") == 0
+
+
+@pytest.mark.parametrize(
+    ("worker_key", "expected"),
+    [
+        ("D-", "Db"),
+        ("A-", "Ab"),
+        ("E-", "Eb"),
+        ("B-", "Bb"),
+        ("G-", "Gb"),
+        ("D- major", "Db"),
+        ("b- minor", "Bbm"),
+        ("F# minor", "F#m"),
+        ("a major", "A"),
+        ("Bbm", "Bbm"),
+    ],
+)
+def test_normalize_worker_key_accepts_music21_flat_and_mode_aliases(worker_key: str, expected: str) -> None:
+    assert _normalize_worker_key(worker_key) == expected
+
+
+@pytest.mark.parametrize("worker_key", ["C-", "F-", "D--", "D- mystery", "D-flat"])
+def test_normalize_worker_key_does_not_widen_unsupported_or_malformed_keys(worker_key: str) -> None:
+    with pytest.raises(MusicXMLStandardizationError, match="unsupported MusicXML key signature"):
+        _normalize_worker_key(worker_key)
+
+
+def test_music21_flat_key_is_reconciled_to_source_bbm_and_keeps_negative_fifths() -> None:
+    payload = _manual_payload()
+    payload.key_signature_events = [WorkerKeySignature(offset_quarter=0, key="D-", sharps=-5)]
+    score, report = standardize_musicxml_payload(
+        payload,
+        performance_metadata={"key": "Bbm", "time_signature": "4/4"},
+    )
+
+    assert score.key == "Bbm"
+    assert score.metadata["key_signature_events"][0] == {"start_tick": 0, "key": "Bbm", "sharps": -5}
+    reconciliation = next(item for item in report["conductor_reconciliation"] if item["field"] == "key")
+    assert reconciliation["musicxml_value"] == "D-"
+    assert reconciliation["production_value"] == "Bbm"
+    assert reconciliation["final_value"] == "Bbm"
 
 
 def test_production_emitted_key_only_controls_signature_number() -> None:

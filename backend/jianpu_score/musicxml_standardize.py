@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 import tempfile
 from collections.abc import Iterable, Mapping
@@ -265,13 +266,29 @@ def _quarter_to_tick(value: float, *, context: str = "MusicXML quarter value") -
     return int(rounded)
 
 
+_WORKER_KEY_PATTERN = re.compile(
+    r"^\s*([A-Ga-g])\s*(?:(#|b|-))?\s*(?:(major|minor|maj|min|m))?\s*$",
+    re.IGNORECASE,
+)
+
+
 def _normalize_worker_key(value: str) -> str:
+    """Normalize music21's strict key spellings into the domain whitelist.
+
+    music21 may serialize a flat as ``D-`` (and, for example, ``b- minor``)
+    instead of the ``Db`` spelling accepted by the application.  Parse only
+    the complete key grammar here: replacing arbitrary hyphens would turn an
+    invalid key into a plausible one and would accidentally widen the domain.
+    """
+
     text = str(value).strip()
-    lowered = text.lower()
-    if lowered.endswith(" minor"):
-        text = text[:-6].strip() + "m"
-    elif lowered.endswith(" major"):
-        text = text[:-6].strip()
+    match = _WORKER_KEY_PATTERN.fullmatch(text)
+    if match is None:
+        raise MusicXMLStandardizationError(f"unsupported MusicXML key signature: {value!r}")
+    root, accidental, mode = match.groups()
+    accidental = "b" if accidental == "-" else (accidental or "")
+    suffix = "m" if mode and mode.casefold() in {"m", "min", "minor"} else ""
+    text = f"{root.upper()}{accidental}{suffix}"
     try:
         return normalize_key(text)
     except ValueError as exc:
