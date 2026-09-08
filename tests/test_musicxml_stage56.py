@@ -332,19 +332,73 @@ def test_score_normalizer_rejoins_cross_voice_tuplet_fragment_without_moving_tim
                 offset_quarter=1 / 6,
                 duration_quarter=1 / 12,
                 pitches=[62],
+                tie="start",
+                tie_types=["start"],
                 tuplet_actual=3,
                 tuplet_normal=2,
                 tuplet_type="stop",
                 voice="2",
             ),
-            WorkerEvent(event_id="cross-tail", kind="rest", offset_quarter=1 / 4, duration_quarter=3.75, voice="2"),
+            WorkerEvent(
+                event_id="cross-successor",
+                kind="note",
+                offset_quarter=1 / 4,
+                duration_quarter=1 / 4,
+                pitches=[62],
+                tie="stop",
+                tie_types=["stop"],
+                voice="2",
+            ),
+            WorkerEvent(event_id="cross-tail", kind="rest", offset_quarter=0.5, duration_quarter=3.5, voice="2"),
+            # An unrelated complete same-voice group must not be mistaken for
+            # the stop belonging to cross-start merely because it shares the
+            # part/staff/ratio context.
+            WorkerEvent(
+                event_id="later-start",
+                kind="note",
+                offset_quarter=1,
+                duration_quarter=1 / 6,
+                pitches=[64],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="start",
+                voice="1",
+            ),
+            WorkerEvent(
+                event_id="later-middle",
+                kind="note",
+                offset_quarter=7 / 6,
+                duration_quarter=1 / 6,
+                pitches=[65],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                voice="1",
+            ),
+            WorkerEvent(
+                event_id="later-stop",
+                kind="note",
+                offset_quarter=4 / 3,
+                duration_quarter=1 / 6,
+                pitches=[67],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="stop",
+                voice="1",
+            ),
         ]
     )
 
     score, report = standardize_musicxml_payload(payload)
 
     notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
-    assert [(event.midi, event.start_tick, event.end_tick) for event in notes] == [(60, 0, 8), (62, 8, 12)]
+    assert [(event.midi, event.start_tick, event.end_tick) for event in notes] == [
+        (60, 0, 8),
+        (62, 8, 12),
+        (62, 12, 24),
+        (64, 48, 56),
+        (65, 56, 64),
+        (67, 64, 72),
+    ]
     assert len({event.voice_id for event in notes}) == 1
     repair = report["tuplet_marker_repairs"][0]
     assert repair["reason"] == "cross_voice_tuplet_marker_reassigned"
@@ -1127,6 +1181,46 @@ def test_production_conductor_metadata_backfills_initial_values_only() -> None:
     ]
     assert score.bpm == pytest.approx(96)
     assert any(item["field"] == "key" for item in report["conductor_reconciliation"])
+
+
+def test_production_meter_hint_preserves_imported_timeline_when_it_conflicts() -> None:
+    payload = _tuplet_marker_payload(
+        [WorkerEvent(event_id="rest", kind="rest", offset_quarter=0, duration_quarter=3, voice="1")]
+    )
+    payload.highest_time_quarter = 3
+    payload.parts[0].highest_time_quarter = 3
+    payload.parts[0].measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=3,
+            end_quarter=3,
+            time_signature="3/4",
+        )
+    ]
+    payload.measures = list(payload.parts[0].measures)
+    payload.time_signature_events = [WorkerTimeSignature(offset_quarter=0, ratio="3/4", numerator=3, denominator=4)]
+
+    score, report = standardize_musicxml_payload(
+        payload,
+        performance_metadata={"time_signature": "4/4"},
+    )
+
+    assert score.time_signature == "3/4"
+    assert score.metadata["time_signature_events"] == [{
+        "start_tick": 0,
+        "time_signature": "3/4",
+        "numerator": 3,
+        "denominator": 4,
+    }]
+    assert any(
+        item["reason"] == "production_metadata_preserved_imported_timeline_meter"
+        and item["production_value"] == "4/4"
+        and item["final_value"] == "3/4"
+        for item in report["conductor_reconciliation"]
+    )
+    assert score_to_jianpu(score)
 
 
 def test_musescore_adapter_reports_missing_pinned_executable_without_fallback(tmp_path: Path) -> None:

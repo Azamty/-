@@ -450,6 +450,11 @@ def _worker_raw_events(payload: WorkerPayload) -> tuple[list[_RawEvent], list[di
             )
     diagnostics.extend(_normalize_tied_event_voices(events))
     diagnostics.extend(_normalize_orphan_tuplet_markers(events))
+    # A cross-voice tuplet repair can move a fragment that starts a tie.  Run
+    # the same conservative tie-chain pass once more so its unique successor
+    # follows the repaired fragment; otherwise the serializer would report a
+    # dangling tie even though the original import was unambiguous.
+    diagnostics.extend(_normalize_tied_event_voices(events))
     return events, diagnostics
 
 
@@ -802,9 +807,19 @@ def _normalize_orphan_tuplet_markers(events: list[_RawEvent]) -> list[dict[str, 
                 ),
                 key=lambda event: (event.start_tick, event.end_tick, event.event_id),
             )
-            # A same-voice stop is authoritative even if the span is malformed;
-            # do not turn a genuine gap or ratio error into a repair.
-            if same_voice_stops:
+            # A later stop may belong to a different tuplet group with the
+            # same part/staff/voice.  Treat it as authoritative only when it
+            # forms a complete same-voice span; otherwise a directly adjacent
+            # cross-voice stop can still prove that the import split one legal
+            # group during an unrelated tie voice repair.  A malformed
+            # same-voice group with no such cross-voice evidence remains
+            # untouched and will still fail serializer validation.
+            same_voice_components = [
+                stop
+                for stop in same_voice_stops
+                if _raw_tuplet_span(events, start, stop, allow_cross_voice=False) is not None
+            ]
+            if same_voice_components:
                 continue
             cross_voice_stops = sorted(
                 (
@@ -2038,26 +2053,58 @@ def _reconcile_conductor_metadata(
         ratio, numerator, denominator = source_time
         xml_initial = next((item for item in time_events if abs(float(item["offset_quarter"])) <= 1e-9), None)
         if xml_initial is None or xml_initial["ratio"] != ratio:
-            if xml_initial is not None:
-                time_events = [item for item in time_events if abs(float(item["offset_quarter"])) > 1e-9]
-            time_events.append(
-                {
-                    "offset_quarter": 0.0,
-                    "ratio": ratio,
-                    "numerator": numerator,
-                    "denominator": denominator,
-                }
+            timeline_initial = next(
+                (
+                    measure
+                    for measure in payload.measures
+                    if abs(float(measure.start_quarter)) <= 1e-9 and measure.time_signature
+                ),
+                None,
             )
-            reconciliation.append(
-                {
-                    "field": "time_signature",
-                    "offset_quarter": 0.0,
-                    "musicxml_value": xml_initial["ratio"] if xml_initial else None,
-                    "production_value": ratio,
-                    "final_value": ratio,
-                    "reason": "production_metadata_backfilled_changed_initial_time_signature",
-                }
+            timeline_ratio = (
+                _normalize_worker_meter(str(timeline_initial.time_signature))
+                if timeline_initial is not None
+                else None
             )
+            if xml_initial is not None and timeline_ratio == xml_initial["ratio"]:
+                # MuseScore can infer a different meter while laying out a
+                # short performance MIDI (especially when the first audible
+                # event is not on a downbeat).  The imported measure spans
+                # are the actual notation boundaries; replacing their
+                # initial event with the performance hint would create an
+                # internally contradictory Score.  Keep the timeline meter
+                # and retain the production value in the audit report.
+                reconciliation.append(
+                    {
+                        "field": "time_signature",
+                        "offset_quarter": 0.0,
+                        "musicxml_value": xml_initial["ratio"],
+                        "production_value": ratio,
+                        "final_value": xml_initial["ratio"],
+                        "reason": "production_metadata_preserved_imported_timeline_meter",
+                    }
+                )
+            else:
+                if xml_initial is not None:
+                    time_events = [item for item in time_events if abs(float(item["offset_quarter"])) > 1e-9]
+                time_events.append(
+                    {
+                        "offset_quarter": 0.0,
+                        "ratio": ratio,
+                        "numerator": numerator,
+                        "denominator": denominator,
+                    }
+                )
+                reconciliation.append(
+                    {
+                        "field": "time_signature",
+                        "offset_quarter": 0.0,
+                        "musicxml_value": xml_initial["ratio"] if xml_initial else None,
+                        "production_value": ratio,
+                        "final_value": ratio,
+                        "reason": "production_metadata_backfilled_changed_initial_time_signature",
+                    }
+                )
     time_events = sorted(time_events, key=lambda value: float(value["offset_quarter"]))
     if not time_events:
         time_events = [{"offset_quarter": 0.0, "ratio": "4/4", "numerator": 4, "denominator": 4}]
