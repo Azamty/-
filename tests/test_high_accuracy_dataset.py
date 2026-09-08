@@ -468,28 +468,40 @@ def test_ccmusic_beat_grid_has_exact_bar_downbeats(tmp_path: Path) -> None:
     assert beats[-1]["time_sec"] == 12.0
 
 
-def test_ccmusic_alignment_provenance_separates_latency_diagnostic_from_mix_offset(monkeypatch) -> None:
-    onset = ccmusic.np.zeros(200, dtype=ccmusic.np.float64)
-    onset[100] = 3.0
-    monkeypatch.setattr(ccmusic, "_onset_feature", lambda _path: (onset, 25.0))
-    payload = SimpleNamespace(
-        parts=[
-            SimpleNamespace(
-                events=[
-                    SimpleNamespace(
-                        kind="note",
-                        pitches=[60],
-                        grace=False,
-                        offset_quarter=39.5,
-                        event_id="first",
-                    )
-                ]
-            )
-        ]
+def test_ccmusic_alignment_provenance_composes_audio_maps_and_validates_placement(monkeypatch) -> None:
+    score_to_guide = {
+        "slope_sec_per_quarter": 0.75,
+        "offset_sec": -29.5,
+        "guide_zero_score_quarter": 39.3333333333,
+        "anchors": [{"score_quarter": 40.0}, {"score_quarter": 64.0}],
+    }
+    score_to_vocal = {
+        "slope_sec_per_quarter": 0.75,
+        "offset_sec": -29.0,
+        "anchors": [{"score_quarter": 40.0}, {"score_quarter": 64.0}],
+    }
+    guide_to_accompaniment = {
+        "slope_accompaniment_sec_per_guide_sec": 1.0,
+        "offset_sec": 29.0,
+    }
+    monkeypatch.setattr(ccmusic, "_fit_score_audio_affine", lambda _payload, _path, *, label: score_to_guide if label == "guide" else score_to_vocal)
+    monkeypatch.setattr(ccmusic, "_fit_guide_accompaniment_alignment", lambda _guide, _accompaniment: guide_to_accompaniment)
+    monkeypatch.setattr(
+        ccmusic,
+        "_estimate_direct_vocal_accompaniment_offset",
+        lambda _vocal, _accompaniment, center: {"offset_sec": center + 0.04, "score": 0.6},
     )
 
-    placement = ccmusic._estimate_vocal_mix_offset(payload, Path("tuned-vocal.wav"))
+    alignment = ccmusic._estimate_ccmusic_alignment(
+        SimpleNamespace(),
+        guide_path=Path("guide.wav"),
+        vocal_path=Path("tuned-vocal.wav"),
+        accompaniment_path=Path("accompaniment.wav"),
+    )
 
-    assert placement["vocal_mix_offset_sec"] == 25.625
-    assert placement["used_vocal_to_guide_latency"] is False
-    assert placement["latency_application"].endswith("not_applied_to_mix_placement")
+    assert alignment["guide_zero"]["score_quarter"] == pytest.approx(39.3333333333)
+    assert alignment["score_to_accompaniment"]["offset_sec"] == pytest.approx(-0.5)
+    assert alignment["placement"]["vocal_mix_offset_sec"] == pytest.approx(28.5)
+    assert alignment["placement"]["confidence"]["level"] == "high"
+    assert alignment["placement"]["used_vocal_to_guide_latency"] is False
+    assert alignment["placement"]["latency_application"].endswith("not_applied_to_mix_placement")
