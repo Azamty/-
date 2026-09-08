@@ -390,6 +390,38 @@ def test_batch_runner_records_unconfigured_pipeline_without_fabricating_success(
     assert "not configured" in manifest["pipelines"]["new"]["error"]
 
 
+def test_batch_runner_raw_only_skips_score_pipelines(tmp_path: Path) -> None:
+    calls = {"baseline": 0, "new": 0}
+
+    def recognizer(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        return {
+            "notes": [{"midi": 60, "start_sec": 0.0, "end_sec": 0.5}],
+            "beat_grid": {"beats": [{"time_sec": 0.0, "downbeat": True}]},
+            "model_output": True,
+        }
+
+    def forbidden_pipeline(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        calls["baseline"] += 1
+        calls["new"] += 1
+        raise AssertionError("raw-only mode must not call score pipelines")
+
+    outcome = runner_module.BenchmarkBatchRunner(
+        recognizer=recognizer,
+        baseline=forbidden_pipeline,
+        new_chain=forbidden_pipeline,
+        timeout_sec=5,
+        raw_only=True,
+    ).run_case({"id": "raw-only"}, result_root=tmp_path / "results")
+
+    assert outcome["status"] == "success"
+    assert outcome["raw_only"] is True
+    assert outcome["pipelines"] == {}
+    assert calls == {"baseline": 0, "new": 0}
+    assert (tmp_path / "results" / "raw-only" / "raw" / "recognition.json").is_file()
+    assert not (tmp_path / "results" / "raw-only" / "baseline").exists()
+    assert not (tmp_path / "results" / "raw-only" / "new").exists()
+
+
 def test_batch_runner_can_resume_failed_pipeline_without_rerunning_raw(tmp_path: Path) -> None:
     calls = {"recognizer": 0}
 

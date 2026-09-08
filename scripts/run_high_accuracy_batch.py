@@ -594,11 +594,13 @@ class BenchmarkBatchRunner:
         baseline: Adapter | None,
         new_chain: Adapter | None,
         timeout_sec: float = 1800.0,
+        raw_only: bool = False,
     ) -> None:
         self.recognizer = recognizer
         self.baseline = baseline
         self.new_chain = new_chain
         self.timeout_sec = float(timeout_sec)
+        self.raw_only = bool(raw_only)
 
     def _call_with_timeout(self, adapter: Adapter, case: Mapping[str, Any], raw: Mapping[str, Any], destination: Path, stage: str) -> Mapping[str, Any]:
         started = time.monotonic()
@@ -684,6 +686,12 @@ class BenchmarkBatchRunner:
             }
             if _sha256(raw_path) != raw_hash:
                 raise BatchRunError(case_id, "raw", "raw recognition changed during pipeline")
+            if self.raw_only:
+                state["status"] = "success"
+                state["raw_only"] = True
+                state["finished_at"] = time.time()
+                _write_json_once(manifest_path, state) if not manifest_path.exists() else manifest_path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                return state
             for name, adapter, pipeline_root in (
                 ("baseline", self.baseline, baseline_root),
                 ("new", self.new_chain, new_root),
@@ -782,10 +790,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     recognition.add_argument("--production-recognizer", action="store_true", help="显式运行可终止的 MuScriptor/Demucs/GAME/BeatNet production worker")
     parser.add_argument("--run-legacy-baseline", action="store_true", help="在已准备的 raw 上运行保留的旧均匀网格 baseline")
     parser.add_argument("--run-new-chain", action="store_true", help="在已准备的 raw 上运行当前高精度服务")
+    parser.add_argument("--raw-only", action="store_true", help="只运行并登记 recognizer raw，不创建或运行 baseline/new score pipeline")
     parser.add_argument("--demucs-model", choices=("htdemucs", "htdemucs_ft"), help="vocal production route 的 Demucs model")
     parser.add_argument("--timeout-sec", type=float, default=1800.0)
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args(argv)
+    if args.raw_only and (args.run_legacy_baseline or args.run_new_chain):
+        parser.error("--raw-only cannot be combined with --run-legacy-baseline or --run-new-chain")
     registry = _load_registry(args.manifest.resolve())
     cases = [case for case in registry["cases"] if not args.case_ids or str(case.get("id")) in set(args.case_ids)]
     if not cases:
@@ -795,13 +806,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     recognizer: Adapter | None = None
     if args.reference_isolation:
         recognizer = ReferenceIsolationRecognizer()
-    elif args.production_recognizer or args.run_legacy_baseline or args.run_new_chain:
+    elif args.production_recognizer or args.raw_only or args.run_legacy_baseline or args.run_new_chain:
         recognizer = ProductionRecognizer(timeout_sec=args.timeout_sec, demucs_model=args.demucs_model)
     runner = BenchmarkBatchRunner(
         recognizer=recognizer,
         baseline=legacy_baseline_adapter if args.run_legacy_baseline else None,
         new_chain=high_accuracy_service_adapter if args.run_new_chain else None,
         timeout_sec=args.timeout_sec,
+        raw_only=args.raw_only,
     )
     result_root = args.result_root.resolve()
     result_root.mkdir(parents=True, exist_ok=True)
@@ -824,6 +836,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "baseline_result_root": str(baseline_root or result_root / "baseline"),
                 "new_result_root": str(new_root or result_root / "new"),
                 "recognizer": "reference-isolation" if args.reference_isolation else "production" if recognizer is not None else None,
+                "raw_only": args.raw_only,
                 "cases": [{"id": item["case_id"], "status": item["status"], "error": item.get("error")} for item in outcomes],
             },
             ensure_ascii=False,
