@@ -104,7 +104,13 @@ def _midi_notes(path: Path, *, exclude_drum_channel: bool = False) -> tuple[int,
 def _f1(precision_count: int, recall_count: int, predicted_count: int, reference_count: int) -> dict[str, float | int | None]:
     precision = precision_count / predicted_count if predicted_count else None
     recall = recall_count / reference_count if reference_count else None
-    f1 = (2 * precision * recall / (precision + recall)) if precision is not None and recall is not None and precision + recall else None
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision is not None and recall is not None and precision + recall
+        else 0.0
+        if precision == 0.0 and recall == 0.0
+        else None
+    )
     return {"true_positive": precision_count, "predicted": predicted_count, "reference": reference_count, "precision": precision, "recall": recall, "f1": f1}
 
 

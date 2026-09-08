@@ -118,6 +118,14 @@ def test_beat_grid_time_sec_and_downbeat_metrics_are_read_correctly(tmp_path: Pa
     assert benchmark.beat_f1([0.0, 1.0], [0.0, 1.0])["f1"] == 1.0
 
 
+def test_zero_true_positives_report_zero_f1_instead_of_missing() -> None:
+    metric = benchmark._f1(0, 0, predicted_count=3, reference_count=4)
+    assert metric["precision"] == 0.0
+    assert metric["recall"] == 0.0
+    assert metric["f1"] == 0.0
+    assert benchmark.beat_f1([0.0], [1.0])["f1"] == 0.0
+
+
 def test_numeric_midi_metrics_ignore_general_midi_drum_channel(tmp_path: Path) -> None:
     path = tmp_path / "mixed.mid"
     midi = mido.MidiFile(ticks_per_beat=480)
