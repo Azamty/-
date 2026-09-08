@@ -2357,7 +2357,10 @@ def getLY(score,headers=None,have_final_barline=True):
                (3,"","2."), # 3 crotchets = dotted minim
                (2,r"\.","2."), # in 6/8, 2 dotted crotchets = dotted minim
                (2,"","2")]: # 2 crotchets = minim
-           out = re.sub("(?P<note>[^<][^ ]*|<[^>]*>)4"+dot+r'((?::32)?) +~(( \\[^ ]+| [_^]"[^"]*")*) '+" +~ ".join(["(?P=note)4"+dot]*(numNotes-1)),r"\g<1>"+result+r"\g<2>\g<3>",out)
+           # Keep the duration token boundary when collapsing tied notes.
+           # Otherwise the literal ``4`` can match the suffix of a longer
+           # duration such as ``e'64`` and emit invalid ``e'62``.
+           out = re.sub("(?P<note>[^<][^ ]*|<[^>]*>)(?<![0-9])4"+dot+r'((?::32)?) +~(( \\[^ ]+| [_^]"[^"]*")*) '+" +~ ".join(["(?P=note)(?<![0-9])4"+dot]*(numNotes-1)),r"\g<1>"+result+r"\g<2>\g<3>",out)
            # Do not let an undotted rest match the prefix of a dotted rest.
            # ``r4 r4.`` must remain 2.5 quarters; otherwise the second
            # token's dot is left on the collapsed ``r2`` and MIDI gains a

@@ -169,6 +169,152 @@ def test_dense_rest_midi_staff_keeps_score_interval_timeline(tmp_path: Path) -> 
     assert round(end_ticks * scale) == score.total_ticks
 
 
+@pytest.mark.skipif(
+    not render_module.JIANPU.is_file() or not render_module.LILYPOND.is_file(),
+    reason="pinned jianpu-ly or LilyPond is unavailable",
+)
+def test_tied_fine_note_after_tuplet_rests_round_trips_without_invalid_duration(tmp_path: Path) -> None:
+    """Keep fine rests/tuplets from corrupting a tied 64th-note token.
+
+    The vendor MIDI collapse pass used to parse ``e'64`` as ``e'6`` followed
+    by duration ``4`` while looking for tied crotchets, producing the invalid
+    ``e'62``.  This fixture keeps the exact local shape from the production
+    failure (rests surrounding two tied 3-tick notes) and also exercises
+    2-tick explicit 3:2 tuplet members and rests in the same rendered score.
+    LilyPond compilation and the generated MIDI are the acceptance checks;
+    the latter must retain every pitched source interval on the Score grid.
+    """
+
+    score = Score(
+        title="tied fine note after tuplet rests",
+        bpm=100,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=192,
+        voices=[
+            ScoreVoice(
+                voice_id="tied-fine",
+                events=[
+                    ScoreNote(start_tick=0, duration_tick=96, midi=None),
+                    ScoreNote(start_tick=96, duration_tick=48, midi=None),
+                    ScoreNote(start_tick=144, duration_tick=6, midi=None),
+                    ScoreNote(start_tick=150, duration_tick=3, midi=None),
+                    ScoreNote(
+                        start_tick=153,
+                        duration_tick=3,
+                        midi=59,
+                        tie="start",
+                        tie_types=["start"],
+                    ),
+                    ScoreNote(
+                        start_tick=156,
+                        duration_tick=3,
+                        midi=59,
+                        tie="stop",
+                        tie_types=["stop"],
+                    ),
+                    ScoreNote(start_tick=159, duration_tick=3, midi=None),
+                    ScoreNote(start_tick=162, duration_tick=6, midi=None),
+                    ScoreNote(start_tick=168, duration_tick=24, midi=None),
+                ],
+            ),
+            ScoreVoice(
+                voice_id="two-tick-tuplet",
+                events=[
+                    ScoreNote(
+                        start_tick=0,
+                        duration_tick=6,
+                        midi=None,
+                        tuplet_actual=3,
+                        tuplet_normal=2,
+                        tuplet_type="start",
+                    ),
+                    ScoreNote(
+                        start_tick=6,
+                        duration_tick=2,
+                        midi=60,
+                        tuplet_actual=3,
+                        tuplet_normal=2,
+                        tuplet_type="stop",
+                    ),
+                    ScoreNote(
+                        start_tick=8,
+                        duration_tick=6,
+                        midi=None,
+                        tuplet_actual=3,
+                        tuplet_normal=2,
+                        tuplet_type="start",
+                    ),
+                    ScoreNote(
+                        start_tick=14,
+                        duration_tick=2,
+                        midi=62,
+                        tuplet_actual=3,
+                        tuplet_normal=2,
+                        tuplet_type="stop",
+                    ),
+                    ScoreNote(
+                        start_tick=16,
+                        duration_tick=6,
+                        midi=None,
+                        tuplet_actual=3,
+                        tuplet_normal=2,
+                        tuplet_type="start",
+                    ),
+                    ScoreNote(
+                        start_tick=22,
+                        duration_tick=2,
+                        midi=64,
+                        tuplet_actual=3,
+                        tuplet_normal=2,
+                        tuplet_type="stop",
+                    ),
+                    ScoreNote(start_tick=24, duration_tick=168, midi=None),
+                ],
+            ),
+        ],
+    )
+
+    artifacts = render_score(score, tmp_path, basename="fine-token-boundary")
+    lilypond = Path(artifacts.lilypond_path).read_text(encoding="utf-8")
+    assert "e'62" not in lilypond
+    assert artifacts.svg_paths
+    assert artifacts.midi_path is not None
+
+    midi = mido.MidiFile(artifacts.midi_path)
+    scale = score.quarter_ticks / midi.ticks_per_beat
+    observed: dict[int, list[tuple[int, int]]] = {}
+    for track in midi.tracks:
+        absolute = 0
+        active: dict[int, list[int]] = {}
+        for message in track:
+            absolute += message.time
+            if message.type == "note_on" and message.velocity:
+                active.setdefault(message.note, []).append(absolute)
+            elif message.type in {"note_off", "note_on"} and not message.velocity:
+                starts = active.get(message.note, [])
+                if starts:
+                    observed.setdefault(message.note, []).append(
+                        (round(starts.pop(0) * scale), round(absolute * scale))
+                    )
+    for intervals in observed.values():
+        intervals.sort()
+
+    expected: dict[int, list[tuple[int, int]]] = {}
+    for voice in score.voices:
+        for event in voice.events:
+            if event.midi is None:
+                continue
+            intervals = expected.setdefault(event.midi, [])
+            if intervals and intervals[-1][1] == event.start_tick:
+                intervals[-1] = (intervals[-1][0], event.end_tick)
+            else:
+                intervals.append((event.start_tick, event.end_tick))
+    assert {pitch for pitch in observed} == set(expected)
+    assert observed == expected
+
+
 def test_chord_token_preserves_independent_extreme_octaves() -> None:
     from backend.jianpu_score.quantize import _pitch_token
 
