@@ -81,6 +81,94 @@ def test_48_tpq_serializer_preserves_durations_chord_and_explicit_tuplet() -> No
     assert jianpu.count("OctavesAfter") == 3
 
 
+@pytest.mark.skipif(
+    not render_module.JIANPU.is_file() or not render_module.LILYPOND.is_file(),
+    reason="pinned jianpu-ly or LilyPond is unavailable",
+)
+def test_dense_rest_midi_staff_keeps_score_interval_timeline(tmp_path: Path) -> None:
+    """The LilyPond MIDI staff must use the same rest timeline as the SVG.
+
+    The first bar deliberately starts with ``0 0.`` followed by fine rests.
+    The old jianpu-ly collapse pass matched the ``r4`` prefix of ``r4.`` and
+    produced ``r2.``.  That made the first following note 24 Score ticks late
+    in ``score.mid`` even though the visual staff still showed the source
+    rhythm.
+    """
+
+    events: list[ScoreNote] = []
+
+    def add(start_tick: int, duration_tick: int, midi: int | None = None) -> None:
+        events.append(
+            ScoreNote(
+                start_tick=start_tick,
+                duration_tick=duration_tick,
+                midi=midi,
+            )
+        )
+
+    # Three complete 3/4 bars.  The first is the dense-rest pattern that
+    # previously triggered the MIDI-only +24 tick drift.
+    for start_tick, duration_tick in [
+        (0, 48),
+        (48, 72),
+        (120, 6),
+        (126, 6),
+        (132, 12),
+        (144, 18),
+        (162, 6),
+        (168, 72),
+        (240, 48),
+        (288, 12),
+        (300, 36),
+        (336, 12),
+        (348, 12),
+        (360, 24),
+        (384, 48),
+        (432, 48),
+    ]:
+        add(start_tick, duration_tick)
+    add(480, 48, 72)
+    add(528, 48)
+
+    score = Score(
+        title="dense-rest MIDI timeline",
+        bpm=100,
+        key="C",
+        time_signature="3/4",
+        quarter_ticks=48,
+        total_ticks=576,
+        voices=[ScoreVoice(voice_id="dense-rest", events=events)],
+    )
+
+    artifacts = render_score(score, tmp_path, basename="dense-rest")
+    assert artifacts.midi_path is not None
+    midi = mido.MidiFile(artifacts.midi_path)
+    intervals: list[tuple[int, int, int]] = []
+    for track in midi.tracks:
+        absolute = 0
+        active: dict[int, list[int]] = {}
+        for message in track:
+            absolute += message.time
+            if message.type == "note_on" and message.velocity:
+                active.setdefault(message.note, []).append(absolute)
+            elif message.type in {"note_off", "note_on"} and not message.velocity:
+                starts = active.get(message.note, [])
+                if starts:
+                    intervals.append((message.note, starts.pop(0), absolute))
+
+    scale = score.quarter_ticks / midi.ticks_per_beat
+    score_intervals = [
+        (pitch, round(start * scale), round(end * scale))
+        for pitch, start, end in intervals
+    ]
+    assert score_intervals == [(72, 480, 528)]
+
+    end_ticks = max(
+        sum(message.time for message in track) for track in midi.tracks
+    )
+    assert round(end_ticks * scale) == score.total_ticks
+
+
 def test_chord_token_preserves_independent_extreme_octaves() -> None:
     from backend.jianpu_score.quantize import _pitch_token
 

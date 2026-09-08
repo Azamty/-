@@ -2358,7 +2358,13 @@ def getLY(score,headers=None,have_final_barline=True):
                (2,r"\.","2."), # in 6/8, 2 dotted crotchets = dotted minim
                (2,"","2")]: # 2 crotchets = minim
            out = re.sub("(?P<note>[^<][^ ]*|<[^>]*>)4"+dot+r'((?::32)?) +~(( \\[^ ]+| [_^]"[^"]*")*) '+" +~ ".join(["(?P=note)4"+dot]*(numNotes-1)),r"\g<1>"+result+r"\g<2>\g<3>",out)
-           out = re.sub("r4"+dot+r'(( \\[^ ]+| [_^]"[^"]*")*) '+" ".join(["r4"+dot]*(numNotes-1)),"r"+result+r"\g<1>",out)
+           # Do not let an undotted rest match the prefix of a dotted rest.
+           # ``r4 r4.`` must remain 2.5 quarters; otherwise the second
+           # token's dot is left on the collapsed ``r2`` and MIDI gains a
+           # half-quarter at every such bar while the visual staff remains
+           # correct.
+           rest_token = "r4" + dot + r"(?!\.)"
+           out = re.sub(rest_token+r'(( \\[^ ]+| [_^]"[^"]*")*) ' + " ".join([rest_token]*(numNotes-1)), "r"+result+r"\g<1>", out)
            if dot: chkLen=6
            else: chkLen = 4
            out = re.sub(r"\\repeat tremolo "+str(chkLen)+r" { (?P<note1>[^ ]+)32 (?P<note2>[^ ]+)32 } +~(( \\[^ ]+)*) "+" +~ ".join(["< (?P=note1) (?P=note2) >4"+dot]*(numNotes-1)),r"\\repeat tremolo "+str(chkLen*numNotes)+r" { \g<1>32 \g<2>32 }\g<3>",out)
