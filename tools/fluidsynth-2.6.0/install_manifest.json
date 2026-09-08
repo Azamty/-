@@ -1,0 +1,14 @@
+﻿{
+    "schema_version":  "1.0",
+    "product":  "FluidSynth",
+    "version":  "2.6.0",
+    "release_url":  "https://github.com/FluidSynth/fluidsynth/releases/tag/v2.6.0",
+    "asset_url":  "https://github.com/FluidSynth/fluidsynth/releases/download/v2.6.0/fluidsynth-v2.6.0-win10-x64-cpp11.zip",
+    "asset_name":  "fluidsynth-v2.6.0-win10-x64-cpp11.zip",
+    "asset_bytes":  2722370,
+    "asset_sha256":  "817262DEACAA748EDB3AF6731DFFE1766B00146790BECFCCC949A9F701E76681",
+    "executable":  "tools/fluidsynth-2.6.0/fluidsynth-v2.6.0-win10-x64-cpp11/bin/fluidsynth.exe",
+    "executable_sha256":  "08C72384A47F67B0C5BE9EE8C88B1F0B6AFE39A8217ED2ADB83A88B41C051632",
+    "executable_version":  "FluidSynth runtime version 2.6.0\r\nCopyright (C) 2000-2026 Peter Hanappe and others.\r\nDistributed under the LGPL license.\r\nSoundFont(R) is a registered trademark of Creative Technology Ltd.\r\n\r\nFluidSynth executable version 2.6.0\r\nSample type=float",
+    "offline_reuse":  true
+}
