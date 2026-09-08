@@ -1050,6 +1050,44 @@ def test_finer_binary_three_fragment_tie_keeps_stop_for_existing_chain() -> None
     assert score_to_jianpu(score)
 
 
+def test_finer_binary_standalone_note_consumes_following_rest_to_reach_atom() -> None:
+    payload = _manual_payload()
+    payload.highest_time_quarter = 8
+    payload.parts[0].highest_time_quarter = 8
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="standalone-fine-note",
+            kind="note",
+            offset_quarter=0,
+            duration_quarter=0.03125,
+            pitches=[67],
+        ),
+    ]
+    payload.parts[0].measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=8,
+            end_quarter=8,
+            time_signature="4/4",
+        )
+    ]
+    payload.measures = list(payload.parts[0].measures)
+
+    score, report = standardize_musicxml_payload(payload)
+
+    note = next(event for voice in score.voices for event in voice.events if event.midi == 67)
+    assert (note.start_tick, note.duration_tick, note.end_tick) == (0, 3, 3)
+    repair = next(item for item in report["notation_grid_repairs"] if item["musicxml_event_id"] == "standalone-fine-note")
+    assert repair["reason"] == "fine_grid_note_extended_to_jianpu_atom"
+    assert repair["movement_ticks"] == 1
+    assert repair["bounded_by_ticks"] == 2
+    for voice in score.voices:
+        _validate_explicit_ties(voice)
+    assert score_to_jianpu(score)
+
+
 def test_finer_binary_chord_tie_slots_clear_only_merged_pitches() -> None:
     payload = _manual_payload()
     payload.highest_time_quarter = 16

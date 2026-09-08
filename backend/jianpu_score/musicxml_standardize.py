@@ -1829,6 +1829,65 @@ def _repair_fine_score_events(
                     index += 1
                     continue
 
+            # A standalone finer-grid note can round to one or two ticks even
+            # when it has no tie predecessor.  If a rest follows immediately,
+            # consume only the rest ticks needed to reach the smallest
+            # representable jianpu atom.  This preserves the pitch and onset,
+            # keeps the voice timeline contiguous, and records the bounded
+            # end movement in the source alignment.
+            if (
+                current_pitches
+                and current.duration_tick < MIN_JIANPU_ATOM_TICKS
+                and index + 1 < len(events)
+                and events[index + 1].is_rest
+                and events[index + 1].start_tick == current.end_tick
+            ):
+                following = events[index + 1]
+                needed = MIN_JIANPU_ATOM_TICKS - current.duration_tick
+                movement = min(needed, following.duration_tick)
+                if (
+                    movement > 0
+                    and movement <= MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS
+                    and following.duration_tick - movement >= 0
+                ):
+                    repaired_end = current.end_tick + movement
+                    updated_current = current.model_copy(
+                        update={"duration_tick": repaired_end - current.start_tick}
+                    )
+                    current_metadata = dict(updated_current.metadata)
+                    current_metadata["notation_grid_repair"] = {
+                        "reason": "fine_grid_note_extended_to_jianpu_atom",
+                        "original_end_tick": current.end_tick,
+                        "repaired_end_tick": repaired_end,
+                    }
+                    events[index] = updated_current.model_copy(update={"metadata": current_metadata})
+                    if current_id is not None:
+                        for item in _alignment_items_for_events(alignment, {current_id}):
+                            _update_alignment_end(item, repaired_end)
+                    remaining = following.duration_tick - movement
+                    if remaining:
+                        events[index + 1] = following.model_copy(
+                            update={"start_tick": repaired_end, "duration_tick": remaining}
+                        )
+                    else:
+                        del events[index + 1]
+                    repairs.append(
+                        {
+                            "reason": "fine_grid_note_extended_to_jianpu_atom",
+                            "action": "extend_note_end_into_following_rest",
+                            "voice_id": voice.voice_id,
+                            "musicxml_event_id": current_id,
+                            "pitch": current_pitches[0] if len(current_pitches) == 1 else None,
+                            "pitches": list(current_pitches),
+                            "original_end_tick": current.end_tick,
+                            "repaired_end_tick": repaired_end,
+                            "movement_ticks": movement,
+                            "bounded_by_ticks": MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS,
+                        }
+                    )
+                    index += 1
+                    continue
+
             # A tiny rest directly following another rest can be coalesced
             # without changing any pitched boundary.  This keeps the same
             # explicit policy available for an equivalent MuseScore rest
