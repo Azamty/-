@@ -55,7 +55,7 @@ The local MAESTRO archive/render cache is present and hash-verified by its selec
 
 ## CCMusic context audit
 
-The five CCMusic production raw payloads in the scanned roots were produced from 12-second clip inputs, so their BeatNet calls were clip-context calls. The full aligned Yueding mix is available locally. The compliant reproducible path is one BeatNet call on that complete mix, retaining the absolute output times and hash, then a deterministic crop to each segment's `[audio_start_sec, audio_start_sec + duration_sec]` window with one boundary beat on each side for interpolation and a recorded absolute-to-local offset. The score-derived beat grid remains an evaluation annotation only; it must not be passed as a tempo, phase, or meter override. Existing full-window diagnostic output should be cited separately from the clip raw and must not be silently merged into it.
+The five original CCMusic production raw payloads were produced from 12-second clip inputs, so their first BeatNet calls were clip-context calls. A reproducible full-track context run is now recorded under `.artifacts/review/ccmusic-production-context-v1`: the complete aligned Yueding mix was decoded once, producing 179 beats, and each case carries the full-track audio/grid hashes, absolute/local window mapping, and the nearest preceding/following boundary beat. The copied raw notes are byte-for-byte the original GAME-cleaned notes; only beat analysis is replaced by the full-track window view. The score-derived beat grid remains an evaluation annotation only and is never passed as a tempo, phase, or meter override. The five windows still share one recording and one BeatNet decode, so this context run does not increase independent sample count.
 
 ## Failure semantics
 

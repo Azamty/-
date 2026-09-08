@@ -77,12 +77,27 @@ MAESTRO 10 条现在已有本地 archive/render cache；selection manifest 记�
 
 CCMusic demo 使用官方 Zenodo 记录 `https://zenodo.org/records/5676893`（DOI `10.5281/zenodo.5676893`）。准备脚本只接受本地 archive，要求字节数 `302024881`、MD5 `DBDC4A7E019C6B7A1424D99FDD8A7838` 和 SHA-256 `477B5466936EEC40CEF7DFD43205900E3E4A651B8EC671FDCCAFF48910523053` 全部匹配；记录说明其可用于 computational musicology，但没有 SPDX license identifier。它只解包 cpop/Yueding 的五个成员，使用 pinned music21 worker 读取 MusicXML。新版准备脚本用 MusicXML 音高事件与 guide/vocal 的 chroma 做六个区间的局部仿射拟合，用 guide/accompaniment 的 chroma+onset 局部 DTW 做六个时间锚点的稳健仿射拟合，再以 score→accompaniment 与 score→tuned-vocal 的多锚点差值决定混音位置；所有锚点、残差、斜率、offset 和 feature score 都写入 `selection_manifest.json`。实际结果是 guide t=0 对应 score q≈39.242，guide→accompaniment 为 slope≈1.000004、offset≈28.9996s，score→accompaniment 为 `0.749895*q−0.427607s`，tuned-vocal 的 `vocal_mix_offset_sec≈28.611286s`，完整 vocal/accompaniment 独立校验约 `28.561286s`。旧的 `vocal_to_guide_shift_sec≈-0.44s` 仍保留为相对延迟诊断，明确不参与混音位置。五段按拟合后的绝对 audio 起点约 `29.568/41.566/53.565/65.563/77.561s` 裁剪，score beat grid 仍独立来自 MusicXML；所有生成音频和 MIDI 仍在 `.cache`，不提交到仓库：
 
-CCMusic 的 12 秒片段用于评估窗口诊断，不代表 BeatNet 的完整上下文能力：对新版完整混音只运行一次 BeatNet 得到 179 个 beat、45 个 downbeat、median `81.08 BPM` 和 `4/4`，按五段绝对 audio 窗口切出的 beat F1 为 `0.23/0.35/0.67/0.79/0.73`，downbeat F1 为 `N/A/0.40/0.89/0.89/0.89`，相位中位数约 `+0.01/-0.01/-0.06/-0.05/-0.05s`。同一运行的 12 秒短片 BeatNet tempo 为 `90.91/81.08/80.01/74.09/81.08 BPM`，拍号候选为 `2/4、2/4、2/4、2/4、4/4`；独立 librosa beat tracker 在完整混音给出 `161.50 BPM`，显示半拍/双拍本身存在歧义。后续 context 评估应对整首混音只运行一次 BeatNet，再按每段的绝对窗口切出预测 beats/downbeats 与独立 score grid 比较；五段仍共享一首录音和一次上下文识别，不能增加独立样本数，也不能用上下文结果覆盖短片真实失败。
+CCMusic 的 12 秒片段用于评估窗口诊断，不代表 BeatNet 的完整上下文能力。`scripts/ccmusic_context_beatnet.py` 现在对完整的 `Yueding aligned accompaniment vocal.wav` 只运行一次 BeatNet，并把完整音频 SHA-256 `e38b9fd11dab41fbf603e825462ffc62fdaabf5141958bd27ce60dcb656d2a20`、完整 179 拍网格 SHA-256 `50de27ff6c5a23ae9daeb47d409a81633daea8da0e3d0b9e14231e08d8262f92`、每段绝对/局部时间映射和两侧最近边界拍写入 context provenance。每段 `beats`/`downbeats` 只保留窗口内的局部拍点，边界拍保存在 `context.window.boundary_beats`，GAME 音符逐字节复用原来的 immutable raw，不重跑 Demucs/GAME，也不读取 score beat grid 来调模型。完整上下文切出的 beat F1 为 `0.23/0.35/0.67/0.79/0.73`，downbeat F1 为 `0.00/0.40/0.89/0.89/0.89`；这是五段共享一次整曲识别的诊断，不能增加独立样本数，也不能覆盖原始短片模型失败。context batch 的 new/baseline fixed-total 节奏均值为 `2.030412/1.968370` quarter，pitch F1 均值为 `0.019280/0.046339`；主 gate 仍按真实比较结果失败。BeatNet full-track median tempo 为 `81.08 BPM`、meter `4/4`；独立 librosa beat tracker 在完整混音给出 `161.50 BPM`，显示半拍/双拍本身存在歧义。
 
 ```powershell
 & .\.venv\Scripts\python.exe scripts\prepare_ccmusic_benchmark.py `
   --archive .\.cache\packages\ccmusic-database-demo.zip `
   --overwrite
+```
+
+在已有真实 CCMusic production raw 上建立完整原曲 BeatNet 上下文并重跑两条记谱链：
+
+```powershell
+& .\.venv\Scripts\python.exe scripts\ccmusic_context_beatnet.py `
+  --raw-root .\.artifacts\review\ccmusic-production-v2 `
+  --output-root .\.artifacts\review\ccmusic-production-context-v1
+& .\.venv\Scripts\python.exe scripts\run_high_accuracy_batch.py `
+  --manifest fixtures\high_accuracy\benchmark_manifest.json `
+  --case-id ccmusic-yueding-01 --case-id ccmusic-yueding-02 `
+  --case-id ccmusic-yueding-03 --case-id ccmusic-yueding-04 `
+  --case-id ccmusic-yueding-05 --production-recognizer `
+  --run-legacy-baseline --run-new-chain `
+  --result-root .artifacts\review\ccmusic-production-context-v1
 ```
 
 校验和选取官方 MIDI 的命令是：
