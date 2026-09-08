@@ -347,6 +347,8 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         "source_kind": case.get("source_kind"),
         "source_id": case.get("source_id"),
         "license": case.get("license"),
+        "benchmark_role": case.get("benchmark_role"),
+        "render_domain": case.get("render_domain"),
         "input": _file_record(str(case["input"]), required=True),
         "reference_midi": _file_record(case.get("reference_midi"), required=False),
         "reference_midi_reliable": bool(case.get("reference_midi_reliable", False)),

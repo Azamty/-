@@ -25,7 +25,7 @@ def _write_raw(path: Path, *, source_audio: Path, model_output: bool, notes: lis
     )
 
 
-def test_inventory_keeps_quantizer_fixture_out_of_production_candidates(tmp_path: Path) -> None:
+def test_inventory_counts_declared_render_domains_when_model_raw_is_real(tmp_path: Path) -> None:
     audio = tmp_path / "fixture.wav"
     audio.write_bytes(b"audio")
     annotation = tmp_path / "beats.json"
@@ -53,7 +53,9 @@ def test_inventory_keeps_quantizer_fixture_out_of_production_candidates(tmp_path
                         "beat_annotation": str(annotation),
                         "beat_annotation_independent": True,
                         "beat_annotation_source": "deterministic_midi_render_ground_truth",
-                        "evaluation_scope": "quantizer_isolation_fixture",
+                        "evaluation_scope": "production_end_to_end",
+                        "benchmark_role": "production_end_to_end",
+                        "render_domain": "synthetic_local_midi_render",
                     },
                 ]
             }
@@ -64,8 +66,9 @@ def test_inventory_keeps_quantizer_fixture_out_of_production_candidates(tmp_path
     _write_raw(scan / "real-case" / "production_raw.json", source_audio=audio, model_output=True, notes=[{"midi": 60}])
     _write_raw(scan / "fixture-case" / "production_raw.json", source_audio=audio, model_output=True, notes=[{"midi": 60}])
     inventory = build_inventory(registry, scan_roots=(scan,))
-    assert inventory["production_candidate_ids"] == ["real-case"]
-    assert inventory["quantizer_fixture_model_smoke_ids"] == ["fixture-case"]
+    assert inventory["production_candidate_ids"] == ["real-case", "fixture-case"]
+    assert inventory["quantizer_fixture_model_smoke_ids"] == []
+    assert inventory["cases"][1]["render_domain"] == "synthetic_local_midi_render"
 
 
 def test_inventory_marks_reference_raw_without_model_output(tmp_path: Path) -> None:

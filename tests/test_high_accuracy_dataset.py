@@ -122,6 +122,53 @@ def test_maestro_track_reader_preserves_source_note_velocity(tmp_path: Path) -> 
     assert [(note.pitch, note.velocity) for note in tracks[0].notes] == [(60, 37), (64, 101)]
 
 
+def test_maestro_clip_window_is_source_aligned_and_preserves_intersected_notes() -> None:
+    from fractions import Fraction
+
+    notes = (
+        generator.RenderNote(Fraction(3, 2), Fraction(5, 2), 60, 37),
+        generator.RenderNote(Fraction(9), Fraction(10), 64, 101),
+        generator.RenderNote(Fraction(35), Fraction(36), 67, 80),
+    )
+    track = generator.RenderTrack("source", 0, notes)
+    start, end = maestro._clip_window((track,), (4, 4))
+    assert (start, end) == (Fraction(0), Fraction(32))
+    clipped = maestro._clip_tracks((track,), start, end)
+    assert [(n.start, n.end, n.pitch, n.velocity) for n in clipped[0].notes] == [
+        (Fraction(3, 2), Fraction(5, 2), 60, 37),
+        (Fraction(9), Fraction(10), 64, 101),
+    ]
+
+
+def test_maestro_selector_records_clip_hashes_and_domain(tmp_path: Path, monkeypatch) -> None:
+    source_midi = tmp_path / "source.mid"
+    midi = mido.MidiFile(ticks_per_beat=480)
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("time_signature", numerator=3, denominator=4, time=0))
+    track.append(mido.Message("note_on", note=60, velocity=37, time=0))
+    track.append(mido.Message("note_off", note=60, velocity=0, time=480))
+    midi.tracks.append(track)
+    midi.save(source_midi)
+    archive = tmp_path / "maestro.zip"
+    import zipfile
+
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.write(source_midi, "a/first.mid")
+    monkeypatch.setattr(maestro, "EXPECTED_SHA256", _hash(archive))
+    result = maestro.prepare_archive(archive, output_root=tmp_path / "maestro", count=1)
+    record = result["cases"][0]
+    assert result["render_domain"]["production_end_to_end"] is True
+    assert result["render_domain"]["benchmark_role"] == "production_end_to_end_render_domain"
+    assert record["midi"]["path"].startswith("rendered/clips/")
+    assert record["audio"]["path"].startswith("rendered/clips/")
+    assert record["beat_annotation"]["path"].startswith("rendered/clips/")
+    assert record["clip"]["source_meter"] == "3/4"
+    for key in ("midi", "audio", "beat_annotation"):
+        path = tmp_path / "maestro" / record[key]["path"]
+        assert path.is_file()
+        assert record[key]["sha256"] == _hash(path)
+
+
 def test_batch_runner_recognizes_once_and_shares_immutable_raw_between_pipelines(tmp_path: Path) -> None:
     calls = {"recognizer": 0, "baseline": 0, "new": 0}
     seen: dict[str, int] = {}
@@ -194,7 +241,9 @@ def test_batch_runner_rejects_raw_resume_across_recognizer_modes(tmp_path: Path)
 
 
 def test_batch_runner_derives_effective_scope_from_raw_provenance(tmp_path: Path) -> None:
-    case = {"id": "scope-switch", "evaluation_scope": "quantizer_isolation_fixture"}
+    # Selected render-domain cases are registered for the production gate;
+    # raw provenance still has authority to downgrade a reference run.
+    case = {"id": "scope-switch", "evaluation_scope": "production_end_to_end"}
 
     def adapter(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
         return {"artifact": "test"}
@@ -410,10 +459,14 @@ def test_maestro_selector_records_archive_and_member_hashes(tmp_path: Path, monk
         bundle.write(source_midi, "a/first.mid")
     monkeypatch.setattr(maestro, "EXPECTED_SHA256", _hash(archive))
     result = maestro.prepare_archive(archive, output_root=tmp_path / "maestro", count=2)
+    second = maestro.prepare_archive(archive, output_root=tmp_path / "maestro-second", count=2)
     assert [item["archive_member"] for item in result["cases"]] == ["a/first.mid", "z/second.mid"]
     assert result["archive"]["sha256"] == _hash(archive)
     assert all(item["midi"]["sha256"] for item in result["cases"])
     assert (tmp_path / "maestro" / "selection_manifest.json").is_file()
+    assert [item["midi"]["sha256"] for item in result["cases"]] == [item["midi"]["sha256"] for item in second["cases"]]
+    assert [item["audio"]["sha256"] for item in result["cases"]] == [item["audio"]["sha256"] for item in second["cases"]]
+    assert [item["beat_annotation"]["sha256"] for item in result["cases"]] == [item["beat_annotation"]["sha256"] for item in second["cases"]]
 
 
 def test_ccmusic_registry_cases_are_five_independent_beat_eligible_segments() -> None:

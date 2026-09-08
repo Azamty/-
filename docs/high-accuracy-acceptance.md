@@ -38,7 +38,7 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
 
 ## 重复验收
 
-验收登记文件是 `fixtures/high_accuracy/benchmark_manifest.json`。当前清单登记 30 个选定 case，另保留 5 个 PJS 孤立歌声诊断 case 和 `luv-letter` 本机完整性候选；脚本不会把音频或语料复制进 Git。30 个选定 case 的构成为：10 个固定 seed 的钢琴/吉他/贝斯/多轨合成样本、10 个 MAESTRO v3 官方钢琴 MIDI 渲染候选、5 个 CCMusic 中文混合曲片段和 5 个弱起/3/4/6/8/三连音/变速/复杂和弦专门 fixture。生成和 MAESTRO 渲染仍是 quantizer-isolation fixture，不能因为有真实模型 raw 就改标签计入 production gate；当前本地只有五个 CCMusic case 具备 production scope 和独立 beat 标注，因此到达 30 个严格 production case 仍缺 25 个真实混合音频 case。CCMusic 的五段来自同一首 Yueding 录音，分别覆盖 MusicXML q40、56、72、88、104 的 16 个四分音符（每段 12 秒），用于真实混合人声的 production smoke；它们不是五首独立歌曲。
+验收登记文件是 `fixtures/high_accuracy/benchmark_manifest.json`。当前清单登记 30 个选定 production case，另保留 5 个 PJS 孤立歌声诊断 case 和 `luv-letter` 本机完整性候选；脚本不会把音频或语料复制进 Git。30 个选定 case 的构成为：10 个固定 seed 的钢琴/吉他/贝斯/多轨合成样本、10 个 MAESTRO v3 官方钢琴 MIDI 渲染片段、5 个 CCMusic 中文混合曲片段和 5 个弱起/3/4/6/8/三连音/变速/复杂和弦专门 fixture。它们都必须走真实 audio→MuScriptor/GAME→BeatNet raw→baseline/new 链路；`model_output=true`、输入 hash 匹配、存在 pitched events 和独立 beat annotation 是硬条件，reference-isolation raw 永远不能替代 production raw。合成和本地 MIDI 渲染仍保留 `render_domain` 限制，但只要 raw 来自真实模型，就与 CCMusic 一起参加 30-case 主 gate。CCMusic 的五段来自同一首 Yueding 录音，分别覆盖 MusicXML q40、56、72、88、104 的 16 个四分音符（每段 12 秒），用于真实混合人声 production smoke；它们不是五首独立歌曲。
 
 ```powershell
 & .\.venv\Scripts\python.exe scripts\high_accuracy_benchmark.py --check
@@ -73,7 +73,7 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
   --new-result-root .\artifacts\review\high-accuracy-benchmark\new
 ```
 
-MAESTRO 10 条现在已有本地 archive/render cache；selection manifest 记录官方下载地址、CC BY-NC-SA 4.0、实际字节数 `58416533`、校验值 `70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c`、选中文件 hash 和 `production_end_to_end=false`。该本地音频是确定性的谐波振荡器渲染，保留 MIDI 音高、时值、起音、力度和 tempo map；它不代表真实钢琴音色、踏板噪声、房间声学或原始演奏细节，因此只用于 quantizer isolation，不冒充真实表演录音。合成 fixture 会按拍号在记谱 downbeat 提高 MIDI velocity，音高和时序保持不变，以便原曲 BeatNet 有可解释的小节重音；guitar 采用较小的 downbeat 增量来保持 MuScriptor 对基音的稳定识别，其他音色使用更明显的增量。这仍是本地合成域，不能冒充真实表演录音。PJS 的拍点文件由同源 MIDI 透明推导，报告会保留这一限制，不把它描述成独立人工 beat 标注。
+MAESTRO 10 条现在已有本地 archive/render cache；selection manifest 记录官方下载地址、CC BY-NC-SA 4.0、实际字节数 `58416533`、校验值 `70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c`、选中文件 hash、源 MIDI 区间以及 clip/output hash。每条 production 输入是源 MIDI 首音符所在小节起的固定八小节片段，裁剪规则在识别前确定，绝不根据模型输出挑片；beat/downbeat grid 由片段源 MIDI 精确生成并独立于模型。该本地音频是确定性的谐波振荡器渲染，保留 MIDI 音高、时值、起音、原始力度、tempo/meter；它不代表真实钢琴音色、踏板噪声、房间声学或原始演奏细节，因此报告必须披露 `maestro_local_midi_render` 域限制。它仍然经过真实 MuScriptor/BeatNet，可以作为计划中的本地渲染 production case。合成 fixture 会按拍号在记谱 downbeat 提高 MIDI velocity，音高和时序保持不变，以便原曲 BeatNet 有可解释的小节重音；guitar 采用较小的 downbeat 增量来保持 MuScriptor 对基音的稳定识别，其他音色使用更明显的增量。这仍是本地合成域，不能冒充真实表演录音。PJS 的拍点文件由同源 MIDI 透明推导，报告会保留这一限制，不把它描述成独立人工 beat 标注。
 
 CCMusic demo 使用官方 Zenodo 记录 `https://zenodo.org/records/5676893`（DOI `10.5281/zenodo.5676893`）。准备脚本只接受本地 archive，要求字节数 `302024881`、MD5 `DBDC4A7E019C6B7A1424D99FDD8A7838` 和 SHA-256 `477B5466936EEC40CEF7DFD43205900E3E4A651B8EC671FDCCAFF48910523053` 全部匹配；记录说明其可用于 computational musicology，但没有 SPDX license identifier。它只解包 cpop/Yueding 的五个成员，使用 pinned music21 worker 读取 MusicXML。新版准备脚本用 MusicXML 音高事件与 guide/vocal 的 chroma 做六个区间的局部仿射拟合，用 guide/accompaniment 的 chroma+onset 局部 DTW 做六个时间锚点的稳健仿射拟合，再以 score→accompaniment 与 score→tuned-vocal 的多锚点差值决定混音位置；所有锚点、残差、斜率、offset 和 feature score 都写入 `selection_manifest.json`。实际结果是 guide t=0 对应 score q≈39.242，guide→accompaniment 为 slope≈1.000004、offset≈28.9996s，score→accompaniment 为 `0.749895*q−0.427607s`，tuned-vocal 的 `vocal_mix_offset_sec≈28.611286s`，完整 vocal/accompaniment 独立校验约 `28.561286s`。旧的 `vocal_to_guide_shift_sec≈-0.44s` 仍保留为相对延迟诊断，明确不参与混音位置。五段按拟合后的绝对 audio 起点约 `29.568/41.566/53.565/65.563/77.561s` 裁剪，score beat grid 仍独立来自 MusicXML；所有生成音频和 MIDI 仍在 `.cache`，不提交到仓库：
 
@@ -107,7 +107,7 @@ CCMusic 的 12 秒片段用于评估窗口诊断，不代表 BeatNet 的完整�
   --archive .\.cache\packages\maestro-v3.0.0-midi.zip
 ```
 
-该命令默认不联网；需要下载时必须显式增加 `--download`，脚本仍会先验证固定 SHA-256，再按归档成员名排序选十条、记录成员 hash，并在本地渲染 WAV 与 beat/downbeat 标注。这里的音频是 MIDI 渲染音频，属于量化器隔离样本；在拥有独立表演录音前不会被描述为端到端准确率证据。
+该命令默认不联网；需要下载时必须显式增加 `--download`，脚本仍会先验证固定 SHA-256，再按归档成员名排序选十条、记录成员 hash，并按源 MIDI 规则生成八小节 WAV、裁剪 MIDI 与 beat/downbeat 标注。这里的音频属于明确披露的本地 MIDI 渲染域；它不等于 MAESTRO 原始钢琴表演录音，但会作为真实 production recognizer 的 10 个计划 case，模型失败必须原样进入 gate 诊断。
 
 MIDI 音符指标先把各文件的 tick 精确换算为四分音符位置，因此不同 PPQ 可直接比较；节奏报告同时给出起音和时值误差，单位是 `quarter_note`。当前报告不把 tempo map 推导的秒误差冒充为已计算指标。
 

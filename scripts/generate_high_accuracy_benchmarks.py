@@ -316,7 +316,13 @@ def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int =
         "case_id": case_id,
         "seed": seed,
         "source_kind": "synthetic",
-        "evaluation_scope": "quantizer_isolation_fixture",
+        # The audio is a deterministic local render, but the benchmark still
+        # runs the real production recognizer over it.  Reference-derived
+        # payloads remain quantizer-isolation; this manifest describes only
+        # the source/render domain and never substitutes for model output.
+        "evaluation_scope": "production_end_to_end",
+        "benchmark_role": "production_end_to_end",
+        "render_domain": "synthetic_local_midi_render",
         "tracks": [{"name": track.name, "program": track.program, "channel": track.channel, "note_count": len(track.notes)} for track in tracks],
         "velocity_policy": {
             "kind": "deterministic_notated_downbeat_accents",

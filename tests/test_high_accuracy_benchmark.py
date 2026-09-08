@@ -56,6 +56,14 @@ def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
     assert sum(item["category"] == "official_piano_rendered" for item in registry["cases"]) == 10
     assert sum(item["category"] == "specialized_fixture" for item in registry["cases"]) == 5
     reliable = [item for item in registry["cases"] if item.get("reference_midi_reliable") is True]
+    assert all(item.get("evaluation_scope") == "production_end_to_end" for item in reliable)
+    assert all(item.get("benchmark_role") == "production_end_to_end" for item in reliable)
+    assert {item.get("render_domain") for item in reliable} == {
+        "synthetic_local_midi_render",
+        "maestro_local_midi_render",
+        "research_mixed_song",
+        "specialized_local_midi_render",
+    }
     assert sum(item.get("beat_annotation_independent") is True for item in reliable) == 30
     assert sum(item.get("beat_annotation_independent") is False for item in reliable) == 0
     assert all(

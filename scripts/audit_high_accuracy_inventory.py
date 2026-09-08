@@ -2,9 +2,10 @@
 
 The audit deliberately treats a reference-isolation payload as a separate
 class.  A case is counted as a production execution only when its raw payload
-is marked ``model_output=true`` and contains a pitched event.  Static registry
-labels are retained in the report so a quantizer fixture cannot be relabelled
-just because a model raw payload exists.
+is marked ``model_output=true`` and contains a pitched event.  The registry's
+30-case plan spans synthetic/local-render, public MIDI-render, mixed-song, and
+specialized domains; the domain is disclosed separately from the production
+role and never permits a reference payload to stand in for a model result.
 """
 
 from __future__ import annotations
@@ -99,6 +100,13 @@ def _beat_info(case: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _case_role(case: Mapping[str, Any]) -> str:
+    declared = str(case.get("benchmark_role") or "")
+    if declared == "production_end_to_end":
+        return "production_scope"
+    if declared == "diagnostic_only":
+        return "diagnostic_only"
+    if declared == "manual_only":
+        return "manual_only"
     scope = str(case.get("evaluation_scope") or "")
     if scope == "production_end_to_end":
         return "production_scope"
@@ -247,6 +255,8 @@ def build_inventory(registry_path: Path = DEFAULT_REGISTRY, *, scan_roots: Seque
                 "source_kind": case.get("source_kind"),
                 "source_id": case.get("source_id"),
                 "case_evaluation_scope": case.get("evaluation_scope"),
+                "benchmark_role": case.get("benchmark_role"),
+                "render_domain": case.get("render_domain"),
                 "case_role": _case_role(case),
                 "input": raw_input,
                 "input_exists": input_path.is_file(),
@@ -308,13 +318,13 @@ def render_markdown(inventory: Mapping[str, Any]) -> str:
         f"- Case roles: `{dict(sorted(role_counts.items()))}`",
         f"- Production cases still needed to reach 30: **{inventory['production_cases_needed_for_30']}**",
         "",
-        "| Case | Category | Role | Input | Beat eligible | Raw status | Pitched events | Effective scopes seen |",
-        "|---|---|---|---:|---:|---|---:|---|",
+        "| Case | Category | Render domain | Role | Input | Beat eligible | Raw status | Pitched events | Effective scopes seen |",
+        "|---|---|---|---|---:|---:|---|---:|---|",
     ]
     for item in inventory["cases"]:
         raw_scopes = sorted({str(raw.get("evaluation_scope")) for raw in item["production_raws"] if raw.get("evaluation_scope")})
         lines.append(
-            f"| `{item['id']}` | `{item['category']}` | `{item['case_role']}` | {'yes' if item['input_exists'] else 'no'} | "
+            f"| `{item['id']}` | `{item['category']}` | `{item.get('render_domain') or '—'}` | `{item['case_role']}` | {'yes' if item['input_exists'] else 'no'} | "
             f"{'yes' if item['beat']['eligible'] else 'no'} | `{_status(item)}` | "
             f"{item['pitched_events_in_latest_production_raw'] if item['pitched_events_in_latest_production_raw'] is not None else '—'} | "
             f"{', '.join(raw_scopes) if raw_scopes else '—'} |"
@@ -324,8 +334,8 @@ def render_markdown(inventory: Mapping[str, Any]) -> str:
             "",
             "## Gate interpretation",
             "",
-            "The registry's 30-case composition is currently a fixture selection policy: 10 generated rendered instruments, 10 MAESTRO MIDI renders, 5 CCMusic segments, and 5 specialized generated fixtures. The generated and MAESTRO cases remain quantizer-isolation fixtures even when a real model raw payload is available; the audit never relabels them. On the current local inputs, only the five CCMusic records have the registry's production scope plus independent beat annotation, so the strict production path is short by 25 cases. Those additional cases require fresh mixed-song audio with independent beat/downbeat annotations. A reference-derived payload is never substituted for a missing model result. PJS remains a five-case vocal diagnostic set because its beat annotation is derived from the same reference MIDI and is not independent.",
-            "The local MAESTRO archive/render cache is present and hash-verified by its selection manifest; this makes the ten files executable for quantizer diagnostics, but its render manifest explicitly records `production_end_to_end=false`.",
+            "The registry's 30-case production composition is the stated acceptance plan: 10 deterministic known-MIDI renders, 10 public MIDI-annotated MAESTRO renders, 5 CCMusic mixed-song segments, and 5 specialized deterministic segments. Synthetic and local-MIDI cases remain explicitly labeled by render domain and renderer limitations, but a real `model_output=true` MuScriptor/GAME payload with a pitched event and independent beat annotation is eligible for the same production gate. A reference-isolation payload, empty model result, failed recognizer, or input mismatch never substitutes for a missing model result. PJS remains a five-case vocal diagnostic set because its beat annotation is derived from the same reference MIDI and is not independent.",
+            "The local MAESTRO archive/render cache is hash-verified by its selection manifest. Each selected case now uses a deterministic eight-bar source-MIDI clip, with the original member hash, source quarter interval, clip hash, tempo/meter, and independent beat grid recorded in provenance.",
             "",
             "## CCMusic context audit",
             "",
