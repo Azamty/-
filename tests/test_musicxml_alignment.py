@@ -93,6 +93,36 @@ def _timed_event(event_id: str, midi: int, start_tick: int, end_tick: int) -> _R
     )
 
 
+def _parted_timed_event(
+    event_id: str,
+    midi: int,
+    start_tick: int,
+    end_tick: int,
+    *,
+    part_id: str,
+    part_group: str,
+    staff: int,
+) -> _RawEvent:
+    return _RawEvent(
+        event_id=event_id,
+        part_group=part_group,
+        part_id=part_id,
+        staff=staff,
+        voice="1",
+        start_tick=start_tick,
+        end_tick=end_tick,
+        pitches=[midi],
+        kind="note",
+        tie=None,
+        tie_types=[None],
+        tuplet_actual=None,
+        tuplet_normal=None,
+        dots=0,
+        measure_number=1,
+        metadata={},
+    )
+
+
 def _case(name: str) -> tuple[list[_RawEvent], list[dict[str, int]]]:
     fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
     value = next(item for item in fixture["cases"] if item["name"] == name)
@@ -187,6 +217,35 @@ def test_source_coordinate_reconciliation_requires_complete_affine_evidence() ->
     assert all(item["matching_evidence"] == "monotonic_pitch_affine_alignment" for item in report)
     assert [item["source_alignment_musicxml_unit_id"] for item in report] == [0, 1, 2]
     assert all(item["source_alignment_start_residual_ticks"] == 0 for item in report)
+
+
+def test_cross_part_source_reconciliation_uses_global_one_to_one_model() -> None:
+    # Each synthetic MuseScore part has only one anchor.  The complete pitch
+    # assignment is still unique, so a global model can reconcile the parts
+    # without changing the imported MusicXML timings.
+    events = [
+        _parted_timed_event("xml-60", 60, 10, 34, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("xml-62", 62, 58, 82, part_id="P1-Staff2", part_group="P1", staff=2),
+        _parted_timed_event("xml-64", 64, 106, 130, part_id="P2", part_group="P2", staff=1),
+    ]
+    sources = [
+        _timed_source(0, 60, 100, 124),
+        _timed_source(1, 62, 148, 172),
+        _timed_source(2, 64, 196, 220),
+    ]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+    assert audit["applied"] is True
+    assert audit["method"] == "monotonic_pitch_assignment_cross_part_affine_model"
+    assert audit["one_to_one"] is True
+    assert audit["models"][0]["source_indices"] == [0, 1, 2]
+    assert audit["models"][0]["musicxml_unit_ids"] == [0, 1, 2]
+    assert audit["strict_start_residual_bound_ticks"] == 64
+
+    report = _align_source_notes(events, sources, alignment_hints=hints)
+    assert [item["musicxml_event_id"] for item in report] == ["xml-60", "xml-62", "xml-64"]
+    assert {item["accounting_category"] for item in report} == {"matched"}
+    assert all(item["matching_evidence"] == "monotonic_pitch_affine_alignment" for item in report)
 
 
 def test_source_coordinate_reconciliation_rejects_pitch_multiset_changes() -> None:

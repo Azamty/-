@@ -60,6 +60,16 @@ MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS = 12
 MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS = 64
 MIN_SOURCE_ALIGNMENT_MODEL_POINTS = 3
 MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS = 384
+# MuseScore can split one imported performance into several synthetic parts
+# (for example P1-Staff1/P1-Staff2 plus a voice-only part).  When the complete
+# pitch multiset and monotonic order prove a one-to-one mapping, a single
+# cross-part affine model is safe even if one synthetic part has fewer than
+# three anchors.  Keep this fallback bounded to roughly one quarter-note of
+# residual and 512 score ticks of raw movement; it is never a nearest-neighbor
+# search and never changes MusicXML timing.
+MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS = 64
+MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS = 64
+MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS = 512
 WORKER = ROOT / "scripts" / "musicxml_score_worker.py"
 
 
@@ -1088,6 +1098,129 @@ def _source_alignment_residuals(
     return abs(unit.start_tick - predicted_start), abs(unit.end_tick - predicted_end)
 
 
+def _cross_part_alignment(
+    provisional: list[tuple[dict[str, Any], _LogicalPitchUnit]],
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any]] | None:
+    """Build a bounded affine model across MuseScore's synthetic parts.
+
+    MuseScore may turn one imported MIDI instrument into multiple ``part_id``
+    values.  A per-staff model is then underdetermined for a short synthetic
+    part even though the complete source/pitch assignment is unambiguous.  A
+    global model is accepted only after the caller has established exact
+    pitch counts, unique same-pitch timing, and global monotonic order.
+    """
+
+    if len(provisional) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
+        return None
+    scale, offset = _fit_source_alignment_line(provisional)
+    if not 0.5 <= scale <= 1.8:
+        return None
+    residuals = [
+        _source_alignment_residuals(pair, scale=scale, offset=offset)
+        for pair in provisional
+    ]
+    max_start_residual = max(item[0] for item in residuals)
+    max_end_residual = max(item[1] for item in residuals)
+    if (
+        max_start_residual > MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS
+        or max_end_residual > MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS
+    ):
+        return None
+    raw_start_movement = max(
+        abs(unit.start_tick - int(source["start_tick"]))
+        for source, unit in provisional
+    )
+    raw_end_movement = max(
+        abs(unit.end_tick - int(source["end_tick"]))
+        for source, unit in provisional
+    )
+    if max(raw_start_movement, raw_end_movement) > MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS:
+        return None
+    needs_reconciliation = any(
+        abs(unit.start_tick - int(source["start_tick"])) > 24
+        or abs(unit.end_tick - int(source["end_tick"])) > 6
+        for source, unit in provisional
+    )
+    if not needs_reconciliation:
+        return None
+
+    source_hints: dict[int, dict[str, Any]] = {}
+    model = {
+        "group": {"scope": "all_imported_parts"},
+        "scale": scale,
+        "offset": offset,
+        "pair_positions": list(range(len(provisional))),
+        "source_indices": [int(source["source_index"]) for source, _unit in provisional],
+        "musicxml_unit_ids": [unit.unit_id for _source, unit in provisional],
+        "method": "cross_part_global_affine_alignment",
+    }
+    for position, (source, unit) in enumerate(provisional):
+        start_residual, end_residual = residuals[position]
+        source_hints[int(source["source_index"])] = {
+            "scale": scale,
+            "offset": offset,
+            "aligned_start_tick": round(scale * int(source["start_tick"]) + offset),
+            "aligned_end_tick": round(scale * int(source["end_tick"]) + offset),
+            "musicxml_unit_id": unit.unit_id,
+            "group": dict(model["group"]),
+            "model_index": 0,
+            "method": model["method"],
+            "start_residual_ticks": start_residual,
+            "end_residual_ticks": end_residual,
+            "start_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
+            "end_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
+        }
+    source_hints_count = len(source_hints)
+    unit_ids = {hint["musicxml_unit_id"] for hint in source_hints.values()}
+    if source_hints_count != len(provisional) or len(unit_ids) != len(provisional):
+        return None
+    classification = "global_offset" if abs(scale - 1.0) <= 0.01 else "global_affine_scale_and_offset"
+    sample_pairs = []
+    for source, unit in sorted(provisional, key=lambda pair: int(pair[0]["source_index"]))[:10]:
+        sample_pairs.append(
+            {
+                "source_index": int(source["source_index"]),
+                "pitch": int(source["midi"]),
+                "source_start_tick": int(source["start_tick"]),
+                "source_end_tick": int(source["end_tick"]),
+                "musicxml_unit_id": unit.unit_id,
+                "musicxml_start_tick": unit.start_tick,
+                "musicxml_end_tick": unit.end_tick,
+                "raw_start_difference_ticks": unit.start_tick - int(source["start_tick"]),
+                "raw_end_difference_ticks": unit.end_tick - int(source["end_tick"]),
+            }
+        )
+    return source_hints, {
+        "applied": True,
+        "method": "monotonic_pitch_assignment_cross_part_affine_model",
+        "classification": classification,
+        "pairing": "monotonic_per_pitch_start_end_order",
+        "global_order_preserved": True,
+        "pitch_multiset_equal": True,
+        "one_to_one": True,
+        "provisional_pair_count": len(provisional),
+        "model_count": 1,
+        "models": [
+            {
+                "group": dict(model["group"]),
+                "scale": scale,
+                "offset_ticks": offset,
+                "method": model["method"],
+                "source_indices": list(model["source_indices"]),
+                "musicxml_unit_ids": list(model["musicxml_unit_ids"]),
+            }
+        ],
+        "max_start_residual_ticks": max_start_residual,
+        "max_end_residual_ticks": max_end_residual,
+        "strict_start_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
+        "strict_end_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
+        "max_raw_start_difference_ticks": raw_start_movement,
+        "max_raw_end_difference_ticks": raw_end_movement,
+        "movement_bound_ticks": MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS,
+        "sample_pairs": sample_pairs,
+    }
+
+
 def _estimate_source_alignment(
     events: list[_RawEvent],
     source_notes: list[dict[str, Any]],
@@ -1186,6 +1319,12 @@ def _estimate_source_alignment(
                 "current_source_index": int(current_source["source_index"]),
                 "current_musicxml_unit_id": current_unit.unit_id,
             }
+
+    imported_groups = {_alignment_unit_group(unit) for _source, unit in provisional}
+    if len(imported_groups) > 1:
+        cross_part = _cross_part_alignment(provisional)
+        if cross_part is not None:
+            return cross_part
 
     grouped: dict[tuple[str, int], list[tuple[dict[str, Any], _LogicalPitchUnit]]] = {}
     for pair in provisional:
@@ -1616,10 +1755,16 @@ def _match_source_pitch(
         overlap_ratio = overlap / min(source_duration, unit_duration)
         end_distance = abs(unit.end_tick - source_end_tick)
         duration_supported = distance <= 48 and overlap_ratio >= 0.9 and end_distance <= 6
+        start_residual_bound = float(
+            hint.get("start_residual_bound_ticks", MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS)
+        ) if hint is not None else MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+        end_residual_bound = float(
+            hint.get("end_residual_bound_ticks", MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS)
+        ) if hint is not None else MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS
         transformed_supported = (
             hint is not None
-            and distance <= MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
-            and end_distance <= MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS
+            and distance <= start_residual_bound
+            and end_distance <= end_residual_bound
         )
         if transformed_supported:
             evidence = "monotonic_pitch_affine_alignment"
