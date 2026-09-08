@@ -28,7 +28,12 @@ PERFORMANCE_TICKS_PER_QUARTER = 480
 PERFORMANCE_SCHEMA_VERSION = "1.0"
 DEFAULT_VELOCITY = 80
 DRUM_CHANNEL = 9  # MIDI channel 10 in one-based terminology.
-MAX_MIDI_VOICE_LANES = 4
+# MuseScore keeps at most four voices on one staff, but a type-1 MIDI file can
+# carry additional independent tracks.  The notation importer turns those
+# tracks into additional parts/ScoreVoice lanes.  Four remains the preferred
+# per-staff voice count; it is not a lossless ceiling for performance MIDI.
+PREFERRED_MIDI_VOICE_LANES_PER_STAFF = 4
+MIDI_MELODIC_CHANNELS = tuple(channel for channel in range(16) if channel != DRUM_CHANNEL)
 
 
 def _midi_text(value: str, *, fallback: str = "track") -> str:
@@ -230,7 +235,7 @@ def _absolute_note_ticks(
 def _assign_midi_voice_lanes(
     notes: Sequence[Mapping[str, Any]],
     *,
-    max_lanes: int = MAX_MIDI_VOICE_LANES,
+    max_lanes: int | None = None,
 ) -> list[list[dict[str, Any]]]:
     """Partition notes so a channel/pitch pair never has overlapping spans.
 
@@ -238,12 +243,15 @@ def _assign_midi_voice_lanes(
     importers are free to pair the note-off with the wrong note-on.  Keep the
     normal single-track representation for ordinary chords and adjacent
     retriggers.  Only a genuine same-pitch interval overlap gets another lane.
-    The greedy interval coloring is minimal for this constraint; if more than
-    ``max_lanes`` are required, fail explicitly instead of dropping or merging
-    source notes.
+    The greedy interval coloring is minimal for this constraint.  When
+    ``max_lanes`` is ``None`` (the production path), each additional lane is a
+    separate MIDI track so note-on/off identity remains lossless even when a
+    source has more than four simultaneous same-pitch intervals.  A finite
+    limit is retained for callers that want an explicit resource guard; it
+    always fails before dropping or merging source notes.
     """
 
-    if max_lanes <= 0:
+    if max_lanes is not None and max_lanes <= 0:
         raise ValueError("max_lanes must be greater than zero")
     lanes: list[list[dict[str, Any]]] = []
     pitch_ends: list[dict[int, int]] = []
@@ -260,7 +268,7 @@ def _assign_midi_voice_lanes(
         )
         if lane_index is None:
             lane_index = len(lanes)
-            if lane_index >= max_lanes:
+            if max_lanes is not None and lane_index >= max_lanes:
                 raise ValueError(
                     "performance MIDI requires more than "
                     f"{max_lanes} same-pitch voice lanes at tick {start_tick}; "
@@ -285,9 +293,15 @@ def _midi_lane_channel(lane_index: int, *, is_drum: bool) -> int:
     # Keep the first drum lane on General MIDI channel 10.  Additional drum
     # lanes use ordinary channels so same-pitch overlaps remain unambiguous;
     # drum notation is never derived from this playback-only artifact.
+    if lane_index < 0:
+        raise ValueError("lane_index must be non-negative")
     if is_drum and lane_index == 0:
         return DRUM_CHANNEL
-    return lane_index if lane_index < DRUM_CHANNEL else lane_index + 1
+    melodic_index = lane_index if not is_drum else lane_index - 1
+    # A track boundary, rather than a unique channel, disambiguates repeated
+    # channels after the 15 melodic channels are exhausted.  Every individual
+    # track still has non-overlapping same-pitch spans by construction.
+    return MIDI_MELODIC_CHANNELS[melodic_index % len(MIDI_MELODIC_CHANNELS)]
 
 
 def _write_track_messages(
@@ -424,7 +438,9 @@ def build_performance_midi(
         "channel": channels[0] + 1,
         "channels": [channel_value + 1 for channel_value in channels],
         "voice_lane_count": len(lane_notes),
-        "voice_lane_policy": "same_pitch_interval_coloring_max_4",
+        "voice_lane_policy": "same_pitch_interval_coloring_lossless_midi_tracks",
+        "preferred_voice_lanes_per_staff": PREFERRED_MIDI_VOICE_LANES_PER_STAFF,
+        "track_channel_reuse_policy": "channels may repeat after 15 melodic lanes because each lane has an independent MIDI track",
         "source": "unquantized_note_events",
         "note_count": len(mapped),
         "time_signature": analysis.time_signature,
@@ -448,6 +464,7 @@ def build_performance_midi(
             {
                 **{key: value for key, value in item.items() if key not in {"start_beat", "end_beat"}},
                 "midi_channel": channels[int(item["midi_lane"]) ] + 1,
+                "midi_track_index": int(item["midi_lane"]) + 1,
                 "playback_start_sec": _tick_to_seconds(int(item["start_tick"]), tempo_points),
                 "playback_end_sec": _tick_to_seconds(int(item["end_tick"]), tempo_points),
             }

@@ -10,6 +10,7 @@ from backend.jianpu_score.domain import VALID_KEYS, MusicAnalysis, NoteEvent
 from backend.jianpu_score.performance_midi import (
     PERFORMANCE_TICKS_PER_QUARTER,
     PerformanceTrack,
+    _assign_midi_voice_lanes,
     build_performance_midi,
     write_performance_midi,
     write_performance_midi_bundle,
@@ -161,14 +162,34 @@ def test_same_pitch_overlaps_use_independent_midi_lanes_without_losing_identity(
         assert all(right[0] >= left[1] for left, right in zip(spans, spans[1:]))
 
 
-def test_more_than_four_same_pitch_lanes_fails_without_dropping_notes() -> None:
+def test_more_than_four_same_pitch_lanes_use_lossless_midi_tracks() -> None:
     analysis = _analysis(beat_times=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
     events = [
-        NoteEvent(start_sec=index * 0.1, end_sec=1.0 + index * 0.1, midi=60)
+        NoteEvent(start_sec=index * 0.1, end_sec=10.0 + index * 0.1, midi=60)
+        for index in range(16)
+    ]
+    midi_bytes, metadata = build_performance_midi(events, analysis, instrument_group="piano")
+    midi, _messages_list = _messages(midi_bytes)
+    assert metadata["voice_lane_count"] == 16
+    assert metadata["voice_lane_policy"] == "same_pitch_interval_coloring_lossless_midi_tracks"
+    assert metadata["preferred_voice_lanes_per_staff"] == 4
+    assert [item["midi_track_index"] for item in metadata["notes"]] == list(range(1, 17))
+    assert metadata["channels"][15] == metadata["channels"][0]
+    assert len(midi.tracks) == 17  # conductor plus one independent track per lane
+    assert all(
+        sum(message.type == "note_on" and message.velocity > 0 for message in track) == 1
+        and sum(message.type in {"note_off", "note_on"} and getattr(message, "velocity", 0) == 0 for message in track) == 1
+        for track in midi.tracks[1:]
+    )
+
+
+def test_same_pitch_lane_guard_is_explicit_when_requested() -> None:
+    notes = [
+        {"index": index, "midi": 60, "start_tick": index, "end_tick": 100 + index}
         for index in range(5)
     ]
     with pytest.raises(ValueError, match="more than 4 same-pitch voice lanes"):
-        build_performance_midi(events, analysis, instrument_group="piano")
+        _assign_midi_voice_lanes(notes, max_lanes=4)
 
 
 def test_variable_tempo_map_round_trips_note_seconds_with_tick_rounding() -> None:
