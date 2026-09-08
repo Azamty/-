@@ -424,9 +424,20 @@ def _analysis_and_events_from_raw(raw: Mapping[str, Any], case: Mapping[str, Any
         raise ValueError(f"raw analysis has unsupported key or meter: {exc}") from exc
     beat_records = beat_grid.get("beats", []) if isinstance(beat_grid, Mapping) else []
     beat_times = [float(item.get("time_sec")) for item in beat_records if isinstance(item, Mapping) and item.get("time_sec") is not None]
+    source_kind = str(raw.get("source_kind") or case.get("source_kind") or "")
+    cleanup_report: Mapping[str, Any] | None = None
+    raw_notes = raw.get("notes", [])
+    if source_kind == "instrumental" and raw.get("model_output") is True:
+        from backend.jianpu_score.instrumental_cleanup import clean_instrumental_model_notes
+
+        cleanup = clean_instrumental_model_notes(raw_notes)
+        prepared_notes = cleanup.events
+        cleanup_report = cleanup.report
+    else:
+        prepared_notes = tuple(dict(item) for item in raw_notes)
     notes: list[NoteEvent] = []
     max_end = 0.0
-    for index, item in enumerate(raw.get("notes", [])):
+    for index, item in enumerate(prepared_notes):
         if not isinstance(item, Mapping):
             raise ValueError(f"raw note {index} is not an object")
         if item.get("start_sec") is not None and item.get("end_sec") is not None:
@@ -440,6 +451,30 @@ def _analysis_and_events_from_raw(raw: Mapping[str, Any], case: Mapping[str, Any
         max_end = max(max_end, end_sec)
         channel = item.get("channel")
         is_drum = bool(item.get("is_drum")) or channel is not None and int(channel) == 9
+        cleanup_lineage = item.get("_instrumental_cleanup")
+        primary_source_index = index
+        source_indices = [index]
+        if isinstance(cleanup_lineage, Mapping):
+            try:
+                primary_source_index = int(cleanup_lineage["primary_source_index"])
+                source_indices = [int(value) for value in cleanup_lineage.get("source_indices", [primary_source_index])]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"raw note {index} has invalid instrumental cleanup lineage") from exc
+        event_metadata = {
+            "raw_index": primary_source_index,
+            "is_drum": is_drum,
+            "channel": channel,
+            "instrument_group": item.get("instrument_group"),
+            "program": item.get("program"),
+        }
+        if isinstance(cleanup_lineage, Mapping):
+            event_metadata["instrumental_cleanup"] = {
+                "primary_source_index": primary_source_index,
+                "source_indices": source_indices,
+                "merged_source_indices": [
+                    int(value) for value in cleanup_lineage.get("merged_source_indices", [])
+                ],
+            }
         notes.append(
             NoteEvent(
                 start_sec=start_sec,
@@ -450,13 +485,7 @@ def _analysis_and_events_from_raw(raw: Mapping[str, Any], case: Mapping[str, Any
                 raw_pitch=item.get("raw_pitch"),
                 voice_id=str(item.get("voice_id", "voice-0")),
                 source=str(item.get("source", "benchmark-raw")),
-                metadata={
-                    "raw_index": index,
-                    "is_drum": is_drum,
-                    "channel": channel,
-                    "instrument_group": item.get("instrument_group"),
-                    "program": item.get("program"),
-                },
+                metadata=event_metadata,
             )
         )
     duration_sec = max(float(analysis_payload.get("duration_sec") or 0.0), max_end, (beat_times[-1] if beat_times else 0.0) + 0.1, 0.1)
@@ -464,6 +493,8 @@ def _analysis_and_events_from_raw(raw: Mapping[str, Any], case: Mapping[str, Any
     metadata = dict(analysis_payload.get("metadata") or {})
     metadata.setdefault("beat_source", "beatnet")
     metadata["beat_grid"] = beat_grid
+    if cleanup_report is not None:
+        metadata["instrumental_cleanup"] = dict(cleanup_report)
     analysis = MusicAnalysis(sample_rate=sample_rate, duration_sec=duration_sec, bpm=bpm, time_signature=meter, key=key, beat_times=beat_times, note_events=notes, warnings=list(analysis_payload.get("warnings") or []), metadata=metadata)
     return analysis, notes
 
@@ -491,6 +522,14 @@ def legacy_baseline_adapter(case: Mapping[str, Any], raw: Mapping[str, Any], des
     analysis = _pitched_analysis(analysis, events)
     destination = destination.resolve()
     destination.mkdir(parents=True, exist_ok=True)
+    cleanup_report = analysis.metadata.get("instrumental_cleanup")
+    cleanup_path: Path | None = None
+    if isinstance(cleanup_report, Mapping):
+        cleanup_path = destination / "instrumental.cleanup.report.json"
+        cleanup_path.write_text(
+            json.dumps(cleanup_report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     score = quantize_events(events, analysis, mode="polyphonic", title=str(case.get("title") or case["id"]))
     score_path = destination / "baseline.score.json"
     score_path.write_text(json.dumps(score.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -500,7 +539,10 @@ def legacy_baseline_adapter(case: Mapping[str, Any], raw: Mapping[str, Any], des
     final_midi = Path(rendered.midi_path).resolve() if rendered.midi_path else None
     if final_midi is None or not final_midi.is_file():
         raise RuntimeError("legacy baseline renderer did not produce final MIDI")
-    return {"engine": "legacy-uniform-grid", "score_json": str(score_path.relative_to(destination.resolve())), "render": rendered.model_dump(mode="json"), "final_midi": str(final_midi.relative_to(destination.resolve())), "beat_grid": "beat_grid.json", "profile": "legacy-uniform-grid"}
+    result = {"engine": "legacy-uniform-grid", "score_json": str(score_path.relative_to(destination.resolve())), "render": rendered.model_dump(mode="json"), "final_midi": str(final_midi.relative_to(destination.resolve())), "beat_grid": "beat_grid.json", "profile": "legacy-uniform-grid"}
+    if cleanup_path is not None:
+        result["instrumental_cleanup"] = str(cleanup_path.relative_to(destination.resolve()))
+    return result
 
 
 def high_accuracy_service_adapter(case: Mapping[str, Any], raw: Mapping[str, Any], destination: Path) -> Mapping[str, Any]:
@@ -515,6 +557,15 @@ def high_accuracy_service_adapter(case: Mapping[str, Any], raw: Mapping[str, Any
     analysis = _pitched_analysis(analysis, events)
     destination = destination.resolve()
     service_output = destination / "service_output"
+    cleanup_report = analysis.metadata.get("instrumental_cleanup")
+    cleanup_path: Path | None = None
+    if isinstance(cleanup_report, Mapping):
+        destination.mkdir(parents=True, exist_ok=True)
+        cleanup_path = destination / "instrumental.cleanup.report.json"
+        cleanup_path.write_text(
+            json.dumps(cleanup_report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     source_kind = str(case.get("source_kind"))
     variant = "game-cleaned" if source_kind == "vocal" else "instrument-part"
     result = build_high_accuracy_artifacts(instrument_id=str(case["id"]), title=str(case.get("title") or case["id"]), program=int(case.get("program", 0)), is_drum=False, events=events, analysis=analysis, output_dir=service_output, variant=variant, overwrite=False)
@@ -527,7 +578,10 @@ def high_accuracy_service_adapter(case: Mapping[str, Any], raw: Mapping[str, Any
     final_midi = service_output / str(score_artifact["relative_path"])
     if not final_midi.is_file():
         raise RuntimeError(f"high-accuracy final MIDI is missing: {final_midi}")
-    return {"engine": "musescore-midi-import", "variant": variant, "profile": variant, "manifest": str(result.manifest_path.relative_to(destination.resolve())), "status": result.status, "jianpu_status": result.jianpu_status, "artifacts": artifact_dicts, "final_midi": str(final_midi.relative_to(destination.resolve())), "beat_grid": "beat_grid.json"}
+    result_payload = {"engine": "musescore-midi-import", "variant": variant, "profile": variant, "manifest": str(result.manifest_path.relative_to(destination.resolve())), "status": result.status, "jianpu_status": result.jianpu_status, "artifacts": artifact_dicts, "final_midi": str(final_midi.relative_to(destination.resolve())), "beat_grid": "beat_grid.json"}
+    if cleanup_path is not None:
+        result_payload["instrumental_cleanup"] = str(cleanup_path.relative_to(destination.resolve()))
+    return result_payload
 
 
 class BenchmarkBatchRunner:

@@ -755,15 +755,18 @@ class HighAccuracyArtifactService:
             source_count = values["source_note_count"]
             accounted_count = values["accounted_source_count"]
             unresolved_count = values["unresolved_count"]
+            emitted_count = int(performance_metadata.get("note_count", -1))
+            expected_source_count = int(performance_metadata.get("source_note_count", emitted_count))
             if (
-                accounted_count != len(materialized)
-                or accounted_count != int(performance_metadata.get("note_count", -1))
+                len(materialized) != emitted_count
+                or source_count != expected_source_count
+                or accounted_count != expected_source_count
                 or unresolved_count != 0
             ):
                 raise fail(
                     "musicxml_standardize",
-                    f"alignment accounted source count {accounted_count} does not match input/performance "
-                    f"{len(materialized)}/{performance_metadata.get('note_count')} or has unresolved={unresolved_count}",
+                    f"alignment source accounting {source_count}/{accounted_count} does not match expected "
+                    f"source/emitted {expected_source_count}/{emitted_count} or has unresolved={unresolved_count}",
                 )
             if score.quarter_ticks != SCORE_TICKS_PER_QUARTER:
                 raise fail(

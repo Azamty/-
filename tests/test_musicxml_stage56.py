@@ -932,6 +932,99 @@ def test_score_normalizer_clears_inconsistent_dots_before_bounded_fragment_repai
     assert score_to_jianpu(score)
 
 
+def test_tiny_fragment_after_tie_repair_closes_one_tick_gap_before_tuplet_inference() -> None:
+    payload = _manual_payload()
+    payload.highest_time_quarter = 24
+    payload.parts[0].highest_time_quarter = 24
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="leading-tie-start",
+            kind="note",
+            offset_quarter=16,
+            duration_quarter=2,
+            pitches=[76],
+            tie="start",
+            tie_types=["start"],
+            voice="6",
+        ),
+        WorkerEvent(
+            event_id="long-tie-continue",
+            kind="note",
+            offset_quarter=18,
+            duration_quarter=2,
+            pitches=[76],
+            tie="continue",
+            tie_types=["continue"],
+            voice="6",
+        ),
+        WorkerEvent(
+            event_id="rounded-tie-stop",
+            kind="note",
+            offset_quarter=20,
+            duration_quarter=0.09375,
+            pitches=[76],
+            tie="stop",
+            tie_types=["stop"],
+            dots=1,
+            voice="6",
+        ),
+        WorkerEvent(
+            event_id="following-tiny-chord",
+            kind="chord",
+            offset_quarter=20.09375,
+            duration_quarter=0.03125,
+            pitches=[40, 53, 57],
+            voice="6",
+        ),
+        WorkerEvent(
+            event_id="following-rest",
+            kind="rest",
+            offset_quarter=20.125,
+            duration_quarter=0.125,
+            voice="6",
+        ),
+        WorkerEvent(
+            event_id="following-rest-2",
+            kind="rest",
+            offset_quarter=20.25,
+            duration_quarter=0.125,
+            voice="6",
+        ),
+        WorkerEvent(
+            event_id="tail",
+            kind="rest",
+            offset_quarter=20.375,
+            duration_quarter=3.625,
+            voice="6",
+        ),
+    ]
+    payload.parts[0].measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=24,
+            end_quarter=24,
+            time_signature="4/4",
+        )
+    ]
+    payload.measures = list(payload.parts[0].measures)
+
+    score, report = standardize_musicxml_payload(payload)
+    voice = next(voice for voice in score.voices if voice.source_voice == "6")
+    assert all(left.end_tick == right.start_tick for left, right in zip(voice.events, voice.events[1:]))
+    tiny = next(event for event in voice.events if event.metadata.get("musicxml_event_id") == "following-tiny-chord")
+    assert (tiny.start_tick, tiny.end_tick) == (963, 966)
+    repairs = [
+        item
+        for item in report["notation_grid_repairs"]
+        if item.get("musicxml_event_id") == "following-tiny-chord"
+    ]
+    assert repairs and repairs[0]["movement_ticks"] == -1
+    assert repairs[0]["action"] == "move_tiny_event_across_repair_gap_to_previous_boundary"
+    assert score_to_jianpu(score)
+
+
 def test_finer_binary_musescore_fragment_is_bounded_to_48_tpq_with_alignment_diagnostic() -> None:
     payload = _manual_payload()
     payload.highest_time_quarter = 16

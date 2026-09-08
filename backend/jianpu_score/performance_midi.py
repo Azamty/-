@@ -212,9 +212,20 @@ def _absolute_note_ticks(
         end_beat = float(mapper.seconds_to_beat(note.end_sec))
         start_tick = max(0, round(start_beat * PERFORMANCE_TICKS_PER_QUARTER))
         end_tick = max(start_tick + 1, round(end_beat * PERFORMANCE_TICKS_PER_QUARTER))
+        cleanup = note.metadata.get("instrumental_cleanup")
+        source_index = index
+        source_indices = [index]
+        if isinstance(cleanup, Mapping):
+            try:
+                source_index = int(cleanup.get("primary_source_index", index))
+                source_indices = [int(value) for value in cleanup.get("source_indices", [source_index])]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"note {index} has invalid instrumental cleanup lineage") from exc
         mapped.append(
             {
                 "index": index,
+                "source_index": source_index,
+                "source_indices": source_indices,
                 "midi": int(note.midi),
                 "start_sec": float(note.start_sec),
                 "end_sec": float(note.end_sec),
@@ -443,6 +454,17 @@ def build_performance_midi(
         "track_channel_reuse_policy": "channels may repeat after 15 melodic lanes because each lane has an independent MIDI track",
         "source": "unquantized_note_events",
         "note_count": len(mapped),
+        "source_note_count": int(
+            (analysis.metadata.get("instrumental_cleanup") or {}).get("source_note_count", len(mapped))
+            if isinstance(analysis.metadata.get("instrumental_cleanup"), Mapping)
+            else len(mapped)
+        ),
+        "source_merged_count": int(
+            (analysis.metadata.get("instrumental_cleanup") or {}).get("merged_count", 0)
+            if isinstance(analysis.metadata.get("instrumental_cleanup"), Mapping)
+            else 0
+        ),
+        "instrumental_cleanup": analysis.metadata.get("instrumental_cleanup"),
         "time_signature": analysis.time_signature,
         "key": analysis.key,
         "emitted_key": _midi_key(analysis.key),

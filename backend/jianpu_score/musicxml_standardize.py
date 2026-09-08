@@ -404,7 +404,7 @@ def _source_notes(performance_metadata: Mapping[str, Any] | None) -> list[dict[s
             continue
         result.append(
             {
-                "source_index": int(value.get("index", index)),
+                "source_index": int(value.get("source_index", value.get("index", index))),
                 "midi": midi,
                 "start_tick_480": start_480,
                 "end_tick_480": end_480,
@@ -1668,6 +1668,58 @@ def _alignment_musicxml_item(
     return result
 
 
+def _append_instrumental_cleanup_alignment(
+    alignment: list[dict[str, Any]],
+    performance_metadata: Mapping[str, Any] | None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Account for exact model duplicates removed before MIDI construction."""
+
+    cleanup = performance_metadata.get("instrumental_cleanup") if performance_metadata else None
+    if not isinstance(cleanup, Mapping):
+        return alignment, len(alignment)
+    merged_items = cleanup.get("merged", [])
+    if not isinstance(merged_items, list):
+        raise MusicXMLStandardizationError("instrumental cleanup report merged must be a list")
+    by_source_index = {int(item["source_index"]): item for item in alignment}
+    result = list(alignment)
+    for merged in merged_items:
+        if not isinstance(merged, Mapping):
+            raise MusicXMLStandardizationError("instrumental cleanup report contains a non-object merge record")
+        try:
+            source_index = int(merged["source_index"])
+            primary_index = int(merged["primary_source_index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MusicXMLStandardizationError("instrumental cleanup merge record lacks source indices") from exc
+        if str(merged.get("reason")) != "exact_model_duplicate":
+            raise MusicXMLStandardizationError(
+                f"unsupported instrumental cleanup merge reason for source index {source_index}"
+            )
+        primary = by_source_index.get(primary_index)
+        if primary is None:
+            raise MusicXMLStandardizationError(
+                f"instrumental cleanup duplicate {source_index} references missing primary {primary_index}"
+            )
+        if source_index in by_source_index:
+            raise MusicXMLStandardizationError(
+                f"instrumental cleanup duplicate source index {source_index} is already aligned"
+            )
+        item = dict(primary)
+        item.update(
+            {
+                "source_index": source_index,
+                "reason": "exact_model_duplicate",
+                "matching_evidence": "instrumental_postprocess_exact_model_duplicate",
+                "accounting_category": "merged",
+                "merged_into_source_index": primary_index,
+                "cleanup_normalized_start_sec": merged.get("normalized_start_sec"),
+                "cleanup_normalized_end_sec": merged.get("normalized_end_sec"),
+            }
+        )
+        result.append(item)
+    result.sort(key=lambda value: int(value["source_index"]))
+    return result, len(alignment)
+
+
 def _source_onset_groups(source_notes: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
     """Cluster source onsets within one 48-TPQ tick for chord evidence."""
 
@@ -2460,6 +2512,71 @@ def _repair_fine_score_events(
         index = 0
         while index < len(events):
             current = events[index]
+            previous = events[index - 1] if index else None
+
+            # A preceding tied fragment may have been shortened by one tick
+            # to reach the jianpu atom grid.  If the next unmarked tiny event
+            # still begins at the old boundary, move only that event back to
+            # the repaired lane boundary before considering inferred tuplets.
+            # This keeps the voice contiguous without inventing a tuplet from
+            # a gap, and records the same bounded one/two-tick movement as the
+            # ordinary tiny-note repair below.
+            current_pitches = _event_pitches(current)
+            current_ties = _event_tie_values(current)
+            if (
+                previous is not None
+                and previous.end_tick < current.start_tick
+                and current_pitches
+                and current.duration_tick < MIN_JIANPU_ATOM_TICKS
+                and current.tuplet_actual is None
+                and current.tuplet_normal is None
+                and current.tuplet_type is None
+                and not any(value is not None for value in current_ties)
+            ):
+                target_start = previous.end_tick
+                movement = target_start - current.start_tick
+                if (
+                    target_start < current.start_tick
+                    and current.end_tick - target_start >= MIN_JIANPU_ATOM_TICKS
+                    and abs(movement) <= MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS
+                ):
+                    current_id = _event_musicxml_id(current)
+                    updated = current.model_copy(
+                        update={
+                            "start_tick": target_start,
+                            "duration_tick": current.end_tick - target_start,
+                        }
+                    )
+                    metadata = dict(updated.metadata)
+                    metadata["notation_grid_repair"] = {
+                        "reason": "fine_grid_note_shifted_to_jianpu_atom",
+                        "action": "move_tiny_event_across_repair_gap_to_previous_boundary",
+                        "original_start_tick": current.start_tick,
+                        "previous_end_tick": previous.end_tick,
+                    }
+                    events[index] = updated.model_copy(update={"metadata": metadata})
+                    if current_id is not None:
+                        for item in _alignment_items_for_events(alignment, {current_id}):
+                            _update_alignment_start(item, target_start)
+                    repairs.append(
+                        {
+                            "reason": "fine_grid_note_shifted_to_jianpu_atom",
+                            "action": "move_tiny_event_across_repair_gap_to_previous_boundary",
+                            "voice_id": voice.voice_id,
+                            "musicxml_event_id": current_id,
+                            "pitch": current_pitches[0] if len(current_pitches) == 1 else None,
+                            "pitches": list(current_pitches),
+                            "original_start_tick": current.start_tick,
+                            "repaired_start_tick": target_start,
+                            "previous_end_tick": previous.end_tick,
+                            "end_tick": current.end_tick,
+                            "movement_ticks": movement,
+                            "bounded_by_ticks": MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS,
+                        }
+                    )
+                    index += 1
+                    continue
+
             # A rounded renderer fragment can be four ticks even though the
             # source duration was a dotted 3/32-quarter value.  Once its dot
             # hint is cleared, let the existing bounded tie repair fold it
@@ -3476,6 +3593,10 @@ def standardize_musicxml_payload(
         if source_notes
         else []
     )
+    alignment, primary_alignment_count = _append_instrumental_cleanup_alignment(
+        alignment,
+        performance_metadata,
+    )
     logical_units = _logical_pitch_units(raw_events)
     matched_musicxml_unit_ids = {
         int(item["musicxml_unit_id"])
@@ -3591,11 +3712,31 @@ def standardize_musicxml_payload(
             "absolute_max": max((abs(value) for value in movement_ends), default=0),
         },
     }
+    instrumental_cleanup = (
+        performance_metadata.get("instrumental_cleanup")
+        if performance_metadata and isinstance(performance_metadata.get("instrumental_cleanup"), Mapping)
+        else None
+    )
+    source_note_count = len(source_notes)
+    if instrumental_cleanup is not None:
+        try:
+            source_note_count = int(instrumental_cleanup.get("source_note_count", source_note_count))
+            expected_merged_count = int(instrumental_cleanup.get("merged_count", 0))
+        except (TypeError, ValueError) as exc:
+            raise MusicXMLStandardizationError("instrumental cleanup report has invalid source accounting") from exc
+        if source_note_count != len(source_notes) + expected_merged_count:
+            raise MusicXMLStandardizationError(
+                "instrumental cleanup source accounting does not equal primary plus merged notes"
+            )
+        if merged_count < expected_merged_count:
+            raise MusicXMLStandardizationError(
+                "instrumental cleanup merged notes were not fully represented in alignment"
+            )
     report: dict[str, Any] = {
         "schema_version": "1.0",
         "source_musicxml": payload.source_path,
         "music21_version": payload.music21_version,
-        "source_note_count": len(source_notes),
+        "source_note_count": source_note_count,
         "accounted_source_count": matched_count + merged_count + dropped_count,
         "matched_count": matched_count,
         "merged_count": merged_count,
@@ -3628,6 +3769,8 @@ def standardize_musicxml_payload(
         },
         "score_voice_count": len(voices),
         "source_to_score": alignment,
+        "instrumental_cleanup": instrumental_cleanup,
+        "primary_alignment_count": primary_alignment_count,
         "source_coordinate_reconciliation": source_alignment_report,
         "repairs": diagnostics + notation_grid_repairs + meter_rebar_splits + lane_reasons,
         "tie_voice_repairs": [
@@ -3703,6 +3846,7 @@ def standardize_musicxml_payload(
         },
         "alignment_report": report,
         "source_coordinate_reconciliation": source_alignment_report,
+        "instrumental_cleanup": instrumental_cleanup,
         "chord_policy": "ScoreNote.chord_pitches retains every MusicXML chord pitch; midi is the lowest pitch for backward compatibility",
         "staff_policy": "Piano staff parts are grouped by the MusicXML parent id and retain staff on ScoreVoice/ScoreNote",
         "voice_policy": "Overlapping events receive additional lanes and are never deleted, including lanes beyond four",
