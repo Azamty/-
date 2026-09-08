@@ -118,6 +118,57 @@ def test_performance_midi_keeps_single_notes_chords_and_overlapping_voices() -> 
     assert metadata["note_count"] == 4
     assert [item["start_tick"] for item in metadata["notes"]] == [0, 0, 0, 240]
     assert all(item["duration_ticks"] >= 1 for item in metadata["notes"])
+    assert metadata["voice_lane_count"] == 1
+    assert metadata["channels"] == [1]
+
+
+def test_same_pitch_overlaps_use_independent_midi_lanes_without_losing_identity() -> None:
+    analysis = _analysis(beat_times=[0.0, 0.5, 1.0, 1.5, 2.0])
+    events = [
+        NoteEvent(start_sec=0.0, end_sec=0.75, midi=60, source="first", voice_id="upper"),
+        NoteEvent(start_sec=0.25, end_sec=1.0, midi=60, source="second", voice_id="lower"),
+        NoteEvent(start_sec=1.0, end_sec=1.5, midi=60, source="adjacent", voice_id="lower"),
+        NoteEvent(start_sec=0.0, end_sec=0.5, midi=64, source="chord", voice_id="upper"),
+    ]
+
+    midi_bytes, metadata = build_performance_midi(
+        events,
+        analysis,
+        instrument_group="piano",
+    )
+    midi, _messages_list = _messages(midi_bytes)
+    assert metadata["voice_lane_count"] == 2
+    assert metadata["channels"] == [1, 2]
+    assert [item["index"] for item in metadata["notes"]] == [0, 1, 2, 3]
+    assert [item["source"] for item in metadata["notes"]] == ["first", "second", "adjacent", "chord"]
+    assert [item["midi_lane"] for item in metadata["notes"]] == [0, 1, 0, 0]
+    assert [item["midi_channel"] for item in metadata["notes"]] == [1, 2, 1, 1]
+
+    open_notes: dict[tuple[int, int], list[int]] = {}
+    intervals: list[tuple[int, int, int, int]] = []
+    for track_index, track in enumerate(midi.tracks[1:], start=1):
+        absolute_tick = 0
+        for message in track:
+            absolute_tick += message.time
+            if message.type == "note_on" and message.velocity > 0:
+                open_notes.setdefault((message.channel, message.note), []).append(absolute_tick)
+            elif message.type in {"note_on", "note_off"}:
+                starts = open_notes[(message.channel, message.note)]
+                intervals.append((message.channel, message.note, starts.pop(0), absolute_tick))
+    assert len(intervals) == len(events)
+    for channel, pitch in {(item[0], item[1]) for item in intervals}:
+        spans = sorted((start, end) for ch, p, start, end in intervals if (ch, p) == (channel, pitch))
+        assert all(right[0] >= left[1] for left, right in zip(spans, spans[1:]))
+
+
+def test_more_than_four_same_pitch_lanes_fails_without_dropping_notes() -> None:
+    analysis = _analysis(beat_times=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
+    events = [
+        NoteEvent(start_sec=index * 0.1, end_sec=1.0 + index * 0.1, midi=60)
+        for index in range(5)
+    ]
+    with pytest.raises(ValueError, match="more than 4 same-pitch voice lanes"):
+        build_performance_midi(events, analysis, instrument_group="piano")
 
 
 def test_variable_tempo_map_round_trips_note_seconds_with_tick_rounding() -> None:

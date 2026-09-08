@@ -28,6 +28,7 @@ PERFORMANCE_TICKS_PER_QUARTER = 480
 PERFORMANCE_SCHEMA_VERSION = "1.0"
 DEFAULT_VELOCITY = 80
 DRUM_CHANNEL = 9  # MIDI channel 10 in one-based terminology.
+MAX_MIDI_VOICE_LANES = 4
 
 
 def _midi_text(value: str, *, fallback: str = "track") -> str:
@@ -226,6 +227,69 @@ def _absolute_note_ticks(
     return mapped
 
 
+def _assign_midi_voice_lanes(
+    notes: Sequence[Mapping[str, Any]],
+    *,
+    max_lanes: int = MAX_MIDI_VOICE_LANES,
+) -> list[list[dict[str, Any]]]:
+    """Partition notes so a channel/pitch pair never has overlapping spans.
+
+    MIDI permits overlapping notes with the same pitch on one channel, but
+    importers are free to pair the note-off with the wrong note-on.  Keep the
+    normal single-track representation for ordinary chords and adjacent
+    retriggers.  Only a genuine same-pitch interval overlap gets another lane.
+    The greedy interval coloring is minimal for this constraint; if more than
+    ``max_lanes`` are required, fail explicitly instead of dropping or merging
+    source notes.
+    """
+
+    if max_lanes <= 0:
+        raise ValueError("max_lanes must be greater than zero")
+    lanes: list[list[dict[str, Any]]] = []
+    pitch_ends: list[dict[int, int]] = []
+    for note in sorted(notes, key=lambda value: (int(value["start_tick"]), int(value["end_tick"]), int(value["index"]))):
+        pitch = int(note["midi"])
+        start_tick = int(note["start_tick"])
+        lane_index = next(
+            (
+                index
+                for index, ends in enumerate(pitch_ends)
+                if int(ends.get(pitch, 0)) <= start_tick
+            ),
+            None,
+        )
+        if lane_index is None:
+            lane_index = len(lanes)
+            if lane_index >= max_lanes:
+                raise ValueError(
+                    "performance MIDI requires more than "
+                    f"{max_lanes} same-pitch voice lanes at tick {start_tick}; "
+                    "preserve the notes with additional ScoreVoice lanes or an "
+                    "explicit lossless MIDI representation"
+                )
+            lanes.append([])
+            pitch_ends.append({})
+        copied = dict(note)
+        copied["midi_lane"] = lane_index
+        lanes[lane_index].append(copied)
+        pitch_ends[lane_index][pitch] = max(
+            int(pitch_ends[lane_index].get(pitch, 0)),
+            int(note["end_tick"]),
+        )
+    return lanes
+
+
+def _midi_lane_channel(lane_index: int, *, is_drum: bool) -> int:
+    """Return a stable channel for a performance voice lane."""
+
+    # Keep the first drum lane on General MIDI channel 10.  Additional drum
+    # lanes use ordinary channels so same-pitch overlaps remain unambiguous;
+    # drum notation is never derived from this playback-only artifact.
+    if is_drum and lane_index == 0:
+        return DRUM_CHANNEL
+    return lane_index if lane_index < DRUM_CHANNEL else lane_index + 1
+
+
 def _write_track_messages(
     notes: Sequence[Mapping[str, Any]],
     *,
@@ -320,24 +384,29 @@ def build_performance_midi(
     resolved_track_id = str(track_id).strip() if track_id is not None and str(track_id).strip() else _default_track_id(group, bounded_program, is_drum)
     mapper = _build_beat_mapper(analysis, list(materialized))
     mapped = _absolute_note_ticks(materialized, mapper)
+    lane_notes = _assign_midi_voice_lanes(mapped)
     tempo_points = _tempo_points(mapper)
-    channel = DRUM_CHANNEL if is_drum else 0
     track_title = str(title).strip() or group
     conductor_track_name = _midi_text(track_title, fallback="Performance")
-    instrument_track_name = _midi_text(group, fallback="Instrument")
+    instrument_track_names = [
+        _midi_text(group if index == 0 else f"{group} voice {index + 1}", fallback="Instrument")
+        for index in range(len(lane_notes))
+    ]
     midi = mido.MidiFile(type=1, ticks_per_beat=PERFORMANCE_TICKS_PER_QUARTER)
     midi.tracks.append(
         _write_conductor_track(title=track_title, analysis=analysis, tempo_points=tempo_points)
     )
-    midi.tracks.append(
-        _write_track_messages(
-            mapped,
-            title=group,
-            channel=channel,
-            program=bounded_program,
-            is_drum=is_drum,
+    for lane_index, notes in enumerate(lane_notes):
+        midi.tracks.append(
+            _write_track_messages(
+                notes,
+                title=instrument_track_names[lane_index],
+                channel=_midi_lane_channel(lane_index, is_drum=is_drum),
+                program=bounded_program,
+                is_drum=is_drum,
+            )
         )
-    )
+    channels = [_midi_lane_channel(index, is_drum=is_drum) for index in range(len(lane_notes))]
     metadata: dict[str, Any] = {
         "schema_version": PERFORMANCE_SCHEMA_VERSION,
         "artifact_kind": "performance_midi",
@@ -345,13 +414,17 @@ def build_performance_midi(
         "title": track_title,
         "midi_track_names": {
             "conductor": conductor_track_name,
-            "instrument": instrument_track_name,
+            "instrument": instrument_track_names[0],
         },
+        "instrument_lane_track_names": instrument_track_names,
         "instrument_group": group,
         "track_id": resolved_track_id,
         "program": bounded_program,
         "is_drum": bool(is_drum),
-        "channel": channel + 1,
+        "channel": channels[0] + 1,
+        "channels": [channel_value + 1 for channel_value in channels],
+        "voice_lane_count": len(lane_notes),
+        "voice_lane_policy": "same_pitch_interval_coloring_max_4",
         "source": "unquantized_note_events",
         "note_count": len(mapped),
         "time_signature": analysis.time_signature,
@@ -374,10 +447,14 @@ def build_performance_midi(
         "notes": [
             {
                 **{key: value for key, value in item.items() if key not in {"start_beat", "end_beat"}},
+                "midi_channel": channels[int(item["midi_lane"]) ] + 1,
                 "playback_start_sec": _tick_to_seconds(int(item["start_tick"]), tempo_points),
                 "playback_end_sec": _tick_to_seconds(int(item["end_tick"]), tempo_points),
             }
-            for item in mapped
+            for item in sorted(
+                (item for lane in lane_notes for item in lane),
+                key=lambda value: int(value["index"]),
+            )
         ],
         "drum_jianpu_policy": "midi_only" if is_drum else "eligible_for_jianpu",
     }
