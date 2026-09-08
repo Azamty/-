@@ -9,6 +9,7 @@ uniform quantizer.
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import os
@@ -51,6 +52,14 @@ MAX_FINE_GRID_MOVEMENT_TICKS = 0.5
 # report so the renderer never silently changes timing.
 MIN_JIANPU_ATOM_TICKS = 3
 MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS = 2
+# A production recognizer can describe the same ordered notes in a different
+# beat coordinate system than MuseScore's notation import.  Only accept an
+# explicit affine/offset reconciliation when the pitch sequence is complete,
+# one-to-one, and the residuals remain bounded.
+MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS = 12
+MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS = 64
+MIN_SOURCE_ALIGNMENT_MODEL_POINTS = 3
+MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS = 384
 WORKER = ROOT / "scripts" / "musicxml_score_worker.py"
 
 
@@ -1035,8 +1044,432 @@ def _logical_pitch_units(events: list[_RawEvent]) -> list[_LogicalPitchUnit]:
     return units
 
 
+def _alignment_unit_group(unit: _LogicalPitchUnit) -> tuple[str, int]:
+    event = unit.chain[0][0]
+    return event.part_group, event.staff
+
+
+def _fit_source_alignment_line(
+    pairs: list[tuple[dict[str, Any], _LogicalPitchUnit]],
+) -> tuple[float, float]:
+    """Fit ``musicxml_tick = scale * source_tick + offset`` to pair starts."""
+
+    if not pairs:
+        raise ValueError("cannot fit an empty source alignment")
+    if len(pairs) == 1:
+        source_tick = int(pairs[0][0]["start_tick"])
+        return 1.0, float(pairs[0][1].start_tick - source_tick)
+    source_values = [int(source["start_tick"]) for source, _unit in pairs]
+    xml_values = [int(unit.start_tick) for _source, unit in pairs]
+    source_mean = sum(source_values) / len(source_values)
+    xml_mean = sum(xml_values) / len(xml_values)
+    denominator = sum((value - source_mean) ** 2 for value in source_values)
+    scale = (
+        sum(
+            (source - source_mean) * (xml - xml_mean)
+            for source, xml in zip(source_values, xml_values, strict=True)
+        )
+        / denominator
+        if denominator
+        else 1.0
+    )
+    return float(scale), float(xml_mean - scale * source_mean)
+
+
+def _source_alignment_residuals(
+    pair: tuple[dict[str, Any], _LogicalPitchUnit],
+    *,
+    scale: float,
+    offset: float,
+) -> tuple[float, float]:
+    source, unit = pair
+    predicted_start = scale * int(source["start_tick"]) + offset
+    predicted_end = scale * int(source["end_tick"]) + offset
+    return abs(unit.start_tick - predicted_start), abs(unit.end_tick - predicted_end)
+
+
+def _estimate_source_alignment(
+    events: list[_RawEvent],
+    source_notes: list[dict[str, Any]],
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+    """Estimate a bounded source-to-MusicXML coordinate reconciliation.
+
+    This is deliberately a diagnostic alignment, never a replacement for
+    MusicXML timing.  Pairing is provisional only when every pitch has exactly
+    the same number of logical XML units and the monotonic per-pitch order is
+    unique.  The resulting models are fitted independently per imported staff;
+    residuals and the provisional unit id are retained so the matcher cannot
+    turn this into broad nearest-neighbour matching.
+    """
+
+    units = _logical_pitch_units(events)
+    source_by_pitch: dict[int, list[dict[str, Any]]] = {}
+    units_by_pitch: dict[int, list[_LogicalPitchUnit]] = {}
+    for source in source_notes:
+        source_by_pitch.setdefault(int(source["midi"]), []).append(source)
+    for unit in units:
+        units_by_pitch.setdefault(int(unit.pitch), []).append(unit)
+    if set(source_by_pitch) != set(units_by_pitch):
+        return {}, {
+            "applied": False,
+            "reason": "source_and_musicxml_pitch_sets_differ",
+            "source_pitch_counts": {str(pitch): len(rows) for pitch, rows in sorted(source_by_pitch.items())},
+            "musicxml_pitch_counts": {str(pitch): len(rows) for pitch, rows in sorted(units_by_pitch.items())},
+        }
+
+    provisional: list[tuple[dict[str, Any], _LogicalPitchUnit]] = []
+    for pitch in sorted(source_by_pitch):
+        source_rows = sorted(
+            source_by_pitch[pitch],
+            key=lambda value: (int(value["start_tick"]), int(value["end_tick"]), int(value["source_index"])),
+        )
+        unit_rows = sorted(
+            units_by_pitch[pitch],
+            key=lambda value: (value.start_tick, value.end_tick, value.unit_id),
+        )
+        if len(source_rows) != len(unit_rows):
+            return {}, {
+                "applied": False,
+                "reason": "source_and_musicxml_pitch_counts_differ",
+                "pitch": pitch,
+                "source_count": len(source_rows),
+                "musicxml_count": len(unit_rows),
+            }
+        source_timing_counts: dict[tuple[int, int], int] = {}
+        unit_timing_counts: dict[tuple[int, int], int] = {}
+        for source in source_rows:
+            timing = (int(source["start_tick"]), int(source["end_tick"]))
+            source_timing_counts[timing] = source_timing_counts.get(timing, 0) + 1
+        for unit in unit_rows:
+            timing = (unit.start_tick, unit.end_tick)
+            unit_timing_counts[timing] = unit_timing_counts.get(timing, 0) + 1
+        if any(count > 1 for count in source_timing_counts.values()) or any(
+            count > 1 for count in unit_timing_counts.values()
+        ):
+            return {}, {
+                "applied": False,
+                "reason": "provisional_alignment_not_unique_same_pitch_timing",
+                "pitch": pitch,
+                "source_timing_duplicates": {
+                    f"{start}:{end}": count
+                    for (start, end), count in sorted(source_timing_counts.items())
+                    if count > 1
+                },
+                "musicxml_timing_duplicates": {
+                    f"{start}:{end}": count
+                    for (start, end), count in sorted(unit_timing_counts.items())
+                    if count > 1
+                },
+            }
+        provisional.extend(zip(source_rows, unit_rows, strict=True))
+
+    source_ordered = sorted(
+        provisional,
+        key=lambda pair: (
+            int(pair[0]["start_tick"]),
+            int(pair[0]["end_tick"]),
+            int(pair[0]["source_index"]),
+        ),
+    )
+    for previous, current in zip(source_ordered, source_ordered[1:], strict=False):
+        previous_source, previous_unit = previous
+        current_source, current_unit = current
+        if (
+            int(current_source["start_tick"]) > int(previous_source["start_tick"])
+            and current_unit.start_tick < previous_unit.start_tick
+        ):
+            return {}, {
+                "applied": False,
+                "reason": "provisional_alignment_global_order_reversed",
+                "previous_source_index": int(previous_source["source_index"]),
+                "previous_musicxml_unit_id": previous_unit.unit_id,
+                "current_source_index": int(current_source["source_index"]),
+                "current_musicxml_unit_id": current_unit.unit_id,
+            }
+
+    grouped: dict[tuple[str, int], list[tuple[dict[str, Any], _LogicalPitchUnit]]] = {}
+    for pair in provisional:
+        grouped.setdefault(_alignment_unit_group(pair[1]), []).append(pair)
+
+    models: list[dict[str, Any]] = []
+    source_hints: dict[int, dict[str, Any]] = {}
+    for group, group_pairs in sorted(grouped.items(), key=lambda item: item[0]):
+        ordered = sorted(
+            group_pairs,
+            key=lambda value: (
+                int(value[0]["start_tick"]),
+                int(value[0]["midi"]),
+                int(value[0]["source_index"]),
+            ),
+        )
+        remaining = list(range(len(ordered)))
+        group_models: list[dict[str, Any]] = []
+        while len(remaining) >= MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
+            candidates: list[tuple[int, float, float, float, list[int]]] = []
+            for left_pos, right_pos in itertools.combinations(remaining, 2):
+                left_source, left_unit = ordered[left_pos]
+                right_source, right_unit = ordered[right_pos]
+                left_tick = int(left_source["start_tick"])
+                right_tick = int(right_source["start_tick"])
+                if left_tick == right_tick:
+                    continue
+                scale = (right_unit.start_tick - left_unit.start_tick) / (right_tick - left_tick)
+                if not 0.5 <= scale <= 1.8:
+                    continue
+                offset = left_unit.start_tick - scale * left_tick
+                inliers = [
+                    position
+                    for position in remaining
+                    if _source_alignment_residuals(ordered[position], scale=scale, offset=offset)[0]
+                    <= MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+                ]
+                if len(inliers) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
+                    continue
+                fitted_scale, fitted_offset = _fit_source_alignment_line([ordered[position] for position in inliers])
+                inliers = [
+                    position
+                    for position in remaining
+                    if _source_alignment_residuals(
+                        ordered[position],
+                        scale=fitted_scale,
+                        offset=fitted_offset,
+                    )[0]
+                    <= MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+                ]
+                if len(inliers) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
+                    continue
+                residuals = [
+                    _source_alignment_residuals(
+                        ordered[position],
+                        scale=fitted_scale,
+                        offset=fitted_offset,
+                    )
+                    for position in inliers
+                ]
+                candidates.append(
+                    (
+                        len(inliers),
+                        max(item[0] for item in residuals),
+                        max(item[1] for item in residuals),
+                        abs(fitted_scale - 1.0),
+                        inliers,
+                    )
+                )
+                # Store the fitted values on the candidate tuple after ranking
+                # without recomputing a second provisional model below.
+            if not candidates:
+                break
+            candidates.sort(key=lambda value: (-value[0], value[1], value[2], value[3]))
+            _count, _start_residual, _end_residual, _scale_distance, inliers = candidates[0]
+            fitted_scale, fitted_offset = _fit_source_alignment_line([ordered[position] for position in inliers])
+            model = {
+                "group": {"part_group": group[0], "staff": group[1]},
+                "scale": fitted_scale,
+                "offset": fitted_offset,
+                "pair_positions": list(inliers),
+                "source_indices": [int(ordered[position][0]["source_index"]) for position in inliers],
+                "musicxml_unit_ids": [ordered[position][1].unit_id for position in inliers],
+                "method": "affine_staff_alignment",
+            }
+            group_models.append(model)
+            remaining = [position for position in remaining if position not in inliers]
+
+        if remaining:
+            if not group_models:
+                return {}, {
+                    "applied": False,
+                    "reason": "insufficient_alignment_model_points",
+                    "group": {"part_group": group[0], "staff": group[1]},
+                    "candidate_count": len(remaining),
+                    "minimum_model_points": MIN_SOURCE_ALIGNMENT_MODEL_POINTS,
+                }
+            # A short remainder can only be accepted when it has a bounded
+            # start/end residual to an already established staff model.  If no
+            # model fits, a singleton offset is retained as an explicit,
+            # auditable fallback for a unique imported fragment.
+            for position in remaining:
+                pair = ordered[position]
+                choices: list[tuple[float, dict[str, Any]]] = []
+                for model in group_models:
+                    start_residual, end_residual = _source_alignment_residuals(
+                        pair,
+                        scale=float(model["scale"]),
+                        offset=float(model["offset"]),
+                    )
+                    if (
+                        start_residual <= MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+                        and end_residual <= MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS
+                    ):
+                        choices.append((start_residual + end_residual / 10.0, model))
+                if choices:
+                    model = min(choices, key=lambda value: value[0])[1]
+                    model["pair_positions"].append(position)
+                    model["source_indices"].append(int(pair[0]["source_index"]))
+                    model["musicxml_unit_ids"].append(pair[1].unit_id)
+                else:
+                    source, unit = pair
+                    model = {
+                        "group": {"part_group": group[0], "staff": group[1]},
+                        "scale": 1.0,
+                        "offset": float(unit.start_tick - int(source["start_tick"])),
+                        "pair_positions": [position],
+                        "source_indices": [int(source["source_index"])],
+                        "musicxml_unit_ids": [unit.unit_id],
+                        "method": "singleton_offset_alignment",
+                    }
+                    start_residual, end_residual = _source_alignment_residuals(
+                        pair,
+                        scale=float(model["scale"]),
+                        offset=float(model["offset"]),
+                    )
+                    if end_residual > MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS:
+                        return {}, {
+                            "applied": False,
+                            "reason": "bounded_alignment_model_not_found",
+                            "group": {"part_group": group[0], "staff": group[1]},
+                            "source_index": int(source["source_index"]),
+                            "start_residual": start_residual,
+                            "end_residual": end_residual,
+                        }
+                group_models.append(model)
+
+        for model_index, model in enumerate(group_models):
+            model["model_index"] = model_index
+            models.append(model)
+            for position in model["pair_positions"]:
+                source, unit = ordered[position]
+                start_residual, end_residual = _source_alignment_residuals(
+                    (source, unit),
+                    scale=float(model["scale"]),
+                    offset=float(model["offset"]),
+                )
+                if (
+                    start_residual > MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+                    or end_residual > MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS
+                ):
+                    return {}, {
+                        "applied": False,
+                        "reason": "alignment_residual_exceeds_bound",
+                        "source_index": int(source["source_index"]),
+                        "musicxml_unit_id": unit.unit_id,
+                        "start_residual": start_residual,
+                        "end_residual": end_residual,
+                    }
+                source_start_movement = abs(unit.start_tick - int(source["start_tick"]))
+                source_end_movement = abs(unit.end_tick - int(source["end_tick"]))
+                if max(source_start_movement, source_end_movement) > MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS:
+                    return {}, {
+                        "applied": False,
+                        "reason": "source_alignment_movement_exceeds_bound",
+                        "source_index": int(source["source_index"]),
+                        "musicxml_unit_id": unit.unit_id,
+                        "start_movement_ticks": source_start_movement,
+                        "end_movement_ticks": source_end_movement,
+                        "movement_bound_ticks": MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS,
+                    }
+                source_hints[int(source["source_index"])] = {
+                    "scale": float(model["scale"]),
+                    "offset": float(model["offset"]),
+                    "aligned_start_tick": round(float(model["scale"]) * int(source["start_tick"]) + float(model["offset"])),
+                    "aligned_end_tick": round(float(model["scale"]) * int(source["end_tick"]) + float(model["offset"])),
+                    "musicxml_unit_id": unit.unit_id,
+                    "group": dict(model["group"]),
+                    "model_index": model_index,
+                    "method": model["method"],
+                    "start_residual_ticks": start_residual,
+                    "end_residual_ticks": end_residual,
+                }
+
+    if len(source_hints) != len(source_notes) or len({hint["musicxml_unit_id"] for hint in source_hints.values()}) != len(source_notes):
+        return {}, {
+            "applied": False,
+            "reason": "provisional_alignment_is_not_one_to_one",
+            "source_count": len(source_notes),
+            "hint_count": len(source_hints),
+        }
+    raw_start_differences = [
+        abs(int(source["start_tick"]) - int(unit.start_tick))
+        for source, unit in provisional
+    ]
+    raw_end_differences = [
+        abs(int(source["end_tick"]) - int(unit.end_tick))
+        for source, unit in provisional
+    ]
+    needs_reconciliation = any(
+        abs(int(source["start_tick"]) - int(unit.start_tick)) > 24
+        or abs(int(source["end_tick"]) - int(unit.end_tick)) > 6
+        for source, unit in provisional
+    )
+    if not needs_reconciliation:
+        return {}, {
+            "applied": False,
+            "reason": "existing_source_alignment_within_strict_window",
+            "provisional_pair_count": len(provisional),
+        }
+    if len(models) == 1:
+        classification = (
+            "global_offset"
+            if abs(float(models[0]["scale"]) - 1.0) <= 0.01
+            else "global_affine_scale_and_offset"
+        )
+    elif all(abs(float(model["scale"]) - 1.0) <= 0.01 for model in models):
+        classification = "segmented_offset_or_bar_shift"
+    elif all(model["method"] == "affine_staff_alignment" for model in models):
+        classification = "segmented_affine_staff_alignment"
+    else:
+        classification = "segmented_affine_and_offset_alignment"
+    sample_pairs = []
+    for source, unit in sorted(provisional, key=lambda pair: int(pair[0]["source_index"]))[:10]:
+        sample_pairs.append(
+            {
+                "source_index": int(source["source_index"]),
+                "pitch": int(source["midi"]),
+                "source_start_tick": int(source["start_tick"]),
+                "source_end_tick": int(source["end_tick"]),
+                "musicxml_unit_id": unit.unit_id,
+                "musicxml_start_tick": unit.start_tick,
+                "musicxml_end_tick": unit.end_tick,
+                "raw_start_difference_ticks": unit.start_tick - int(source["start_tick"]),
+                "raw_end_difference_ticks": unit.end_tick - int(source["end_tick"]),
+            }
+        )
+    return source_hints, {
+        "applied": True,
+        "method": "monotonic_pitch_assignment_affine_staff_models",
+        "classification": classification,
+        "pairing": "monotonic_per_pitch_start_end_order",
+        "global_order_preserved": True,
+        "pitch_multiset_equal": True,
+        "one_to_one": True,
+        "provisional_pair_count": len(provisional),
+        "model_count": len(models),
+        "models": [
+            {
+                "group": model["group"],
+                "scale": float(model["scale"]),
+                "offset_ticks": float(model["offset"]),
+                "method": model["method"],
+                "pair_count": len(model["pair_positions"]),
+                "source_indices": list(model["source_indices"]),
+                "musicxml_unit_ids": list(model["musicxml_unit_ids"]),
+            }
+            for model in models
+        ],
+        "max_start_residual_ticks": max(hint["start_residual_ticks"] for hint in source_hints.values()),
+        "max_end_residual_ticks": max(hint["end_residual_ticks"] for hint in source_hints.values()),
+        "strict_start_residual_bound_ticks": MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS,
+        "strict_end_residual_bound_ticks": MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS,
+        "source_pitch_counts": {str(pitch): len(rows) for pitch, rows in sorted(source_by_pitch.items())},
+        "musicxml_pitch_counts": {str(pitch): len(rows) for pitch, rows in sorted(units_by_pitch.items())},
+        "max_raw_start_difference_ticks": max(raw_start_differences),
+        "max_raw_end_difference_ticks": max(raw_end_differences),
+        "movement_bound_ticks": MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS,
+        "sample_pairs": sample_pairs,
+    }
+
+
 def _alignment_source_item(source: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         "source_index": int(source["source_index"]),
         "source_midi": int(source["midi"]),
         "source_start_tick_480": int(source["start_tick_480"]),
@@ -1044,6 +1477,21 @@ def _alignment_source_item(source: Mapping[str, Any]) -> dict[str, Any]:
         "source_start_tick": int(source["start_tick"]),
         "source_end_tick": int(source["end_tick"]),
     }
+    if isinstance(source.get("_alignment_hint"), Mapping):
+        hint = source["_alignment_hint"]
+        result.update(
+            {
+                "source_alignment_start_tick": int(hint["aligned_start_tick"]),
+                "source_alignment_end_tick": int(hint["aligned_end_tick"]),
+                "source_alignment_scale": float(hint["scale"]),
+                "source_alignment_offset_ticks": float(hint["offset"]),
+                "source_alignment_model": str(hint["method"]),
+                "source_alignment_musicxml_unit_id": int(hint["musicxml_unit_id"]),
+                "source_alignment_start_residual_ticks": float(hint["start_residual_ticks"]),
+                "source_alignment_end_residual_ticks": float(hint["end_residual_ticks"]),
+            }
+        )
+    return result
 
 
 def _alignment_musicxml_item(
@@ -1111,6 +1559,7 @@ def _match_source_pitch(
     *,
     source_group_by_index: dict[int, list[dict[str, Any]]],
     unit_starts_by_pitch: dict[int, list[int]],
+    alignment_hints: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> tuple[dict[int, tuple[_LogicalPitchUnit, dict[str, Any]]], dict[int, int], list[dict[str, Any]] | None]:
     """Monotonic sequence alignment for one MIDI pitch.
 
@@ -1148,20 +1597,33 @@ def _match_source_pitch(
         return support, len(cohort)
 
     def option(source: Mapping[str, Any], unit: _LogicalPitchUnit) -> dict[str, Any] | None:
-        distance = abs(unit.start_tick - int(source["start_tick"]))
+        hint = (alignment_hints or {}).get(int(source["source_index"]))
+        if hint is not None and int(hint["musicxml_unit_id"]) != unit.unit_id:
+            return None
+        source_start_tick = int(hint["aligned_start_tick"]) if hint is not None else int(source["start_tick"])
+        source_end_tick = int(hint["aligned_end_tick"]) if hint is not None else int(source["end_tick"])
+        distance = abs(unit.start_tick - source_start_tick)
         unit_window = min(24, max(6, _nearest_gap(unit_starts, unit.start_tick) // 2 + 6))
-        source_window = min(24, max(6, _nearest_gap(source_starts, int(source["start_tick"])) // 2 + 6))
+        source_window = min(24, max(6, _nearest_gap(source_starts, source_start_tick) // 2 + 6))
         ordinary_window = min(unit_window, source_window)
         support, cohort_count = group_support(source, unit)
-        source_duration = max(1, int(source["end_tick"]) - int(source["start_tick"]))
+        source_duration = max(1, source_end_tick - source_start_tick)
         unit_duration = max(1, unit.end_tick - unit.start_tick)
         overlap = max(
             0,
-            min(int(source["end_tick"]), unit.end_tick) - max(int(source["start_tick"]), unit.start_tick),
+            min(source_end_tick, unit.end_tick) - max(source_start_tick, unit.start_tick),
         )
         overlap_ratio = overlap / min(source_duration, unit_duration)
-        duration_supported = distance <= 48 and overlap_ratio >= 0.9 and abs(unit.end_tick - int(source["end_tick"])) <= 6
-        if distance <= ordinary_window:
+        end_distance = abs(unit.end_tick - source_end_tick)
+        duration_supported = distance <= 48 and overlap_ratio >= 0.9 and end_distance <= 6
+        transformed_supported = (
+            hint is not None
+            and distance <= MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+            and end_distance <= MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS
+        )
+        if transformed_supported:
+            evidence = "monotonic_pitch_affine_alignment"
+        elif distance <= ordinary_window:
             evidence = "adaptive_quantization_window"
         elif distance <= 48 and cohort_count >= 2 and support >= min(cohort_count, 3):
             evidence = "chord_onset_group_quantization_window"
@@ -1170,6 +1632,8 @@ def _match_source_pitch(
         else:
             return None
         cost = distance / 6.0 + abs(unit_duration - source_duration) / 24.0
+        if transformed_supported:
+            cost += end_distance / 64.0
         if overlap == 0:
             cost += min(2.0, distance / 48.0)
         if distance > 24:
@@ -1276,6 +1740,8 @@ def _match_source_pitch(
 def _align_source_notes(
     events: list[_RawEvent],
     source_notes: list[dict[str, Any]],
+    *,
+    alignment_hints: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Align source notes to logical MusicXML pitch units.
 
@@ -1318,6 +1784,7 @@ def _align_source_notes(
             units_by_pitch.get(pitch, []),
             source_group_by_index=source_group_by_index,
             unit_starts_by_pitch=unit_starts_by_pitch,
+            alignment_hints=alignment_hints,
         )
         matched.update(pitch_matched)
         merged.update(pitch_merged)
@@ -1330,7 +1797,13 @@ def _align_source_notes(
         if source_index in matched:
             unit, option = matched[source_index]
             score_end = unit.end_tick
-            reason = "matched_musicxml_tie_chain" if len(unit.chain) > 1 else "matched_musicxml_event"
+            reason = (
+                "matched_musicxml_affine_source_alignment"
+                if source_index in (alignment_hints or {})
+                else "matched_musicxml_tie_chain"
+                if len(unit.chain) > 1
+                else "matched_musicxml_event"
+            )
             overlap_starts = [
                 int(other["start_tick"])
                 for other in source_notes
@@ -2696,7 +3169,22 @@ def standardize_musicxml_payload(
     )
     raw_events, diagnostics = _worker_raw_events(payload)
     source_notes = _source_notes(performance_metadata)
-    alignment = _align_source_notes(raw_events, source_notes) if source_notes else []
+    source_alignment_hints: dict[int, dict[str, Any]] = {}
+    source_alignment_report: dict[str, Any] = {
+        "applied": False,
+        "reason": "no_performance_source_metadata",
+    }
+    if source_notes:
+        source_alignment_hints, source_alignment_report = _estimate_source_alignment(raw_events, source_notes)
+        for source in source_notes:
+            hint = source_alignment_hints.get(int(source["source_index"]))
+            if hint is not None:
+                source["_alignment_hint"] = hint
+    alignment = (
+        _align_source_notes(raw_events, source_notes, alignment_hints=source_alignment_hints)
+        if source_notes
+        else []
+    )
     logical_units = _logical_pitch_units(raw_events)
     matched_musicxml_unit_ids = {
         int(item["musicxml_unit_id"])
@@ -2830,6 +3318,7 @@ def standardize_musicxml_payload(
             "accounted_source_count": matched_count + merged_count + dropped_count,
             "movement": movement_summary,
             "musicxml_extra_count": len(musicxml_extras),
+            "source_coordinate_reconciliation": source_alignment_report,
         },
         "musicxml_event_count": len(raw_events),
         "musicxml_logical_unit_count": len(logical_units),
@@ -2848,6 +3337,7 @@ def standardize_musicxml_payload(
         },
         "score_voice_count": len(voices),
         "source_to_score": alignment,
+        "source_coordinate_reconciliation": source_alignment_report,
         "repairs": diagnostics + notation_grid_repairs + meter_rebar_splits + lane_reasons,
         "tie_voice_repairs": [
             item
@@ -2919,6 +3409,7 @@ def standardize_musicxml_payload(
             "measure_number": payload.pickup.measure_number,
         },
         "alignment_report": report,
+        "source_coordinate_reconciliation": source_alignment_report,
         "chord_policy": "ScoreNote.chord_pitches retains every MusicXML chord pitch; midi is the lowest pitch for backward compatibility",
         "staff_policy": "Piano staff parts are grouped by the MusicXML parent id and retain staff on ScoreVoice/ScoreNote",
         "voice_policy": "Overlapping events receive additional lanes and are never deleted, including lanes beyond four",

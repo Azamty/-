@@ -9,6 +9,7 @@ from backend.jianpu_score.musicxml_standardize import (
     MusicXMLStandardizationError,
     _RawEvent,
     _align_source_notes,
+    _estimate_source_alignment,
     WorkerEvent,
     WorkerKeySignature,
     WorkerMeasure,
@@ -58,6 +59,38 @@ def _source(value: dict[str, object]) -> dict[str, int]:
         "start_tick": start,
         "end_tick": end,
     }
+
+
+def _timed_source(source_index: int, midi: int, start_tick: int, end_tick: int) -> dict[str, int]:
+    return {
+        "source_index": source_index,
+        "midi": midi,
+        "start_tick_480": start_tick * 10,
+        "end_tick_480": end_tick * 10,
+        "start_tick": start_tick,
+        "end_tick": end_tick,
+    }
+
+
+def _timed_event(event_id: str, midi: int, start_tick: int, end_tick: int) -> _RawEvent:
+    return _RawEvent(
+        event_id=event_id,
+        part_group="p1",
+        part_id="p1",
+        staff=1,
+        voice="1",
+        start_tick=start_tick,
+        end_tick=end_tick,
+        pitches=[midi],
+        kind="note",
+        tie=None,
+        tie_types=[None],
+        tuplet_actual=None,
+        tuplet_normal=None,
+        dots=0,
+        measure_number=1,
+        metadata={},
+    )
 
 
 def _case(name: str) -> tuple[list[_RawEvent], list[dict[str, int]]]:
@@ -119,6 +152,113 @@ def test_scattered_chord_does_not_supply_long_distance_support() -> None:
     events, sources = _case("scattered_chord_does_not_support_remote_pitch")
     with pytest.raises(MusicXMLStandardizationError, match=r"count=1; index=0,midi=60"):
         _align_source_notes(events, sources)
+
+
+def test_source_coordinate_reconciliation_requires_complete_affine_evidence() -> None:
+    # The source ticks are in a different, but exact, coordinate system:
+    # MusicXML = source - 100.  Three distinct pitches make that transform
+    # independently identifiable; matching is then locked to the audited
+    # logical-unit ids rather than widening a nearest-neighbour window.
+    events = [
+        _timed_event("xml-60", 60, 0, 24),
+        _timed_event("xml-62", 62, 48, 72),
+        _timed_event("xml-64", 64, 96, 120),
+    ]
+    sources = [
+        _timed_source(0, 60, 100, 124),
+        _timed_source(1, 62, 148, 172),
+        _timed_source(2, 64, 196, 220),
+    ]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+    assert audit["applied"] is True
+    assert audit["method"] == "monotonic_pitch_assignment_affine_staff_models"
+    assert audit["max_raw_start_difference_ticks"] == 100
+    assert audit["max_raw_end_difference_ticks"] == 100
+    assert audit["movement_bound_ticks"] == 384
+    assert audit["models"][0]["source_indices"] == [0, 1, 2]
+    assert audit["models"][0]["musicxml_unit_ids"] == [0, 1, 2]
+
+    for source in sources:
+        source["_alignment_hint"] = hints[int(source["source_index"])]
+    report = _align_source_notes(events, sources, alignment_hints=hints)
+    assert [item["musicxml_event_id"] for item in report] == ["xml-60", "xml-62", "xml-64"]
+    assert all(item["reason"] == "matched_musicxml_affine_source_alignment" for item in report)
+    assert all(item["matching_evidence"] == "monotonic_pitch_affine_alignment" for item in report)
+    assert [item["source_alignment_musicxml_unit_id"] for item in report] == [0, 1, 2]
+    assert all(item["source_alignment_start_residual_ticks"] == 0 for item in report)
+
+
+def test_source_coordinate_reconciliation_rejects_pitch_multiset_changes() -> None:
+    events = [
+        _timed_event("xml-60", 60, 0, 24),
+        _timed_event("xml-62", 62, 48, 72),
+        _timed_event("xml-64", 64, 96, 120),
+    ]
+    sources = [
+        _timed_source(0, 60, 100, 124),
+        _timed_source(1, 62, 148, 172),
+        _timed_source(2, 65, 196, 220),
+    ]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+    assert hints == {}
+    assert audit["applied"] is False
+    assert audit["reason"] == "source_and_musicxml_pitch_sets_differ"
+    with pytest.raises(MusicXMLStandardizationError, match=r"count=3;.*index=2,midi=65"):
+        _align_source_notes(events, sources, alignment_hints=hints)
+
+
+def test_source_coordinate_reconciliation_rejects_single_note_offset_without_anchors() -> None:
+    events = [_timed_event("xml-60", 60, 0, 24)]
+    sources = [_timed_source(0, 60, 100, 124)]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+    assert hints == {}
+    assert audit == {
+        "applied": False,
+        "reason": "insufficient_alignment_model_points",
+        "group": {"part_group": "p1", "staff": 1},
+        "candidate_count": 1,
+        "minimum_model_points": 3,
+    }
+    with pytest.raises(MusicXMLStandardizationError, match=r"count=1; index=0,midi=60"):
+        _align_source_notes(events, sources, alignment_hints=hints)
+
+
+def test_source_coordinate_reconciliation_rejects_ambiguous_same_pitch_timing() -> None:
+    events = [
+        _timed_event("xml-a", 60, 0, 24),
+        _timed_event("xml-b", 60, 0, 24),
+        _timed_event("xml-c", 62, 48, 72),
+    ]
+    sources = [
+        _timed_source(0, 60, 100, 124),
+        _timed_source(1, 60, 100, 124),
+        _timed_source(2, 62, 148, 172),
+    ]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+    assert hints == {}
+    assert audit["applied"] is False
+    assert audit["reason"] == "provisional_alignment_not_unique_same_pitch_timing"
+    assert audit["pitch"] == 60
+
+
+def test_source_coordinate_reconciliation_rejects_global_order_reversal() -> None:
+    events = [
+        _timed_event("xml-62", 62, 0, 24),
+        _timed_event("xml-60", 60, 48, 72),
+    ]
+    sources = [
+        _timed_source(0, 60, 100, 124),
+        _timed_source(1, 62, 148, 172),
+    ]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+    assert hints == {}
+    assert audit["applied"] is False
+    assert audit["reason"] == "provisional_alignment_global_order_reversed"
 
 
 def test_partial_chord_match_reports_unreferenced_units_by_unit_id() -> None:
