@@ -2736,6 +2736,8 @@ def _fine_tuplet_candidate(
         or event.tie is not None
         or any(value is not None for value in event.tie_types)
         or event.dots
+        or event.metadata.get("fine_grid_tuplet")
+        or event.metadata.get("fine_grid_tuplet_group_id")
         for event in group
     ):
         return False
@@ -2798,12 +2800,26 @@ def _fine_tuplet_repair(
         actual, normal = ratio
         event_ids: list[str] = []
         durations: list[int] = []
-        for offset, event in enumerate(events[start:end]):
+        for event in events[start:end]:
             event_ids.append(_event_musicxml_id(event) or f"score:{event.start_tick}:{event.end_tick}")
             durations.append(event.duration_tick)
+        group_id = ":".join(
+            [
+                "fine-grid",
+                voice_id,
+                str(events[start].start_tick),
+                str(events[end - 1].end_tick),
+                str(actual),
+                str(normal),
+                *event_ids,
+            ]
+        )
+        for offset, event in enumerate(events[start:end]):
             metadata = dict(event.metadata)
             metadata["fine_grid_tuplet"] = True
             metadata["fine_grid_tuplet_ratio"] = {"actual": actual, "normal": normal}
+            metadata["fine_grid_tuplet_group_id"] = group_id
+            metadata["fine_grid_tuplet_member_index"] = offset
             events[start + offset] = event.model_copy(
                 update={
                     "tuplet_actual": actual,
@@ -2817,6 +2833,8 @@ def _fine_tuplet_repair(
             "action": "annotate_exact_fine_grid_tuplet",
             "voice_id": voice_id,
             "musicxml_event_ids": event_ids,
+            "group_id": group_id,
+            "member_count": len(event_ids),
             "start_tick": events[start].start_tick,
             "end_tick": events[end - 1].end_tick,
             "duration_ticks": durations,
@@ -2832,6 +2850,102 @@ def _fine_tuplet_repair(
             events[event_index] = events[event_index].model_copy(update={"metadata": metadata})
         return events, repair
     return None
+
+
+def _is_fine_grid_tuplet_member(event: ScoreNote | None) -> bool:
+    return bool(event is not None and event.metadata.get("fine_grid_tuplet"))
+
+
+def _validate_fine_grid_tuplet_groups(events: list[ScoreNote], *, voice_id: str) -> None:
+    """Validate inferred fine-grid groups after all bounded repairs.
+
+    Inferred tuplets are a renderer representation of already-authoritative
+    event boundaries.  Later atom repairs must therefore never consume a group
+    member or move one of its boundaries.  Keep this check close to the repair
+    pass so a future mutation fails explicitly instead of reaching the
+    serializer as a misleading nested or unclosed group.
+    """
+
+    grouped: dict[str, list[ScoreNote]] = {}
+    repairs: dict[str, Mapping[str, Any]] = {}
+    for event in events:
+        marked = _is_fine_grid_tuplet_member(event)
+        group_id = event.metadata.get("fine_grid_tuplet_group_id")
+        if not marked and group_id is None:
+            continue
+        if not marked or not isinstance(group_id, str) or not group_id:
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplet member in voice {voice_id} has incomplete group metadata "
+                f"at tick {event.start_tick}"
+            )
+        repair = event.metadata.get("fine_grid_tuplet_repair")
+        if not isinstance(repair, Mapping) or repair.get("group_id") != group_id:
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplet group {group_id!r} in voice {voice_id} has inconsistent repair metadata"
+            )
+        grouped.setdefault(group_id, []).append(event)
+        previous = repairs.get(group_id)
+        if previous is not None and previous != repair:
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplet group {group_id!r} in voice {voice_id} has conflicting member metadata"
+            )
+        repairs[group_id] = repair
+
+    spans: list[tuple[int, int, str]] = []
+    for group_id, members in grouped.items():
+        repair = repairs[group_id]
+        expected_count = int(repair.get("member_count", 0))
+        expected_durations = [int(value) for value in repair.get("duration_ticks", [])]
+        expected_ids = [str(value) for value in repair.get("musicxml_event_ids", [])]
+        if len(members) != expected_count or len(expected_durations) != expected_count:
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplet group {group_id!r} in voice {voice_id} lost a member"
+            )
+        actual_ids = [
+            _event_musicxml_id(event) or f"score:{event.start_tick}:{event.end_tick}"
+            for event in members
+        ]
+        if actual_ids != expected_ids or [event.duration_tick for event in members] != expected_durations:
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplet group {group_id!r} in voice {voice_id} changed its event boundaries"
+            )
+        actual, normal = int(repair["tuplet_actual"]), int(repair["tuplet_normal"])
+        if any(
+            event.tuplet_actual != actual
+            or event.tuplet_normal != normal
+            or event.metadata.get("fine_grid_tuplet_member_index") != index
+            for index, event in enumerate(members)
+        ):
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplet group {group_id!r} in voice {voice_id} has inconsistent ratios or member order"
+            )
+        expected_boundaries = ["start", *([None] * (expected_count - 2)), "stop"]
+        if [event.tuplet_type for event in members] != expected_boundaries:
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplet group {group_id!r} in voice {voice_id} is not closed"
+            )
+        if any(left.end_tick != right.start_tick for left, right in zip(members, members[1:])):
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplet group {group_id!r} in voice {voice_id} has a timeline gap or overlap"
+            )
+        start_tick, end_tick = members[0].start_tick, members[-1].end_tick
+        if (
+            int(repair.get("start_tick", -1)) != start_tick
+            or int(repair.get("end_tick", -1)) != end_tick
+            or sum(event.duration_tick for event in members) != end_tick - start_tick
+        ):
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplet group {group_id!r} in voice {voice_id} did not preserve total ticks"
+            )
+        spans.append((start_tick, end_tick, group_id))
+
+    spans.sort()
+    for previous, current in zip(spans, spans[1:]):
+        if current[0] < previous[1]:
+            raise MusicXMLStandardizationError(
+                f"fine-grid tuplets in voice {voice_id} overlap or nest "
+                f"at tick {current[0]} ({previous[2]!r}, {current[2]!r})"
+            )
 
 
 def _set_tie_after_merge(event: ScoreNote, merged_pitches: set[int]) -> ScoreNote:
@@ -2993,6 +3107,8 @@ def _repair_fine_score_events(
             if (
                 current_pitches
                 and previous is not None
+                and not _is_fine_grid_tuplet_member(current)
+                and not _is_fine_grid_tuplet_member(previous)
                 and previous_pitches == current_pitches
                 and previous.end_tick == current.start_tick
                 and all(value in {"stop", "continue"} for value in current_ties)
@@ -3041,7 +3157,12 @@ def _repair_fine_score_events(
             # its onset when the resulting atom is exactly representable.  In
             # the MuseScore fragment that triggered this repair this is a
             # two-tick bass note shifted one tick earlier to become 3 ticks.
-            if previous is not None and previous.end_tick <= current.end_tick:
+            if (
+                previous is not None
+                and not _is_fine_grid_tuplet_member(current)
+                and not _is_fine_grid_tuplet_member(previous)
+                and previous.end_tick <= current.end_tick
+            ):
                 target_start = max(previous.end_tick, current.end_tick - MIN_JIANPU_ATOM_TICKS)
                 movement = target_start - current.start_tick
                 if (
@@ -3087,9 +3208,11 @@ def _repair_fine_score_events(
             # end movement in the source alignment.
             if (
                 current_pitches
+                and not _is_fine_grid_tuplet_member(current)
                 and current.duration_tick < MIN_JIANPU_ATOM_TICKS
                 and index + 1 < len(events)
                 and events[index + 1].is_rest
+                and not _is_fine_grid_tuplet_member(events[index + 1])
                 and events[index + 1].start_tick == current.end_tick
             ):
                 following = events[index + 1]
@@ -3142,7 +3265,14 @@ def _repair_fine_score_events(
             # without changing any pitched boundary.  This keeps the same
             # explicit policy available for an equivalent MuseScore rest
             # fragment.
-            if current.is_rest and previous is not None and previous.is_rest and previous.end_tick == current.start_tick:
+            if (
+                current.is_rest
+                and previous is not None
+                and previous.is_rest
+                and not _is_fine_grid_tuplet_member(current)
+                and not _is_fine_grid_tuplet_member(previous)
+                and previous.end_tick == current.start_tick
+            ):
                 events[index - 1] = previous.model_copy(
                     update={"duration_tick": current.end_tick - previous.start_tick}
                 )
@@ -3151,6 +3281,7 @@ def _repair_fine_score_events(
 
             index += 1
 
+        _validate_fine_grid_tuplet_groups(events, voice_id=voice.voice_id)
         repaired_voices.append(voice.model_copy(update={"events": events}))
     return repaired_voices, repairs
 

@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
+from backend.jianpu_score.domain import Score, ScoreNote, ScoreVoice
 from backend.jianpu_score.musicxml_standardize import (
     MusicXMLStandardizationError,
     WorkerEvent,
@@ -24,6 +25,7 @@ from backend.jianpu_score.musicxml_standardize import (
     WorkerTimeSignature,
     _normalize_worker_key,
     _key_sharps,
+    _repair_fine_score_events,
     standardize_musicxml_payload,
     standardize_musicxml,
     write_standardized_score,
@@ -1376,6 +1378,73 @@ def test_fine_grid_tuplet_fixture_renders_through_jianpu_and_lilypond(tmp_path: 
     assert Path(artifacts.jly_path).is_file()
     assert Path(artifacts.lilypond_path).is_file()
     assert artifacts.svg_paths and all(Path(path).is_file() for path in artifacts.svg_paths)
+
+
+def test_fine_grid_tuplet_repair_keeps_adjacent_group_closed_and_non_overlapping() -> None:
+    # The middle 1-tick note has a following 2-tick rest.  Before the guard,
+    # the ordinary atom repair consumed that rest after the 3:1 group had been
+    # inferred, deleting its stop member and making the next group appear
+    # nested at the same tick.
+    source = [
+        ("e78", 0, 12, None),
+        ("e79", 12, 2, 76),
+        ("e80", 14, 1, 75),
+        ("e81", 15, 1, 74),
+        ("e82", 16, 2, None),
+        ("e83", 18, 2, 73),
+        ("e84", 20, 1, 72),
+        ("e85", 21, 1, 83),
+    ]
+    voice = ScoreVoice(
+        voice_id="fine-grid-regression",
+        source_voice="1",
+        events=[
+            ScoreNote(
+                start_tick=start,
+                duration_tick=duration,
+                midi=midi,
+                metadata={"musicxml_event_id": event_id},
+            )
+            for event_id, start, duration, midi in source
+        ],
+    )
+
+    voices, repairs = _repair_fine_score_events([voice], [], total_ticks=22)
+    events = voices[0].events
+    assert [event.metadata["musicxml_event_id"] for event in events] == [item[0] for item in source]
+    assert [(event.start_tick, event.end_tick, event.tuplet_type) for event in events] == [
+        (0, 12, "start"),
+        (12, 14, "stop"),
+        (14, 15, "start"),
+        (15, 16, None),
+        (16, 18, "stop"),
+        (18, 20, "start"),
+        (20, 21, None),
+        (21, 22, "stop"),
+    ]
+    group_ids = [event.metadata["fine_grid_tuplet_group_id"] for event in events]
+    assert len(set(group_ids)) == 3
+    assert [item["musicxml_event_ids"] for item in repairs] == [
+        ["e78", "e79"],
+        ["e80", "e81", "e82"],
+        ["e83", "e84", "e85"],
+    ]
+
+    score = Score(
+        title="fine-grid regression",
+        bpm=120,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=22,
+        voices=voices,
+        metadata={
+            "timeline_measures": [
+                {"start_tick": 0, "duration_tick": 22, "end_tick": 22, "time_signature": "4/4"}
+            ]
+        },
+    )
+    assert "3:1[" in score_to_jianpu(score)
 
 
 def test_finer_binary_chord_tie_slots_clear_only_merged_pitches() -> None:
