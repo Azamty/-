@@ -1858,6 +1858,414 @@ def _dedupe_events(values: Iterable[Mapping[str, Any]], key: tuple[str, ...]) ->
     return result
 
 
+def _meter_bar_ticks(ratio: str) -> int:
+    numerator, denominator = (int(value) for value in _normalize_worker_meter(ratio).split("/", 1))
+    ticks = round(numerator * SCORE_QUARTER_TICKS * 4 / denominator)
+    if ticks <= 0:
+        raise MusicXMLStandardizationError(f"time signature {ratio!r} produces an empty measure")
+    return ticks
+
+
+def _payload_measure_metadata(payload: WorkerPayload) -> list[dict[str, Any]]:
+    return [
+        {
+            "part_index": measure.part_index,
+            "number": measure.number,
+            "start_tick": _quarter_to_tick(measure.start_quarter),
+            "duration_tick": _quarter_to_tick(measure.duration_quarter),
+            "end_tick": _quarter_to_tick(measure.end_quarter),
+            "time_signature": (
+                _normalize_worker_meter(str(measure.time_signature))
+                if measure.time_signature
+                else None
+            ),
+            "is_pickup": measure.is_pickup,
+        }
+        for measure in payload.measures
+    ]
+
+
+def _deduped_timeline_measure_metadata(measure_metadata: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse per-part/staff measure records into one auditable timeline."""
+
+    return sorted(
+        _dedupe_events(
+            (
+                {
+                    "start_tick": item["start_tick"],
+                    "duration_tick": item["duration_tick"],
+                    "end_tick": item["end_tick"],
+                    "time_signature": item["time_signature"],
+                    "is_pickup": item["is_pickup"],
+                    "number": item["number"],
+                }
+                for item in measure_metadata
+            ),
+            ("start_tick", "duration_tick", "end_tick", "is_pickup"),
+        ),
+        key=lambda item: (int(item["start_tick"]), int(item["end_tick"])),
+    )
+
+
+def _rebuild_meter_timeline(
+    imported_timeline: list[dict[str, Any]],
+    *,
+    total_ticks: int,
+    time_events: list[dict[str, Any]],
+    production_authoritative: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any], int]:
+    """Rebuild measure boundaries from the final conductor meter.
+
+    MusicXML/MuseScore may assign a short performance import an inferred
+    initial meter that disagrees with production BeatNet/manual metadata.  A
+    Score cannot keep those two authorities at the same boundary: the
+    serializer would reject the contradiction and users would see the wrong
+    bar grid.  Rebuild the timeline from the final meter events, retaining
+    explicit meter changes as boundaries (including a deliberately partial
+    segment when a change occurs mid nominal bar).
+    """
+
+    _validate_timeline_measures(imported_timeline, total_ticks)
+    if not imported_timeline:
+        raise MusicXMLStandardizationError("MusicXML contained no measure timeline")
+
+    events = sorted(
+        _dedupe_events(time_events, ("offset_quarter", "ratio")),
+        key=lambda item: float(item["offset_quarter"]),
+    )
+    final_events: list[dict[str, Any]] = []
+    for item in events:
+        offset = float(item["offset_quarter"])
+        if not math.isfinite(offset) or offset < 0:
+            raise MusicXMLStandardizationError(f"invalid meter event offset {offset!r}")
+        tick = _quarter_to_tick(offset)
+        if tick > total_ticks:
+            continue
+        ratio = _normalize_worker_meter(str(item["ratio"]))
+        numerator, denominator = (int(value) for value in ratio.split("/", 1))
+        final_events.append(
+            {
+                "start_tick": tick,
+                "time_signature": ratio,
+                "numerator": numerator,
+                "denominator": denominator,
+            }
+        )
+    if not final_events or final_events[0]["start_tick"] != 0:
+        imported_initial = imported_timeline[0].get("time_signature") or "4/4"
+        ratio = _normalize_worker_meter(str(imported_initial))
+        numerator, denominator = (int(value) for value in ratio.split("/", 1))
+        final_events.insert(
+            0,
+            {
+                "start_tick": 0,
+                "time_signature": ratio,
+                "numerator": numerator,
+                "denominator": denominator,
+            },
+        )
+    final_events_by_tick: dict[int, dict[str, Any]] = {}
+    for item in final_events:
+        tick = int(item["start_tick"])
+        previous = final_events_by_tick.get(tick)
+        if previous is not None and previous["time_signature"] != item["time_signature"]:
+            raise MusicXMLStandardizationError(
+                f"conflicting final meter events at tick {tick}: "
+                f"{previous['time_signature']} vs {item['time_signature']}"
+            )
+        final_events_by_tick[tick] = item
+    final_events = sorted(final_events_by_tick.values(), key=lambda item: int(item["start_tick"]))
+
+    def active_meter(tick: int) -> str:
+        current = str(final_events[0]["time_signature"])
+        for item in final_events:
+            if int(item["start_tick"]) > tick:
+                break
+            current = str(item["time_signature"])
+        return current
+
+    def imported_active_meter(tick: int) -> str:
+        current = str(imported_timeline[0].get("time_signature") or final_events[0]["time_signature"])
+        for item in imported_timeline:
+            if int(item["start_tick"]) > tick:
+                break
+            if item.get("time_signature"):
+                current = str(item["time_signature"])
+        return current
+
+    first_imported = imported_timeline[0]
+    pickup = bool(first_imported.get("is_pickup", False))
+    target_total_ticks = total_ticks
+    terminal_padding: dict[str, Any] | None = None
+
+    def build_timeline(limit: int) -> list[dict[str, Any]]:
+        cursor = 0
+        rebuilt: list[dict[str, Any]] = []
+        next_number = 1
+        if pickup:
+            initial_meter = active_meter(0)
+            initial_bar_ticks = _meter_bar_ticks(initial_meter)
+            pickup_end = int(first_imported["end_tick"])
+            if pickup_end <= 0 or pickup_end >= initial_bar_ticks:
+                raise MusicXMLStandardizationError(
+                    f"cannot safely rebar pickup: imported duration {pickup_end} is not shorter than "
+                    f"final {initial_meter} bar {initial_bar_ticks} ticks"
+                )
+            rebuilt.append(
+                {
+                    "start_tick": 0,
+                    "duration_tick": pickup_end,
+                    "end_tick": pickup_end,
+                    "time_signature": initial_meter,
+                    "is_pickup": True,
+                    "number": first_imported.get("number", 0),
+                    "rebar_reason": "preserved_imported_pickup",
+                }
+            )
+            cursor = pickup_end
+            next_number = 1
+
+        while cursor < limit:
+            meter = active_meter(cursor)
+            bar_ticks = _meter_bar_ticks(meter)
+            next_change = next(
+                (
+                    int(item["start_tick"])
+                    for item in final_events
+                    if int(item["start_tick"]) > cursor
+                ),
+                None,
+            )
+            end = min(limit, cursor + bar_ticks)
+            partial_reason = None
+            if next_change is not None and next_change < end:
+                # A real meter event is an authoritative boundary even when it
+                # lands in the middle of the previous nominal bar.  The
+                # shorter preceding span is explicit and keeps the score
+                # timeline exact.
+                end = next_change
+                partial_reason = "meter_change_inside_nominal_bar"
+            if end <= cursor:
+                raise MusicXMLStandardizationError(
+                    f"cannot safely rebar: meter boundary at tick {cursor} does not advance the timeline"
+                )
+            record: dict[str, Any] = {
+                "start_tick": cursor,
+                "duration_tick": end - cursor,
+                "end_tick": end,
+                "time_signature": meter,
+                "is_pickup": False,
+                "number": next_number,
+            }
+            if partial_reason:
+                record["rebar_reason"] = partial_reason
+            rebuilt.append(record)
+            cursor = end
+            next_number += 1
+        return rebuilt
+
+    rebuilt = build_timeline(target_total_ticks)
+    if not pickup and rebuilt:
+        imported_last = imported_timeline[-1]
+        imported_last_meter = imported_active_meter(int(imported_last["start_tick"]))
+        imported_last_bar_ticks = _meter_bar_ticks(imported_last_meter)
+        final_last = rebuilt[-1]
+        final_last_meter = str(final_last["time_signature"])
+        final_last_bar_ticks = _meter_bar_ticks(final_last_meter)
+        if (
+            production_authoritative
+            and
+            int(imported_last["duration_tick"]) == imported_last_bar_ticks
+            and int(final_last["duration_tick"]) < final_last_bar_ticks
+            and int(final_last["end_tick"]) == total_ticks
+        ):
+            target_total_ticks = int(final_last["start_tick"]) + final_last_bar_ticks
+            if target_total_ticks > total_ticks:
+                terminal_padding = {
+                    "applied": True,
+                    "start_tick": total_ticks,
+                    "end_tick": target_total_ticks,
+                    "duration_tick": target_total_ticks - total_ticks,
+                    "reason": "completed_terminal_bar_after_production_meter_rebar",
+                    "imported_meter": imported_last_meter,
+                    "final_meter": final_last_meter,
+                }
+                rebuilt = build_timeline(target_total_ticks)
+
+    _validate_timeline_measures(rebuilt, target_total_ticks)
+    imported_view = [
+        {
+            "start_tick": int(item["start_tick"]),
+            "duration_tick": int(item["duration_tick"]),
+            "end_tick": int(item["end_tick"]),
+            "time_signature": item.get("time_signature"),
+            "is_pickup": bool(item.get("is_pickup", False)),
+            "number": item.get("number"),
+        }
+        for item in imported_timeline
+    ]
+    final_view = [
+        {
+            "start_tick": int(item["start_tick"]),
+            "duration_tick": int(item["duration_tick"]),
+            "end_tick": int(item["end_tick"]),
+            "time_signature": str(item["time_signature"]),
+            "is_pickup": bool(item.get("is_pickup", False)),
+            "number": item.get("number"),
+            **(
+                {"rebar_reason": item["rebar_reason"]}
+                if item.get("rebar_reason") is not None
+                else {}
+            ),
+        }
+        for item in rebuilt
+    ]
+    comparable_imported = [
+        {
+            **item,
+            "time_signature": item["time_signature"] or imported_active_meter(item["start_tick"]),
+        }
+        for item in imported_view
+    ]
+    comparable_final = [
+        {key: value for key, value in item.items() if key != "rebar_reason"}
+        for item in final_view
+    ]
+    changed = comparable_imported != comparable_final
+    audit = {
+        "applied": changed,
+        "production_meter_authoritative": production_authoritative,
+        "imported_timeline": imported_view,
+        "final_timeline": final_view,
+        "reason": (
+            "production_meter_authoritative_rebuilt_timeline"
+            if production_authoritative and changed
+            else "conductor_meter_rebuilt_timeline"
+            if changed
+            else "timeline_already_matches_final_meter"
+        ),
+        "terminal_padding": terminal_padding,
+    }
+    return rebuilt, audit, target_total_ticks
+
+
+def _rebar_score_voices(
+    voices: list[ScoreVoice],
+    timeline: list[dict[str, Any]],
+) -> tuple[list[ScoreVoice], list[dict[str, Any]]]:
+    """Split events crossing new bars while preserving pitch and tie semantics."""
+
+    boundaries = sorted(
+        {
+            int(item["start_tick"])
+            for item in timeline
+            if int(item["start_tick"]) > 0
+        }
+    )
+    repairs: list[dict[str, Any]] = []
+
+    def measure_number(tick: int) -> int | None:
+        for item in timeline:
+            if int(item["start_tick"]) <= tick < int(item["end_tick"]):
+                value = item.get("number")
+                return int(value) if value is not None else None
+        return None
+
+    def tie_fields(event: ScoreNote, pitches: tuple[int, ...], *, first: bool, last: bool) -> tuple[str | None, list[str | None]]:
+        original = _event_tie_values(event)
+        if len(original) != len(pitches):
+            original = [event.tie] * len(pitches)
+        incoming = {
+            pitch
+            for pitch, tie in zip(pitches, original)
+            if tie in {"stop", "continue"}
+        }
+        outgoing = {
+            pitch
+            for pitch, tie in zip(pitches, original)
+            if tie in {"start", "continue"}
+        }
+        if not first:
+            incoming = set(pitches)
+        if not last:
+            outgoing = set(pitches)
+        values = [
+            "continue"
+            if pitch in incoming and pitch in outgoing
+            else "stop"
+            if pitch in incoming
+            else "start"
+            if pitch in outgoing
+            else None
+            for pitch in pitches
+        ]
+        tie = (
+            values[0]
+            if len(values) == 1
+            else values[0]
+            if values and all(value is not None and value == values[0] for value in values)
+            else None
+        )
+        tie_types = values if event.tie_types or any(value is not None for value in values) else []
+        return tie, tie_types
+
+    rebuilt_voices: list[ScoreVoice] = []
+    for voice in voices:
+        split_events: list[ScoreNote] = []
+        for event in voice.events:
+            start = int(event.start_tick)
+            end = int(event.end_tick)
+            cuts = [start, *(boundary for boundary in boundaries if start < boundary < end), end]
+            if len(cuts) == 2:
+                split_events.append(event)
+                continue
+            if event.tuplet_actual is not None or event.tuplet_normal is not None or event.tuplet_type is not None:
+                raise MusicXMLStandardizationError(
+                    f"cannot safely rebar explicit tuplet event {event.start_tick}:{event.end_tick} "
+                    "across a meter boundary"
+                )
+            pitches = _event_pitches(event)
+            segments: list[dict[str, Any]] = []
+            for index, (segment_start, segment_end) in enumerate(zip(cuts, cuts[1:])):
+                first = index == 0
+                last = index == len(cuts) - 2
+                tie, tie_types = tie_fields(event, pitches, first=first, last=last)
+                metadata = dict(event.metadata)
+                repair = {
+                    "reason": "meter_rebar_event_split",
+                    "voice_id": voice.voice_id,
+                    "musicxml_event_id": _event_musicxml_id(event),
+                    "original_start_tick": start,
+                    "original_end_tick": end,
+                    "segment_start_tick": segment_start,
+                    "segment_end_tick": segment_end,
+                    "segment_index": index,
+                    "segment_count": len(cuts) - 1,
+                    "pitches": list(pitches),
+                }
+                metadata["meter_rebar_split"] = repair
+                segments.append(
+                    {
+                        "start_tick": segment_start,
+                        "duration_tick": segment_end - segment_start,
+                        "tie": tie,
+                        "tie_types": tie_types,
+                        "dots": event.dots if len(cuts) == 2 else 0,
+                        "metadata": metadata,
+                        "measure_number": measure_number(segment_start),
+                        "tuplet_type": (
+                            event.tuplet_type
+                            if (event.tuplet_type == "continue" or (event.tuplet_type == "start" and first) or (event.tuplet_type == "stop" and last))
+                            else None
+                        ),
+                    }
+                )
+                repairs.append(repair)
+            split_events.extend(event.model_copy(update=segment) for segment in segments)
+        rebuilt_voices.append(voice.model_copy(update={"events": split_events}))
+    return rebuilt_voices, repairs
+
+
 def _validate_timeline_measures(measures: list[dict[str, Any]], total_ticks: int) -> None:
     if not measures:
         raise MusicXMLStandardizationError("MusicXML contained no measure timeline")
@@ -1983,6 +2391,69 @@ def _source_time_signature(performance_metadata: Mapping[str, Any] | None) -> tu
     return ratio, numerator, denominator
 
 
+def _source_time_signature_records(performance_metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Return production meter events, with the selected meter authoritative at zero.
+
+    Production metadata normally carries one selected meter.  Accepting an
+    optional event list keeps the standardizer correct for callers that carry
+    a real meter map as well, while still treating the explicit selected
+    meter/manual override as the highest-priority initial value.
+    """
+
+    if not performance_metadata:
+        return []
+    records: list[dict[str, Any]] = []
+    values = performance_metadata.get("time_signature_events", [])
+    if isinstance(values, list):
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            raw_offset = value.get("offset_quarter")
+            if raw_offset is None:
+                raw_tick = value.get("tick", value.get("start_tick"))
+                if raw_tick is None:
+                    continue
+                try:
+                    raw_offset = float(raw_tick) / PERFORMANCE_QUARTER_TICKS
+                except (TypeError, ValueError):
+                    continue
+            try:
+                offset = float(raw_offset)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(offset) or offset < 0:
+                continue
+            raw_ratio = value.get("ratio", value.get("time_signature"))
+            if not isinstance(raw_ratio, str):
+                continue
+            try:
+                ratio = _normalize_worker_meter(raw_ratio)
+            except MusicXMLStandardizationError:
+                continue
+            numerator, denominator = (int(item) for item in ratio.split("/", 1))
+            records.append(
+                {
+                    "offset_quarter": offset,
+                    "ratio": ratio,
+                    "numerator": numerator,
+                    "denominator": denominator,
+                }
+            )
+    selected = _source_time_signature(performance_metadata)
+    if selected is not None:
+        ratio, numerator, denominator = selected
+        records = [item for item in records if abs(float(item["offset_quarter"])) > 1e-9]
+        records.append(
+            {
+                "offset_quarter": 0.0,
+                "ratio": ratio,
+                "numerator": numerator,
+                "denominator": denominator,
+            }
+        )
+    return _dedupe_events(sorted(records, key=lambda item: float(item["offset_quarter"])), ("offset_quarter",))
+
+
 def _reconcile_conductor_metadata(
     payload: WorkerPayload,
     performance_metadata: Mapping[str, Any] | None,
@@ -2047,64 +2518,37 @@ def _reconcile_conductor_metadata(
         ),
         ("offset_quarter", "ratio"),
     )
-    source_time = _source_time_signature(performance_metadata)
+    source_time_records = _source_time_signature_records(performance_metadata)
     time_events = list(xml_time)
-    if source_time is not None:
-        ratio, numerator, denominator = source_time
-        xml_initial = next((item for item in time_events if abs(float(item["offset_quarter"])) <= 1e-9), None)
-        if xml_initial is None or xml_initial["ratio"] != ratio:
-            timeline_initial = next(
-                (
-                    measure
-                    for measure in payload.measures
-                    if abs(float(measure.start_quarter)) <= 1e-9 and measure.time_signature
+    for source in source_time_records:
+        offset = float(source["offset_quarter"])
+        matching = next(
+            (item for item in time_events if abs(float(item["offset_quarter"]) - offset) <= 1e-9),
+            None,
+        )
+        if matching is not None and matching["ratio"] == source["ratio"]:
+            continue
+        if matching is not None:
+            time_events = [
+                item
+                for item in time_events
+                if abs(float(item["offset_quarter"]) - offset) > 1e-9
+            ]
+        time_events.append(dict(source))
+        reconciliation.append(
+            {
+                "field": "time_signature",
+                "offset_quarter": offset,
+                "musicxml_value": matching["ratio"] if matching else None,
+                "production_value": source["ratio"],
+                "final_value": source["ratio"],
+                "reason": (
+                    "production_metadata_replaced_changed_initial_time_signature"
+                    if abs(offset) <= 1e-9
+                    else "production_metadata_replaced_changed_time_signature"
                 ),
-                None,
-            )
-            timeline_ratio = (
-                _normalize_worker_meter(str(timeline_initial.time_signature))
-                if timeline_initial is not None
-                else None
-            )
-            if xml_initial is not None and timeline_ratio == xml_initial["ratio"]:
-                # MuseScore can infer a different meter while laying out a
-                # short performance MIDI (especially when the first audible
-                # event is not on a downbeat).  The imported measure spans
-                # are the actual notation boundaries; replacing their
-                # initial event with the performance hint would create an
-                # internally contradictory Score.  Keep the timeline meter
-                # and retain the production value in the audit report.
-                reconciliation.append(
-                    {
-                        "field": "time_signature",
-                        "offset_quarter": 0.0,
-                        "musicxml_value": xml_initial["ratio"],
-                        "production_value": ratio,
-                        "final_value": xml_initial["ratio"],
-                        "reason": "production_metadata_preserved_imported_timeline_meter",
-                    }
-                )
-            else:
-                if xml_initial is not None:
-                    time_events = [item for item in time_events if abs(float(item["offset_quarter"])) > 1e-9]
-                time_events.append(
-                    {
-                        "offset_quarter": 0.0,
-                        "ratio": ratio,
-                        "numerator": numerator,
-                        "denominator": denominator,
-                    }
-                )
-                reconciliation.append(
-                    {
-                        "field": "time_signature",
-                        "offset_quarter": 0.0,
-                        "musicxml_value": xml_initial["ratio"] if xml_initial else None,
-                        "production_value": ratio,
-                        "final_value": ratio,
-                        "reason": "production_metadata_backfilled_changed_initial_time_signature",
-                    }
-                )
+            }
+        )
     time_events = sorted(time_events, key=lambda value: float(value["offset_quarter"]))
     if not time_events:
         time_events = [{"offset_quarter": 0.0, "ratio": "4/4", "numerator": 4, "denominator": 4}]
@@ -2183,6 +2627,14 @@ def standardize_musicxml_payload(
         *(measure.end_quarter for measure in payload.measures),
     )
     total_ticks = max(1, _quarter_to_tick(total_quarter))
+    measure_metadata = _payload_measure_metadata(payload)
+    imported_timeline = _deduped_timeline_measure_metadata(measure_metadata)
+    timeline_measures, meter_rebar, total_ticks = _rebuild_meter_timeline(
+        imported_timeline,
+        total_ticks=total_ticks,
+        time_events=conductor["time_events"],
+        production_authoritative=bool(_source_time_signature_records(performance_metadata)),
+    )
     raw_events, diagnostics = _worker_raw_events(payload)
     source_notes = _source_notes(performance_metadata)
     alignment = _align_source_notes(raw_events, source_notes) if source_notes else []
@@ -2242,6 +2694,9 @@ def standardize_musicxml_payload(
             )
     if not voices:
         raise MusicXMLStandardizationError("MusicXML contained no printable notes, chords, or rests")
+    meter_rebar_splits: list[dict[str, Any]] = []
+    if meter_rebar["applied"]:
+        voices, meter_rebar_splits = _rebar_score_voices(voices, timeline_measures)
     voices, dot_repairs = _repair_explicit_dots(voices)
     voices, fine_grid_repairs = _repair_fine_score_events(
         voices,
@@ -2255,36 +2710,6 @@ def standardize_musicxml_payload(
         if item.get("reason") in {"cross_voice_tuplet_marker_reassigned", "orphan_tuplet_marker_cleared"}
     ]
 
-    measure_metadata: list[dict[str, Any]] = []
-    for measure in payload.measures:
-        measure_metadata.append(
-            {
-                "part_index": measure.part_index,
-                "number": measure.number,
-                "start_tick": _quarter_to_tick(measure.start_quarter),
-                "duration_tick": _quarter_to_tick(measure.duration_quarter),
-                "end_tick": _quarter_to_tick(measure.end_quarter),
-                "time_signature": measure.time_signature,
-                "is_pickup": measure.is_pickup,
-            }
-        )
-    # A piano part is commonly split into one music21 part per staff.  Keep
-    # each source record above for auditability, but derive one timeline for
-    # duration checks so the same bar is not counted once per staff/part.
-    timeline_measures = _dedupe_events(
-        (
-            {
-                "start_tick": item["start_tick"],
-                "duration_tick": item["duration_tick"],
-                "end_tick": item["end_tick"],
-                "time_signature": item["time_signature"],
-                "is_pickup": item["is_pickup"],
-            }
-            for item in measure_metadata
-        ),
-        ("start_tick", "duration_tick", "end_tick", "is_pickup"),
-    )
-    _validate_timeline_measures(timeline_measures, total_ticks)
     time_signature_events = [
         {
             "start_tick": _quarter_to_tick(item["offset_quarter"]),
@@ -2357,9 +2782,14 @@ def standardize_musicxml_payload(
         ],
         "notation_grid_repairs": notation_grid_repairs,
         "tuplet_marker_repairs": tuplet_marker_repairs,
+        "meter_rebar": {
+            **meter_rebar,
+            "event_splits": meter_rebar_splits,
+            "event_split_count": len(meter_rebar_splits),
+        },
         "score_voice_count": len(voices),
         "source_to_score": alignment,
-        "repairs": diagnostics + notation_grid_repairs + lane_reasons,
+        "repairs": diagnostics + notation_grid_repairs + meter_rebar_splits + lane_reasons,
         "tie_voice_repairs": [
             item
             for item in diagnostics
@@ -2381,6 +2811,8 @@ def standardize_musicxml_payload(
         warnings.append("Finer MusicXML fragments required bounded jianpu atom repairs; inspect alignment_report.json")
     if tuplet_marker_repairs:
         warnings.append("MusicXML explicit tuplet markers were repaired only for an auditable orphan or cross-voice import artifact; inspect alignment_report.json")
+    if meter_rebar["applied"]:
+        warnings.append("Production meter authority rebuilt MusicXML measure boundaries; inspect alignment_report.json for imported/final spans and event splits")
     if any(item.get("reason") in {"tie_chain_voice_reassigned", "tie_chain_event_split"} for item in diagnostics):
         warnings.append("MusicXML tie fragments were normalized into serializable ScoreVoice lanes")
     if lane_reasons:
@@ -2413,9 +2845,18 @@ def standardize_musicxml_payload(
         "time_signature_events": time_signature_events,
         "key_signature_events": key_signature_events,
         "conductor_reconciliation": conductor["reconciliation"],
+        "meter_rebar": {
+            **meter_rebar,
+            "event_splits": meter_rebar_splits,
+            "event_split_count": len(meter_rebar_splits),
+        },
         "pickup": {
             "is_pickup": payload.pickup.is_pickup,
-            "duration_tick": _quarter_to_tick(payload.pickup.duration_quarter),
+            "duration_tick": (
+                _quarter_to_tick(payload.pickup.duration_quarter)
+                if payload.pickup.is_pickup
+                else 0
+            ),
             "measure_number": payload.pickup.measure_number,
         },
         "alignment_report": report,

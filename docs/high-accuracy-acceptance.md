@@ -15,6 +15,8 @@ BeatNet 依赖放在独立的 `.venv-model-beatnet`，MusicXML 标准化 worker 
 
 MusicXML 标准化器保留同声部的合法 3:2 tuplets；若 tie voice 重分配造成一个连续 bracket 的 start/stop 跨 ScoreVoice，只在无重叠、无 gap、marker ratio 一致且 tick 时值可序列化时把 fragment 归到 start voice，并在 `alignment_report.json` 的 `tuplet_marker_repairs` 中记录原 voice、目标 voice、tick 和原始 marker。孤立 marker 只有在清除后普通 48 TPQ 时值可序列化时才清除；同声部 gap、嵌套或不支持的 ratio 仍会失败。
 
+Production metadata 中的最终拍号（包括用户手动覆盖）优先于 MuseScore 从 performance MIDI 推断的初始拍号。若两者导致 MusicXML 小节边界不一致，标准化器会按最终的 `2/4`、`3/4`、`4/4` 或 `6/8` 以及明确的中途拍号事件重建 timeline；跨新小节线的音符、和弦、休止符会保留总时值，音符/和弦按 pitch 生成 `start/continue/stop` tie。若原始末小节在导入拍号下是完整小节、重划后只差一个尾部休止，标准化器会补足该尾部休止以满足 renderer 的完整小节约束，并在 audit 中记录补足范围。导入的 timeline、最终 meter、partial meter-change boundary 和每次事件拆分都会写入 `alignment_report.json`；tuplets 跨新边界无法安全保持时明确失败，不静默保留冲突拍号。
+
 生产 BeatNet 的速度候选会保留模型 note onset、原曲 onset 和可用 Demucs drums/bass onset 的来源名称与数量；传入 `source_onsets` 的映射会让 `beat_grid.tempo.evidence_sources` 显示实际参与候选排序的多源证据，而不是把所有生产路由压成一个无来源的 `all` 序列。该证据只对 BeatNet 已返回的 half/original/double 候选排序，不替换拍点，也不会自动把鼓/贝斯 onset 当成独立拍号真值；拍号仍保留候选和低置信度告警。
 
 MuseScore 也可以直接启动检查安装（项目解包目录或系统安装目录二选一）：

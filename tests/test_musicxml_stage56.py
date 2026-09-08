@@ -1183,7 +1183,7 @@ def test_production_conductor_metadata_backfills_initial_values_only() -> None:
     assert any(item["field"] == "key" for item in report["conductor_reconciliation"])
 
 
-def test_production_meter_hint_preserves_imported_timeline_when_it_conflicts() -> None:
+def test_production_meter_hint_rebars_conflicting_imported_timeline() -> None:
     payload = _tuplet_marker_payload(
         [WorkerEvent(event_id="rest", kind="rest", offset_quarter=0, duration_quarter=3, voice="1")]
     )
@@ -1201,25 +1201,140 @@ def test_production_meter_hint_preserves_imported_timeline_when_it_conflicts() -
     ]
     payload.measures = list(payload.parts[0].measures)
     payload.time_signature_events = [WorkerTimeSignature(offset_quarter=0, ratio="3/4", numerator=3, denominator=4)]
+    payload.pickup = WorkerPickup(is_pickup=False, duration_quarter=3, measure_number=1)
 
     score, report = standardize_musicxml_payload(
         payload,
         performance_metadata={"time_signature": "4/4"},
     )
 
-    assert score.time_signature == "3/4"
+    assert score.time_signature == "4/4"
     assert score.metadata["time_signature_events"] == [{
         "start_tick": 0,
-        "time_signature": "3/4",
-        "numerator": 3,
+        "time_signature": "4/4",
+        "numerator": 4,
         "denominator": 4,
     }]
     assert any(
-        item["reason"] == "production_metadata_preserved_imported_timeline_meter"
+        item["reason"] == "production_metadata_replaced_changed_initial_time_signature"
         and item["production_value"] == "4/4"
-        and item["final_value"] == "3/4"
+        and item["final_value"] == "4/4"
         for item in report["conductor_reconciliation"]
     )
+    assert report["meter_rebar"]["applied"] is True
+    assert report["meter_rebar"]["imported_timeline"][0]["time_signature"] == "3/4"
+    assert report["meter_rebar"]["final_timeline"][0]["time_signature"] == "4/4"
+    assert score.metadata["pickup"]["duration_tick"] == 0
+    assert score.total_ticks == 192
+    assert report["meter_rebar"]["terminal_padding"]["duration_tick"] == 48
+    assert score_to_jianpu(score)
+
+
+def test_production_meter_rebar_splits_cross_measure_chord_and_preserves_ties() -> None:
+    payload = _tuplet_marker_payload(
+        [
+            WorkerEvent(
+                event_id="crossing-chord",
+                kind="chord",
+                offset_quarter=1,
+                duration_quarter=4,
+                pitches=[60, 64],
+                voice="1",
+            ),
+            WorkerEvent(event_id="leading-rest", kind="rest", offset_quarter=0, duration_quarter=1, voice="1"),
+            WorkerEvent(event_id="trailing-rest", kind="rest", offset_quarter=5, duration_quarter=3, voice="1"),
+        ]
+    )
+    payload.highest_time_quarter = 8
+    payload.parts[0].highest_time_quarter = 8
+    payload.parts[0].measures = [
+        WorkerMeasure(part_index=0, number=1, start_quarter=0, duration_quarter=3, end_quarter=3, time_signature="3/4"),
+        WorkerMeasure(part_index=0, number=2, start_quarter=3, duration_quarter=3, end_quarter=6, time_signature="3/4"),
+        WorkerMeasure(part_index=0, number=3, start_quarter=6, duration_quarter=2, end_quarter=8, time_signature="3/4"),
+    ]
+    payload.measures = list(payload.parts[0].measures)
+    payload.time_signature_events = [WorkerTimeSignature(offset_quarter=0, ratio="3/4", numerator=3, denominator=4)]
+
+    score, report = standardize_musicxml_payload(
+        payload,
+        performance_metadata={"time_signature": "4/4", "manual_time_signature_override": True},
+    )
+
+    voice = next(voice for voice in score.voices if voice.source_voice == "1")
+    chord_segments = [event for event in voice.events if event.chord_pitches == [60, 64]]
+    assert [(event.start_tick, event.duration_tick, event.tie_types) for event in chord_segments] == [
+        (48, 144, ["start", "start"]),
+        (192, 48, ["stop", "stop"]),
+    ]
+    assert sum(event.duration_tick for event in chord_segments) == 192
+    _validate_explicit_ties(voice)
+    assert report["meter_rebar"]["event_split_count"] == 2
+    assert score_to_jianpu(score)
+
+
+@pytest.mark.parametrize(
+    ("meter", "expected_starts"),
+    [
+        ("2/4", [0, 96, 192, 288]),
+        ("3/4", [0, 144, 288]),
+        ("4/4", [0, 192]),
+        ("6/8", [0, 144, 288]),
+    ],
+)
+def test_production_manual_meter_rebar_supports_supported_meters(
+    meter: str, expected_starts: list[int]
+) -> None:
+    payload = _tuplet_marker_payload([WorkerEvent(event_id="rest", kind="rest", offset_quarter=0, duration_quarter=8, voice="1")])
+    payload.highest_time_quarter = 8
+    payload.parts[0].highest_time_quarter = 8
+    payload.parts[0].measures = [
+        WorkerMeasure(part_index=0, number=1, start_quarter=0, duration_quarter=4, end_quarter=4, time_signature="4/4"),
+        WorkerMeasure(part_index=0, number=2, start_quarter=4, duration_quarter=4, end_quarter=8, time_signature="4/4"),
+    ]
+    payload.measures = list(payload.parts[0].measures)
+    payload.time_signature_events = [WorkerTimeSignature(offset_quarter=0, ratio="4/4", numerator=4, denominator=4)]
+
+    score, _report = standardize_musicxml_payload(
+        payload,
+        performance_metadata={"time_signature": meter, "manual_time_signature_override": True},
+    )
+
+    assert score.time_signature == meter
+    assert [item["start_tick"] for item in score.metadata["timeline_measures"]] == expected_starts
+    assert all(item["time_signature"] == meter for item in score.metadata["timeline_measures"])
+    assert score_to_jianpu(score)
+
+
+def test_production_meter_change_inside_nominal_bar_rebars_and_splits_event() -> None:
+    payload = _tuplet_marker_payload(
+        [WorkerEvent(event_id="long-note", kind="note", offset_quarter=0, duration_quarter=4, pitches=[60], voice="1")]
+    )
+    payload.highest_time_quarter = 4
+    payload.parts[0].highest_time_quarter = 4
+    payload.parts[0].measures = [
+        WorkerMeasure(part_index=0, number=1, start_quarter=0, duration_quarter=4, end_quarter=4, time_signature="4/4")
+    ]
+    payload.measures = list(payload.parts[0].measures)
+    payload.time_signature_events = [
+        WorkerTimeSignature(offset_quarter=0, ratio="4/4", numerator=4, denominator=4),
+        WorkerTimeSignature(offset_quarter=2, ratio="3/4", numerator=3, denominator=4),
+    ]
+
+    score, report = standardize_musicxml_payload(payload, performance_metadata={"time_signature": "4/4"})
+
+    assert [(item["start_tick"], item["end_tick"], item["time_signature"]) for item in score.metadata["timeline_measures"]] == [
+        (0, 96, "4/4"),
+        (96, 240, "3/4"),
+    ]
+    note_segments = [event for voice in score.voices for event in voice.events if event.midi == 60]
+    assert [(event.start_tick, event.duration_tick, event.tie) for event in note_segments] == [
+        (0, 96, "start"),
+        (96, 96, "stop"),
+    ]
+    assert report["meter_rebar"]["final_timeline"][0]["rebar_reason"] == "meter_change_inside_nominal_bar"
+    assert report["meter_rebar"]["event_split_count"] == 2
+    for voice in score.voices:
+        _validate_explicit_ties(voice)
     assert score_to_jianpu(score)
 
 
