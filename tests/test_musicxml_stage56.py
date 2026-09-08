@@ -434,6 +434,94 @@ def test_score_normalizer_rejoins_cross_voice_tuplet_fragment_without_moving_tim
     assert score_to_jianpu(score)
 
 
+def test_score_normalizer_reassembles_complete_tuplet_split_by_tied_chord_voice_repair() -> None:
+    payload = _tuplet_marker_payload(
+        [
+            WorkerEvent(
+                event_id="lead-chord",
+                kind="chord",
+                offset_quarter=0,
+                duration_quarter=3 / 8,
+                pitches=[60, 80],
+                tie_types=["start", None],
+                voice="1",
+            ),
+            WorkerEvent(
+                event_id="bridge-chord",
+                kind="chord",
+                offset_quarter=3 / 8,
+                duration_quarter=1 / 8,
+                pitches=[60, 81],
+                tie_types=["continue", None],
+                voice="2",
+            ),
+            WorkerEvent(
+                event_id="source-tuplet-start",
+                kind="note",
+                offset_quarter=1 / 2,
+                duration_quarter=1 / 6,
+                pitches=[60],
+                tie="continue",
+                tie_types=["continue"],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="start",
+                voice="2",
+            ),
+            WorkerEvent(
+                event_id="source-tuplet-middle",
+                kind="chord",
+                offset_quarter=2 / 3,
+                duration_quarter=1 / 6,
+                pitches=[60, 64],
+                tie_types=["stop", None],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                voice="2",
+            ),
+            WorkerEvent(
+                event_id="source-tuplet-stop",
+                kind="note",
+                offset_quarter=5 / 6,
+                duration_quarter=1 / 6,
+                pitches=[65],
+                tuplet_actual=3,
+                tuplet_normal=2,
+                tuplet_type="stop",
+                voice="2",
+            ),
+            WorkerEvent(event_id="tail", kind="rest", offset_quarter=1, duration_quarter=3, voice="1"),
+        ]
+    )
+
+    score, report = standardize_musicxml_payload(payload)
+
+    repair = next(
+        item for item in report["tuplet_marker_repairs"] if item["reason"] == "cross_voice_tuplet_marker_reassembled"
+    )
+    assert repair["voice"] == "2"
+    assert repair["target_voice"] == "1"
+    assert (repair["start_tick"], repair["end_tick"]) == (24, 48)
+    assert (repair["actual_ticks"], repair["nominal_ticks"]) == (24, 36)
+    assert repair["source_event_ids"] == [
+        "source-tuplet-start",
+        "source-tuplet-middle",
+        "source-tuplet-stop",
+    ]
+    notes = [
+        event
+        for voice in score.voices
+        for event in voice.events
+        if event.metadata.get("musicxml_event_id", "").startswith("source-tuplet")
+    ]
+    assert [(event.start_tick, event.end_tick, event.chord_pitches, event.tuplet_type) for event in notes] == [
+        (24, 32, [60], "start"),
+        (32, 40, [60, 64], None),
+        (40, 48, [65], "stop"),
+    ]
+    assert score_to_jianpu(score)
+
+
 def test_score_normalizer_does_not_hide_same_voice_tuplet_gap() -> None:
     payload = _tuplet_marker_payload(
         [

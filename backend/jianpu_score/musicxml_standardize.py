@@ -467,13 +467,17 @@ def _worker_raw_events(payload: WorkerPayload) -> tuple[list[_RawEvent], list[di
                     metadata={"musicxml_event_id": item.event_id},
                 )
             )
+    diagnostics.extend(_annotate_source_tuplet_groups(events))
     diagnostics.extend(_normalize_tied_event_voices(events))
+    diagnostics.extend(_reassemble_split_source_tuplets(events))
     diagnostics.extend(_normalize_orphan_tuplet_markers(events))
     # A cross-voice tuplet repair can move a fragment that starts a tie.  Run
     # the same conservative tie-chain pass once more so its unique successor
     # follows the repaired fragment; otherwise the serializer would report a
     # dangling tie even though the original import was unambiguous.
     diagnostics.extend(_normalize_tied_event_voices(events))
+    for event in events:
+        event.metadata.pop(_SOURCE_TUPLET_GROUP_KEY, None)
     return events, diagnostics
 
 
@@ -650,6 +654,371 @@ def _normalize_tied_event_voices(events: list[_RawEvent]) -> list[dict[str, Any]
                 )
             )
     events[:] = normalized
+    return repairs
+
+
+_SOURCE_TUPLET_GROUP_KEY = "_source_tuplet_group"
+
+
+def _source_event_id(event: _RawEvent) -> str:
+    value = event.metadata.get("musicxml_event_id")
+    return str(value) if value is not None else event.event_id.split(":tie-voice-", 1)[0]
+
+
+def _annotate_source_tuplet_groups(events: list[_RawEvent]) -> list[dict[str, Any]]:
+    """Record complete MusicXML tuplet groups before tie voice normalization.
+
+    Tie repair can split one MusicXML chord into multiple ScoreVoice fragments.
+    We retain a compact source group only when the original worker events prove
+    a single ratio, contiguous boundaries, and a closed actual/nominal span.
+    Later repair may then reassemble that exact source group; incomplete or
+    ambiguous markers receive no annotation and remain serializer errors.
+    """
+
+    grouped: dict[tuple[str, int, str, tuple[int, int]], list[_RawEvent]] = {}
+    for event in events:
+        ratio = _raw_tuplet_ratio(event)
+        if ratio is None or ratio != (3, 2):
+            continue
+        grouped.setdefault((event.part_group, event.staff, event.voice, ratio), []).append(event)
+    diagnostics: list[dict[str, Any]] = []
+    group_number = 0
+    for (part_group, staff, voice, ratio), candidates in grouped.items():
+        ordered = sorted(candidates, key=lambda event: (event.start_tick, event.end_tick, event.event_id))
+        for start in (event for event in ordered if event.tuplet_type == "start"):
+            stops = [
+                event
+                for event in ordered
+                if event.tuplet_type == "stop" and event.start_tick >= start.end_tick
+            ]
+            if not stops:
+                continue
+            stop = stops[0]
+            component = _raw_tuplet_span(events, start, stop, allow_cross_voice=False)
+            if component is None:
+                continue
+            source_event_ids = [_source_event_id(event) for event in component]
+            if len(source_event_ids) != len(set(source_event_ids)):
+                continue
+            actual_ticks = sum(event.end_tick - event.start_tick for event in component)
+            nominal_durations = [
+                Fraction((event.end_tick - event.start_tick) * ratio[0], ratio[1]) for event in component
+            ]
+            nominal_ticks = sum(nominal_durations, Fraction(0))
+            if (
+                nominal_ticks.denominator != 1
+                or nominal_ticks <= 0
+                or any(value.denominator != 1 or value <= 0 for value in nominal_durations)
+            ):
+                continue
+            group_number += 1
+            group_id = f"{part_group}:{staff}:{voice}:{start.start_tick}:{stop.end_tick}:{group_number}"
+            members = [
+                {
+                    "event_id": _source_event_id(event),
+                    "start_tick": event.start_tick,
+                    "end_tick": event.end_tick,
+                    "pitches": list(event.pitches),
+                    "kind": event.kind,
+                    "tie": event.tie,
+                    "tie_types": list(event.tie_types),
+                    "tuplet_actual": event.tuplet_actual,
+                    "tuplet_normal": event.tuplet_normal,
+                    "tuplet_type": event.tuplet_type,
+                    "dots": event.dots,
+                    "measure_number": event.measure_number,
+                }
+                for event in component
+            ]
+            group = {
+                "group_id": group_id,
+                "part_group": part_group,
+                "staff": staff,
+                "source_voice": voice,
+                "tuplet_actual": ratio[0],
+                "tuplet_normal": ratio[1],
+                "start_tick": start.start_tick,
+                "end_tick": stop.end_tick,
+                "actual_ticks": actual_ticks,
+                "nominal_ticks": int(nominal_ticks),
+                "nominal_duration_ticks": [int(value) for value in nominal_durations],
+                "source_event_ids": source_event_ids,
+                "members": members,
+            }
+            for event in component:
+                metadata = dict(event.metadata)
+                metadata[_SOURCE_TUPLET_GROUP_KEY] = group
+                event.metadata = metadata
+            diagnostics.append(
+                {
+                    "reason": "complete_source_tuplet_group_recorded",
+                    "action": "retained_source_tuplet_group_for_voice_reconciliation",
+                    "group_id": group_id,
+                    "part_group": part_group,
+                    "staff": staff,
+                    "voice": voice,
+                    "start_tick": start.start_tick,
+                    "end_tick": stop.end_tick,
+                    "tuplet_actual": ratio[0],
+                    "tuplet_normal": ratio[1],
+                    "source_event_ids": source_event_ids,
+                    "actual_ticks": actual_ticks,
+                    "nominal_ticks": int(nominal_ticks),
+                    "nominal_duration_ticks": [int(value) for value in nominal_durations],
+                }
+            )
+    return diagnostics
+
+
+def _reassemble_split_source_tuplets(events: list[_RawEvent]) -> list[dict[str, Any]]:
+    """Reassemble only a proven source tuplet split by tie voice repair."""
+
+    groups: dict[str, dict[str, Any]] = {}
+    grouped_events: dict[str, list[_RawEvent]] = {}
+    for event in events:
+        group = event.metadata.get(_SOURCE_TUPLET_GROUP_KEY)
+        if not isinstance(group, Mapping):
+            continue
+        group_id = str(group.get("group_id", ""))
+        if not group_id:
+            continue
+        groups[group_id] = dict(group)
+        grouped_events.setdefault(group_id, []).append(event)
+
+    repairs: list[dict[str, Any]] = []
+    remove_ids: set[int] = set()
+    replacements: list[_RawEvent] = []
+    for group_id, group_events in grouped_events.items():
+        group = groups[group_id]
+        source_event_ids = [str(value) for value in group.get("source_event_ids", [])]
+        audit = {
+            "group_id": group_id,
+            "part_group": group.get("part_group"),
+            "staff": group.get("staff"),
+            "voice": group.get("source_voice"),
+            "start_tick": group.get("start_tick"),
+            "end_tick": group.get("end_tick"),
+            "tuplet_actual": group.get("tuplet_actual"),
+            "tuplet_normal": group.get("tuplet_normal"),
+            "actual_ticks": group.get("actual_ticks"),
+            "nominal_ticks": group.get("nominal_ticks"),
+            "nominal_duration_ticks": group.get("nominal_duration_ticks"),
+            "source_event_ids": source_event_ids,
+        }
+        members = group.get("members")
+        if not source_event_ids or not isinstance(members, list) or len(members) != len(source_event_ids):
+            continue
+        source_members = {str(item.get("event_id")): item for item in members if isinstance(item, Mapping)}
+        if set(source_members) != set(source_event_ids):
+            continue
+        by_source: dict[str, list[_RawEvent]] = {event_id: [] for event_id in source_event_ids}
+        invalid = False
+        for event in group_events:
+            source_id = _source_event_id(event)
+            member = source_members.get(source_id)
+            if member is None:
+                invalid = True
+                break
+            if (
+                event.part_group != group.get("part_group")
+                or event.staff != int(group.get("staff", event.staff))
+                or event.start_tick != int(member["start_tick"])
+                or event.end_tick != int(member["end_tick"])
+                or _raw_tuplet_ratio(event) != (int(group["tuplet_actual"]), int(group["tuplet_normal"]))
+            ):
+                invalid = True
+                break
+            by_source[source_id].append(event)
+        if invalid or any(not values for values in by_source.values()):
+            continue
+        voices = {event.voice for event in group_events}
+        repaired_voices = {
+            str(event.metadata.get("tie_voice_repair", {}).get("target_voice"))
+            for event in group_events
+            if isinstance(event.metadata.get("tie_voice_repair"), Mapping)
+            and event.metadata["tie_voice_repair"].get("target_voice") is not None
+        }
+        repaired_voices.discard("None")
+        if len(repaired_voices) != 1 or len(voices) <= 1:
+            # A source group that did not split because of the known tie repair
+            # has no basis for a cross-voice reconstruction.
+            if len(voices) > 1:
+                repairs.append(
+                    {
+                        **audit,
+                        "reason": "cross_voice_tuplet_marker_conflict",
+                        "action": "preserved_split_tuplet_due_to_ambiguous_voice_repair",
+                        "conflict": "missing_unique_tie_repair_target",
+                        "candidate_voices": sorted(voices),
+                        "candidate_repair_voices": sorted(repaired_voices),
+                        "original_marker": [
+                            {
+                                "musicxml_event_id": str(member["event_id"]),
+                                "tuplet_actual": member.get("tuplet_actual"),
+                                "tuplet_normal": member.get("tuplet_normal"),
+                                "tuplet_type": member.get("tuplet_type"),
+                            }
+                            for member in members
+                        ],
+                    }
+                )
+            continue
+        target_voice = next(iter(repaired_voices))
+        target_staff = int(group["staff"])
+        group_event_ids = {id(event) for event in group_events}
+        for event in events:
+            if id(event) in group_event_ids:
+                continue
+            if event.part_group != group.get("part_group") or event.staff != target_staff or event.voice != target_voice:
+                continue
+            if any(
+                event.start_tick < int(member["end_tick"]) and int(member["start_tick"]) < event.end_tick
+                for member in members
+            ):
+                invalid = True
+                break
+        if invalid:
+            repairs.append(
+                {
+                    **audit,
+                    "reason": "cross_voice_tuplet_marker_conflict",
+                    "action": "preserved_split_tuplet_due_to_target_voice_overlap",
+                    "conflict": "target_voice_overlap",
+                    "target_voice": target_voice,
+                }
+            )
+            continue
+
+        reconstructed: list[_RawEvent] = []
+        for member in members:
+            source_id = str(member["event_id"])
+            fragments = by_source[source_id]
+            expected_pitches = [int(value) for value in member.get("pitches", [])]
+            fragment_pitches = [pitch for event in fragments for pitch in event.pitches]
+            if sorted(fragment_pitches) != sorted(expected_pitches) or len(fragment_pitches) != len(set(fragment_pitches)):
+                invalid = True
+                break
+            template = fragments[0]
+            tie_by_pitch: dict[int, str | None] = {}
+            for fragment in fragments:
+                for pitch_index, pitch in enumerate(fragment.pitches):
+                    if pitch in tie_by_pitch:
+                        invalid = True
+                        break
+                    tie_by_pitch[pitch] = (
+                        fragment.tie_types[pitch_index]
+                        if pitch_index < len(fragment.tie_types)
+                        else fragment.tie
+                    )
+                if invalid:
+                    break
+            if invalid:
+                break
+            tie_types = [tie_by_pitch.get(pitch) for pitch in expected_pitches]
+            present_ties = [value for value in tie_types if value is not None]
+            tie = (
+                present_ties[0]
+                if present_ties and len(present_ties) == len(tie_types) and all(value == present_ties[0] for value in present_ties)
+                else None
+            )
+            repair = {
+                "reason": "cross_voice_tuplet_marker_reassembled",
+                "action": "reassembled_complete_source_tuplet_after_tie_voice_split",
+                "group_id": group_id,
+                "part_group": group["part_group"],
+                "staff": target_staff,
+                "voice": group["source_voice"],
+                "target_voice": target_voice,
+                "start_tick": int(group["start_tick"]),
+                "end_tick": int(group["end_tick"]),
+                "tuplet_actual": int(group["tuplet_actual"]),
+                "tuplet_normal": int(group["tuplet_normal"]),
+                "actual_ticks": int(group["actual_ticks"]),
+                "nominal_ticks": int(group["nominal_ticks"]),
+                "nominal_duration_ticks": list(group.get("nominal_duration_ticks", [])),
+                "source_event_ids": source_event_ids,
+                "source_event_id": source_id,
+                "original_marker": {
+                    "tuplet_actual": member.get("tuplet_actual"),
+                    "tuplet_normal": member.get("tuplet_normal"),
+                    "tuplet_type": member.get("tuplet_type"),
+                },
+                "timing_preserved": True,
+                "pitch_multiset_preserved": True,
+                "one_to_one_source_events": True,
+            }
+            metadata = dict(template.metadata)
+            metadata.pop(_SOURCE_TUPLET_GROUP_KEY, None)
+            metadata["tuplet_boundary_repair"] = repair
+            reconstructed.append(
+                _RawEvent(
+                    event_id=source_id,
+                    part_group=template.part_group,
+                    part_id=template.part_id,
+                    staff=target_staff,
+                    voice=target_voice,
+                    start_tick=int(member["start_tick"]),
+                    end_tick=int(member["end_tick"]),
+                    pitches=expected_pitches,
+                    kind=str(member.get("kind", template.kind)),
+                    tie=tie,
+                    tie_types=tie_types if expected_pitches else [],
+                    tuplet_actual=int(member["tuplet_actual"]) if member.get("tuplet_actual") is not None else None,
+                    tuplet_normal=int(member["tuplet_normal"]) if member.get("tuplet_normal") is not None else None,
+                    tuplet_type=member.get("tuplet_type"),
+                    dots=int(member.get("dots", template.dots)),
+                    measure_number=member.get("measure_number"),
+                    metadata=metadata,
+                )
+            )
+        if invalid:
+            repairs.append(
+                {
+                    **audit,
+                    "reason": "cross_voice_tuplet_marker_conflict",
+                    "action": "preserved_split_tuplet_due_to_pitch_or_tie_mismatch",
+                    "conflict": "source_pitch_or_tie_slot_mismatch",
+                    "target_voice": target_voice,
+                }
+            )
+            continue
+        remove_ids.update(group_event_ids)
+        replacements.extend(reconstructed)
+        repairs.append(
+            {
+                "reason": "cross_voice_tuplet_marker_reassembled",
+                "action": "reassembled_complete_source_tuplet_after_tie_voice_split",
+                "group_id": group_id,
+                "part_group": group["part_group"],
+                "staff": target_staff,
+                "voice": group["source_voice"],
+                "target_voice": target_voice,
+                "start_tick": int(group["start_tick"]),
+                "end_tick": int(group["end_tick"]),
+                "tuplet_actual": int(group["tuplet_actual"]),
+                "tuplet_normal": int(group["tuplet_normal"]),
+                "actual_ticks": int(group["actual_ticks"]),
+                "nominal_ticks": int(group["nominal_ticks"]),
+                "nominal_duration_ticks": list(group.get("nominal_duration_ticks", [])),
+                "source_event_ids": source_event_ids,
+                "original_marker": [
+                    {
+                        "musicxml_event_id": str(member["event_id"]),
+                        "tuplet_actual": member.get("tuplet_actual"),
+                        "tuplet_normal": member.get("tuplet_normal"),
+                        "tuplet_type": member.get("tuplet_type"),
+                    }
+                    for member in members
+                ],
+                "timing_preserved": True,
+                "pitch_multiset_preserved": True,
+                "one_to_one_source_events": True,
+            }
+        )
+    if remove_ids:
+        events[:] = [event for event in events if id(event) not in remove_ids]
+        events.extend(replacements)
+        events.sort(key=lambda event: (event.part_group, event.staff, event.start_tick, event.end_tick, event.voice, event.event_id))
     return repairs
 
 
@@ -3666,7 +4035,13 @@ def standardize_musicxml_payload(
     tuplet_marker_repairs = [
         item
         for item in diagnostics
-        if item.get("reason") in {"cross_voice_tuplet_marker_reassigned", "orphan_tuplet_marker_cleared"}
+        if item.get("reason")
+        in {
+            "cross_voice_tuplet_marker_reassigned",
+            "cross_voice_tuplet_marker_reassembled",
+            "cross_voice_tuplet_marker_conflict",
+            "orphan_tuplet_marker_cleared",
+        }
     ]
 
     time_signature_events = [
