@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_OUTPUT = ROOT / "artifacts" / "review" / "high-accuracy-benchmark" / "latest.json"
 MidiNote = tuple[int, Fraction, Fraction]
+UNMATCHED_NOTE_PENALTY_QUARTERS = Fraction(1, 1)
 
 
 def _sha256(path: Path) -> str:
@@ -146,15 +147,38 @@ def rhythm_error(reference: Sequence[MidiNote], predicted: Sequence[MidiNote], *
             _, ref_start, ref_end = reference[ref_index]
             onset_errors.append(abs(start - ref_start))
             duration_errors.append(abs((end - start) - (ref_end - ref_start)))
-    mean_onset = sum(onset_errors, Fraction(0)) / len(onset_errors) if onset_errors else None
-    mean_duration = sum(duration_errors, Fraction(0)) / len(duration_errors) if duration_errors else None
+    reference_count = len(reference)
+    predicted_count = len(predicted)
+    matched_count = len(onset_errors)
+    false_negatives = reference_count - matched_count
+    false_positives = predicted_count - matched_count
+    mean_onset = sum(onset_errors, Fraction(0)) / matched_count if onset_errors else None
+    mean_duration = sum(duration_errors, Fraction(0)) / matched_count if duration_errors else None
     combined = [onset + duration for onset, duration in zip(onset_errors, duration_errors, strict=True)]
     mean_combined = sum(combined, Fraction(0)) / len(combined) if combined else None
+    fixed_total_cost = sum(combined, Fraction(0)) + UNMATCHED_NOTE_PENALTY_QUARTERS * (false_negatives + false_positives)
+    fixed_total_denominator = max(1, reference_count)
     return {
-        "matched_notes": len(onset_errors),
+        "matched_notes": matched_count,
+        "reference_notes": reference_count,
+        "predicted_notes": predicted_count,
+        "false_negative_unmatched_reference": false_negatives,
+        "false_positive_unmatched_prediction": false_positives,
         "mean_onset_error_quarter": float(mean_onset) if mean_onset is not None else None,
         "mean_duration_error_quarter": float(mean_duration) if mean_duration is not None else None,
-        "mean_rhythm_error_quarter": float(mean_combined) if mean_combined is not None else None,
+        "mean_matched_rhythm_error_quarter": float(mean_combined) if mean_combined is not None else None,
+        # The acceptance metric is reference-normalized over every expected
+        # note.  An unmatched FN or FP receives one fixed quarter-note unit;
+        # this keeps zero-match cases numeric and prevents coverage from being
+        # silently dropped when averaging cases.
+        "fixed_total_assignment_cost_quarter": float(fixed_total_cost),
+        "fixed_total_denominator_reference_notes": fixed_total_denominator,
+        "unmatched_penalty_quarter_each_fn_or_fp": float(UNMATCHED_NOTE_PENALTY_QUARTERS),
+        "mean_fixed_total_assignment_rhythm_error_quarter": float(fixed_total_cost / fixed_total_denominator),
+        # Preserve the historical field name as the official gate metric.  It
+        # now has fixed-total semantics; matched-only timing remains available
+        # under mean_matched_rhythm_error_quarter above.
+        "mean_rhythm_error_quarter": float(fixed_total_cost / fixed_total_denominator),
         "unit": "quarter_note",
     }
 
@@ -415,6 +439,10 @@ def _metric_f1(case: Mapping[str, Any], name: str, field: str) -> float | None:
     if not isinstance(value, Mapping):
         return None
     number = value.get(field)
+    if name == "rhythm_error" and field == "mean_rhythm_error_quarter":
+        # Reports produced before the fixed-total metric only have the legacy
+        # matched-only field; new reports explicitly prefer the stricter value.
+        number = value.get("mean_fixed_total_assignment_rhythm_error_quarter", number)
     return float(number) if isinstance(number, (int, float)) and math.isfinite(float(number)) else None
 
 

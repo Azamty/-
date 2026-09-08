@@ -102,6 +102,46 @@ def test_evaluator_normalizes_different_ppq_and_does_not_invent_missing_beats(tm
     assert evaluated["metrics"]["beat_f1"] is None
 
 
+def test_rhythm_assignment_penalizes_unmatched_notes_and_zero_match_cases() -> None:
+    reference = [
+        (60, benchmark.Fraction(0), benchmark.Fraction(1)),
+        (62, benchmark.Fraction(1), benchmark.Fraction(2)),
+    ]
+    predicted = [
+        (60, benchmark.Fraction(0), benchmark.Fraction(1)),
+        (64, benchmark.Fraction(3), benchmark.Fraction(4)),
+    ]
+    metric = benchmark.rhythm_error(reference, predicted, tolerance_quarters=benchmark.Fraction(1, 16))
+    assert metric["matched_notes"] == 1
+    assert metric["false_negative_unmatched_reference"] == 1
+    assert metric["false_positive_unmatched_prediction"] == 1
+    assert metric["mean_matched_rhythm_error_quarter"] == 0.0
+    assert metric["fixed_total_assignment_cost_quarter"] == 2.0
+    assert metric["mean_fixed_total_assignment_rhythm_error_quarter"] == 1.0
+    assert metric["mean_rhythm_error_quarter"] == 1.0
+
+    zero_match = benchmark.rhythm_error(
+        reference,
+        [(65, benchmark.Fraction(3), benchmark.Fraction(4))],
+        tolerance_quarters=benchmark.Fraction(1, 16),
+    )
+    assert zero_match["matched_notes"] == 0
+    assert zero_match["mean_matched_rhythm_error_quarter"] is None
+    assert zero_match["mean_rhythm_error_quarter"] == 1.5
+
+
+def test_rhythm_gate_prefers_fixed_total_metric_when_report_has_both_fields() -> None:
+    case = {
+        "metrics": {
+            "rhythm_error": {
+                "mean_rhythm_error_quarter": 0.01,
+                "mean_fixed_total_assignment_rhythm_error_quarter": 1.25,
+            }
+        }
+    }
+    assert benchmark._metric_f1(case, "rhythm_error", "mean_rhythm_error_quarter") == 1.25
+
+
 def test_beat_grid_time_sec_and_downbeat_metrics_are_read_correctly(tmp_path: Path) -> None:
     beat_grid = tmp_path / "beat_grid.json"
     beat_grid.write_text(
