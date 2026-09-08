@@ -882,6 +882,46 @@ def test_pickup_duration_must_be_exactly_representable() -> None:
         score_to_jianpu(score)
 
 
+def test_unmarked_fine_atom_failure_keeps_local_import_context() -> None:
+    score = Score(
+        title="unmarked fine atom",
+        bpm=100,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=192,
+        voices=[
+            ScoreVoice(
+                voice_id="P1:staff-1:voice-2:lane-1",
+                events=[
+                    ScoreNote(start_tick=0, duration_tick=24, midi=None),
+                    ScoreNote(
+                        start_tick=24,
+                        duration_tick=2,
+                        midi=None,
+                        metadata={"musicxml_event_id": "p0:e41"},
+                    ),
+                    ScoreNote(start_tick=26, duration_tick=166, midi=60),
+                ],
+            )
+        ],
+    )
+
+    with pytest.raises(JianpuSerializationError) as raised:
+        score_to_jianpu(score)
+
+    message = str(raised.value)
+    assert "duration 2 ticks cannot be represented" in message
+    assert "voice='P1:staff-1:voice-2:lane-1'" in message
+    assert "event=24:26" in message
+    assert "kind=rest" in message
+    assert "source_event_id='p0:e41'" in message
+    assert "tie_before=[] tie_after=[] tuplet=none" in message
+    assert "measure=0:192 remaining_after=166" in message
+    assert "previous=rest@0:24" in message
+    assert "following=note@26:192/pitches=[60]" in message
+
+
 def test_timeline_key_change_uses_boundary_and_rejects_mid_measure() -> None:
     score = _meter_key_change_score()
     score.metadata["key_signature_events"] = [{"start_tick": 96, "key": "D"}]

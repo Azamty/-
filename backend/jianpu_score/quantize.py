@@ -521,6 +521,7 @@ class _Slice:
     start_tick: int
     duration_tick: int
     midi: int | None
+    source_event_id: str | None = None
     chord_pitches: tuple[int, ...] = ()
     tie_before: frozenset[int] = frozenset()
     tie_after: frozenset[int] = frozenset()
@@ -1341,6 +1342,11 @@ def _slice_voice_events(voice: ScoreVoice, spans: list[_MeasureSpan]) -> list[li
                     start_tick=start,
                     duration_tick=end - start,
                     midi=event.midi,
+                    source_event_id=(
+                        str(event.metadata.get("musicxml_event_id"))
+                        if event.metadata.get("musicxml_event_id") is not None
+                        else None
+                    ),
                     chord_pitches=pitches if event.midi is not None else (),
                     tie_before=frozenset(pitches if not is_first and pitches else tie_before),
                     tie_after=frozenset(pitches if not is_last and pitches else tie_after),
@@ -1404,6 +1410,83 @@ def _slice_tokens(
     if include_tie and item.tie_after and item.pitches:
         tokens.append("~")
     return tokens
+
+
+def _slice_context(
+    slices: list[_Slice],
+    index: int,
+    span: _MeasureSpan,
+    *,
+    voice_id: str | None,
+) -> str:
+    """Describe one failing slice without changing its notation semantics.
+
+    A one or two tick atom can be an exact imported event, but jianpu-ly has
+    no ordinary 48-TPQ token for it.  The failure must retain enough local
+    provenance to distinguish that case from a malformed tuplet or tie; in
+    particular, adjacent events are evidence only, never an implicit tuplet.
+    """
+
+    def tuplet_text(item: _Slice) -> str:
+        if item.tuplet_actual is None and item.tuplet_normal is None:
+            return "none"
+        return f"{item.tuplet_actual}:{item.tuplet_normal}/{item.tuplet_type or 'continue'}"
+
+    def describe(item: _Slice | None) -> str:
+        if item is None:
+            return "none"
+        if item.midi is None:
+            kind = "rest"
+        elif len(item.pitches) > 1:
+            kind = "chord"
+        else:
+            kind = "note"
+        return (
+            f"{kind}@{item.start_tick}:{item.end_tick}"
+            f"/pitches={list(item.pitches)}"
+            f"/source_event_id={item.source_event_id!r}"
+            f"/tie_before={sorted(item.tie_before)}"
+            f"/tie_after={sorted(item.tie_after)}"
+            f"/tuplet={tuplet_text(item)}"
+        )
+
+    item = slices[index]
+    return (
+        f"voice={voice_id!r} event={item.start_tick}:{item.end_tick}"
+        f" kind={'rest' if item.midi is None else 'chord' if len(item.pitches) > 1 else 'note'}"
+        f" pitches={list(item.pitches)} source_event_id={item.source_event_id!r}"
+        f" tie_before={sorted(item.tie_before)} tie_after={sorted(item.tie_after)}"
+        f" tuplet={tuplet_text(item)} dots={item.dots}"
+        f" measure={span.start_tick}:{span.end_tick}"
+        f" remaining_after={span.end_tick - item.end_tick}"
+        f" previous={describe(slices[index - 1] if index else None)}"
+        f" following={describe(slices[index + 1] if index + 1 < len(slices) else None)}"
+    )
+
+
+def _serialize_slice_tokens(
+    item: _Slice,
+    key: str,
+    quarter_ticks: int,
+    *,
+    context: str,
+    duration_tick: int | None = None,
+    dots: int = 0,
+    include_tie: bool = True,
+) -> list[str]:
+    """Serialize a slice and retain local context when exact output fails."""
+
+    try:
+        return _slice_tokens(
+            item,
+            key,
+            quarter_ticks,
+            duration_tick=duration_tick,
+            dots=dots,
+            include_tie=include_tie,
+        )
+    except JianpuSerializationError as exc:
+        raise JianpuSerializationError(f"{exc}; {context}") from exc
 
 
 def _validate_tuplet_ratio(item: _Slice) -> tuple[int, int] | None:
@@ -1551,6 +1634,7 @@ def _serialize_measure(
     key: str,
     quarter_ticks: int,
     *,
+    voice_id: str | None = None,
     explicit_groups: Mapping[int, tuple[tuple[int, int], int]] | None = None,
     global_offset: int = 0,
 ) -> list[str]:
@@ -1591,10 +1675,11 @@ def _serialize_measure(
                 )
             is_last = global_index + 1 == end
             output.extend(
-                _slice_tokens(
+                _serialize_slice_tokens(
                     item,
                     key,
                     quarter_ticks,
+                    context=_slice_context(slices, index, span, voice_id=voice_id),
                     duration_tick=int(nominal),
                     dots=item.dots,
                     include_tie=not is_last,
@@ -1615,10 +1700,11 @@ def _serialize_measure(
                 if nominal.denominator != 1:
                     raise JianpuSerializationError("legacy triplet duration is not exact")
                 output.extend(
-                    _slice_tokens(
+                    _serialize_slice_tokens(
                         member,
                         key,
                         quarter_ticks,
+                        context=_slice_context(slices, index + group_index, span, voice_id=voice_id),
                         duration_tick=int(nominal),
                         dots=0,
                         include_tie=group_index < 2,
@@ -1630,7 +1716,15 @@ def _serialize_measure(
             cursor = group[-1].end_tick
             index += 3
             continue
-        output.extend(_slice_tokens(item, key, quarter_ticks, dots=item.dots))
+        output.extend(
+            _serialize_slice_tokens(
+                item,
+                key,
+                quarter_ticks,
+                context=_slice_context(slices, index, span, voice_id=voice_id),
+                dots=item.dots,
+            )
+        )
         cursor = item.end_tick
         index += 1
     if cursor != span.end_tick:
@@ -1740,6 +1834,7 @@ def score_to_jianpu(score: Score) -> str:
                     span,
                     context.key,
                     score.quarter_ticks,
+                    voice_id=voice.voice_id,
                     explicit_groups=global_tuplet_groups,
                     global_offset=slice_offset,
                 )
