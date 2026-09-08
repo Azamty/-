@@ -28,7 +28,11 @@ from backend.jianpu_score.musicxml_standardize import (
     standardize_musicxml,
     write_standardized_score,
 )
-from backend.jianpu_score.musescore_import import MuseScoreImportError, convert_performance_midi
+from backend.jianpu_score.musescore_import import (
+    MUSESCORE_ORIGIN_SENTINEL_NAME,
+    MuseScoreImportError,
+    convert_performance_midi,
+)
 import backend.jianpu_score.musescore_import as musescore_import
 from backend.jianpu_score.quantize import JianpuSerializationError, _validate_explicit_ties, score_to_jianpu
 from backend.jianpu_score.high_accuracy import (
@@ -54,6 +58,26 @@ EXTERNAL_READY = (
     and PROFILE.is_file()
     and MUSESCORE_VOCAL_IMPORT_PROFILE_PATH.is_file()
 )
+
+
+def _write_test_midi(path: Path) -> None:
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("end_of_track", time=0))
+    midi.tracks.append(track)
+    midi.save(path)
+
+
+def _fake_musescore_xml() -> str:
+    return (
+        "<score-partwise version='3.1'><part-list>"
+        "<score-part id='P1'><part-name>source</part-name></score-part>"
+        f"<score-part id='P2'><part-name>Grand Piano, {MUSESCORE_ORIGIN_SENTINEL_NAME}</part-name></score-part>"
+        "</part-list><part id='P1'>"
+        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
+        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
+        "</part><part id='P2'></part></score-partwise>"
+    )
 
 
 def test_musescore_profile_pins_exact_48_tpq_tuplet_policy() -> None:
@@ -1378,7 +1402,7 @@ def test_production_meter_change_inside_nominal_bar_rebars_and_splits_event() ->
 
 def test_musescore_adapter_reports_missing_pinned_executable_without_fallback(tmp_path: Path) -> None:
     midi = tmp_path / "source.mid"
-    midi.write_bytes(b"MThd")
+    _write_test_midi(midi)
     with pytest.raises(MuseScoreImportError, match="executable is unavailable"):
         convert_performance_midi(
             midi,
@@ -1396,15 +1420,9 @@ def test_musescore_cli_calls_are_serialized_within_one_process(
     source_b = tmp_path / "b.mid"
     executable.write_bytes(b"stub")
     profile.write_text(PROFILE.read_text(encoding="utf-8"), encoding="utf-8")
-    source_a.write_bytes(b"MThd")
-    source_b.write_bytes(b"MThd")
-    xml = (
-        "<?xml version='1.0' encoding='UTF-8'?>"
-        "<score-partwise version='3.1'><part-list></part-list><part id='P1'>"
-        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
-        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
-        "</part></score-partwise>"
-    )
+    _write_test_midi(source_a)
+    _write_test_midi(source_b)
+    xml = _fake_musescore_xml()
     active = 0
     maximum_active = 0
     state_lock = threading.Lock()
@@ -1463,13 +1481,8 @@ def test_musescore_transient_crash_is_retried_once_with_fresh_output(
     destination = tmp_path / "result.musicxml"
     executable.write_bytes(b"stub")
     profile.write_text(PROFILE.read_text(encoding="utf-8"), encoding="utf-8")
-    source.write_bytes(b"MThd")
-    xml = (
-        "<score-partwise version='3.1'><part-list/><part id='P1'>"
-        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
-        "<!-- fixture output --><!-- fixture output --><!-- fixture output -->"
-        "</part></score-partwise>"
-    )
+    _write_test_midi(source)
+    xml = _fake_musescore_xml()
     calls: list[tuple[str, ...]] = []
 
     def fake_run(command, **_kwargs):
@@ -1508,7 +1521,7 @@ def test_musescore_transient_crash_after_retry_is_explicit_failure(
     destination = tmp_path / "result.musicxml"
     executable.write_bytes(b"stub")
     profile.write_text(PROFILE.read_text(encoding="utf-8"), encoding="utf-8")
-    source.write_bytes(b"MThd")
+    _write_test_midi(source)
     calls: list[tuple[str, ...]] = []
 
     def fake_run(command, **_kwargs):
@@ -1542,7 +1555,7 @@ def test_musescore_nontransient_failure_is_not_retried(
     destination = tmp_path / "result.musicxml"
     executable.write_bytes(b"stub")
     profile.write_text(PROFILE.read_text(encoding="utf-8"), encoding="utf-8")
-    source.write_bytes(b"MThd")
+    _write_test_midi(source)
     calls: list[tuple[str, ...]] = []
 
     def fake_run(command, **_kwargs):

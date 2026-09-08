@@ -719,6 +719,7 @@ class HighAccuracyArtifactService:
                 "status": "completed",
                 "attempt_count": len(musicxml_artifact.attempts),
                 "attempt_returncodes": [return_code for _, return_code in musicxml_artifact.attempts],
+                "origin_sentinel": musicxml_artifact.origin_sentinel,
             }
 
             try:
