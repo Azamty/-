@@ -2234,6 +2234,19 @@ def getLY(score,headers=None,have_final_barline=True):
                 else:
                     out.append(word)
                     if word=="~" and not midi and not western and lastNonDashPtr < lastPtr: sys.stderr.write("Warning: jianpu long-note tie won't be done right because your Lilypond version is older than 2.20\n")
+            elif re.match(r"[1-9][0-9]*:[1-9][0-9]*\[$",word):
+                # The normal ``3[`` shorthand below is intentionally kept
+                # compatible with upstream jianpu-ly.  The renderer also
+                # accepts an explicit actual:normal ratio for bounded
+                # importer fine-grid fragments, e.g. ``3:1[`` ->
+                # LilyPond ``\\times 1/3``.  This is emitted only by the
+                # score serializer when every member has an auditable
+                # fine_grid_tuplet marker.
+                actual, normal = [int(value) for value in word[:-1].split(":", 1)]
+                if actual <= 0 or normal <= 0:
+                    scoreError("Tuplet ratios must be positive",origWord,line)
+                out.append("\\times %d/%d {" % (normal, actual))
+                notehead_markup.tuplet = (normal, actual)
             elif re.match(r"[1-9][0-9]*\[$",word):
                 # tuplet start, e.g. 3[
                 fitIn = int(word[:-1])

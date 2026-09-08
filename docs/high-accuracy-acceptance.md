@@ -15,7 +15,7 @@ BeatNet 依赖放在独立的 `.venv-model-beatnet`，MusicXML 标准化 worker 
 
 MuseScore 导入前会在只读的临时 MIDI 副本中加入一个独立的 `__JIANPU_SOURCE_ORIGIN_SENTINEL_v1__` track：它在 tick 0 放置一个可追踪的低力度标记音符，作用是让 human-performance importer 观察到原始时间原点；原始性能 MIDI 不会被改写。MusicXML 成功导出后，适配器只按精确 part-name 删除这个 sentinel part，并把 sentinel 名称、channel、导入 track、删除的 part id/name 和剩余 part id 写入服务 manifest；如果 sentinel 没有被保留或无法审计删除，stage 明确失败，不退回无 sentinel 的导入。该方案只恢复 importer 丢失的整体原点，MusicXML 内部音符时值和相对时序仍由 XML 保持。
 
-MusicXML 标准化器保留同声部的合法 3:2 tuplets；若 tie voice 重分配造成一个连续 bracket 的 start/stop 跨 ScoreVoice，只在无重叠、无 gap、marker ratio 一致且 tick 时值可序列化时把 fragment 归到 start voice，并在 `alignment_report.json` 的 `tuplet_marker_repairs` 中记录原 voice、目标 voice、tick 和原始 marker。孤立 marker 只有在清除后普通 48 TPQ 时值可序列化时才清除；同声部 gap、嵌套或不支持的 ratio 仍会失败。
+MusicXML 标准化器保留同声部的合法 3:2 tuplets；若 MuseScore 在 48 TPQ 边界产生紧凑的 4/8 tick 细网格片段，会在每个成员的 nominal duration 为整数且无 tie/voice 歧义时写成显式 `3[` 或受审计的 `3:1[` fine-grid bracket。该表示不移动事件边界，并在 `notation_grid_repairs` 记录 ratio、voice、tick、event id 和 movement=0；不能证明时仍失败。若 tie voice 重分配造成一个连续 bracket 的 start/stop 跨 ScoreVoice，只在无重叠、无 gap、marker ratio 一致且 tick 时值可序列化时把 fragment 归到 start voice，并在 `alignment_report.json` 的 `tuplet_marker_repairs` 中记录原 voice、目标 voice、tick 和原始 marker。孤立 marker 只有在清除后普通 48 TPQ 时值可序列化时才清除；同声部 gap、嵌套或不支持的 ratio 仍会失败。
 
 Production metadata 中的最终拍号（包括用户手动覆盖）优先于 MuseScore 从 performance MIDI 推断的初始拍号。若两者导致 MusicXML 小节边界不一致，标准化器会按最终的 `2/4`、`3/4`、`4/4` 或 `6/8` 以及明确的中途拍号事件重建 timeline；跨新小节线的音符、和弦、休止符会保留总时值，音符/和弦按 pitch 生成 `start/continue/stop` tie。若原始末小节在导入拍号下是完整小节、重划后只差一个尾部休止，标准化器会补足该尾部休止以满足 renderer 的完整小节约束，并在 audit 中记录补足范围。导入的 timeline、最终 meter、partial meter-change boundary 和每次事件拆分都会写入 `alignment_report.json`；tuplets 跨新边界无法安全保持时明确失败，不静默保留冲突拍号。
 

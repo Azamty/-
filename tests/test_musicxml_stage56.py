@@ -35,6 +35,7 @@ from backend.jianpu_score.musescore_import import (
 )
 import backend.jianpu_score.musescore_import as musescore_import
 from backend.jianpu_score.quantize import JianpuSerializationError, _validate_explicit_ties, score_to_jianpu
+from backend.jianpu_score.render import render_score
 from backend.jianpu_score.high_accuracy import (
     MUSESCORE_IMPORT_PROFILE_EXPECTED,
     MUSESCORE_IMPORT_PROFILE_SHA256,
@@ -1110,6 +1111,90 @@ def test_finer_binary_standalone_note_consumes_following_rest_to_reach_atom() ->
     for voice in score.voices:
         _validate_explicit_ties(voice)
     assert score_to_jianpu(score)
+
+
+def _fine_grid_tuplet_fixture_payload() -> WorkerPayload:
+    payload = _manual_payload()
+    payload.highest_time_quarter = 16
+    payload.parts[0].highest_time_quarter = 16
+    # MuseScore's 1/32-quarter fragments round to 2 and 1 ticks at 48 TPQ.
+    # The first two events are an exact 3:2 fragment pair (6+2 ticks); the
+    # final 1+3 pair needs the explicit fine-grid 3:1 encoding.
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="triplet-rest-6",
+            kind="rest",
+            offset_quarter=15.75,
+            duration_quarter=0.125,
+            pitches=[],
+        ),
+        WorkerEvent(
+            event_id="triplet-rest-2",
+            kind="rest",
+            offset_quarter=15.875,
+            duration_quarter=0.03125,
+            pitches=[],
+        ),
+        WorkerEvent(
+            event_id="fine-chord-1",
+            kind="chord",
+            offset_quarter=15.90625,
+            duration_quarter=0.03125,
+            pitches=[57, 60, 65],
+        ),
+        WorkerEvent(
+            event_id="fine-rest-3",
+            kind="rest",
+            offset_quarter=15.9375,
+            duration_quarter=0.0625,
+            pitches=[],
+        ),
+    ]
+    payload.parts[0].measures = [
+        WorkerMeasure(
+            part_index=0,
+            number=1,
+            start_quarter=0,
+            duration_quarter=16,
+            end_quarter=16,
+            time_signature="4/4",
+        )
+    ]
+    payload.measures = list(payload.parts[0].measures)
+    return payload
+
+
+def test_fine_grid_fragments_use_exact_tuplet_serialization_without_timing_move() -> None:
+    score, report = standardize_musicxml_payload(_fine_grid_tuplet_fixture_payload())
+    voice = next(voice for voice in score.voices if voice.source_voice == "1")
+    events = [
+        event
+        for event in voice.events
+        if event.start_tick >= 750 and (event.midi is not None or event.is_rest)
+    ]
+    events = [event for event in events if event.start_tick < 768]
+    assert [(event.start_tick, event.duration_tick, event.midi, event.tuplet_actual, event.tuplet_normal, event.tuplet_type) for event in events] == [
+        (756, 6, None, 3, 2, "start"),
+        (762, 2, None, 3, 2, "stop"),
+        (764, 1, 57, 3, 1, "start"),
+        (765, 3, None, 3, 1, "stop"),
+    ]
+    repairs = [item for item in report["notation_grid_repairs"] if item["reason"] == "fine_grid_fragment_encoded_as_explicit_tuplet"]
+    assert [item["tuplet_actual"] for item in repairs] == [3, 3]
+    assert all(item["timing_preserved"] and item["movement_ticks"] == 0 for item in repairs)
+    assert score.total_ticks == 768
+    serialized = score_to_jianpu(score)
+    assert "3[" in serialized
+    assert "3:1[" in serialized
+
+
+@pytest.mark.skipif(not EXTERNAL_READY, reason="pinned MuseScore/music21/jianpu-ly/LilyPond toolchain unavailable")
+def test_fine_grid_tuplet_fixture_renders_through_jianpu_and_lilypond(tmp_path: Path) -> None:
+    score, _report = standardize_musicxml_payload(_fine_grid_tuplet_fixture_payload())
+    artifacts = render_score(score, tmp_path, basename="fine-grid-tuplets")
+    assert Path(artifacts.jly_path).is_file()
+    assert Path(artifacts.lilypond_path).is_file()
+    assert artifacts.svg_paths and all(Path(path).is_file() for path in artifacts.svg_paths)
 
 
 def test_finer_binary_chord_tie_slots_clear_only_merged_pitches() -> None:

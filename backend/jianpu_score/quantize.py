@@ -527,6 +527,12 @@ class _Slice:
     tuplet_actual: int | None = None
     tuplet_normal: int | None = None
     tuplet_type: str | None = None
+    # Standard MusicXML tuplets are restricted to the pinned 3:2 policy.
+    # The importer may additionally mark a bounded fine-grid fragment for
+    # the renderer-specific exact tuplets (for example 3:1).  Keeping this
+    # bit on the slice, rather than widening all Score JSON tuplets, prevents
+    # an arbitrary ratio from entering the production serializer silently.
+    fine_grid_tuplet: bool = False
     dots: int = 0
 
     @property
@@ -1353,6 +1359,7 @@ def _slice_voice_events(voice: ScoreVoice, spans: list[_MeasureSpan]) -> list[li
                         )
                         else None
                     ),
+                    fine_grid_tuplet=bool(event.metadata.get("fine_grid_tuplet", False)),
                     dots=event.dots if is_first and is_last else 0,
                 )
             )
@@ -1406,9 +1413,10 @@ def _validate_tuplet_ratio(item: _Slice) -> tuple[int, int] | None:
     if item.tuplet_actual is None or item.tuplet_normal is None:
         raise JianpuSerializationError("tuplet_actual and tuplet_normal must be supplied together")
     ratio = (item.tuplet_actual, item.tuplet_normal)
-    if ratio != (3, 2):
+    if ratio != (3, 2) and not (item.fine_grid_tuplet and ratio == (3, 1)):
         raise JianpuSerializationError(
-            f"jianpu-ly serializer only supports explicit 3:2 tuplets, got {ratio[0]}:{ratio[1]}"
+            "jianpu-ly serializer only supports explicit 3:2 tuplets; "
+            f"bounded fine-grid tuplets may be 3:1, got {ratio[0]}:{ratio[1]}"
         )
     return ratio
 
@@ -1570,7 +1578,12 @@ def _serialize_measure(
         if group_info is not None:
             start, ratio, end = group_info
             if global_index == start:
-                output.append(f"{ratio[0]}[")
+                # The vendor syntax ``3[`` is the historical shorthand for
+                # a 3:2 group.  Fine-grid ratios use an explicit ``a:b[``
+                # form so the LilyPond ``\\times b/a`` factor is unambiguous.
+                output.append(
+                    f"{ratio[0]}[" if ratio == (3, 2) else f"{ratio[0]}:{ratio[1]}["
+                )
             nominal = Fraction(item.duration_tick * ratio[0], ratio[1])
             if nominal.denominator != 1:
                 raise JianpuSerializationError(
