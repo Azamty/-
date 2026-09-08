@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MUSCRIPTOR_PYTHON = ROOT / ".venv-model-muscriptor" / "Scripts" / "python.exe"
 MUSCRIPTOR_SCRIPT = ROOT / "scripts" / "run_muscriptor_job.py"
 MUSCRIPTOR_BENCHMARK_SEED = 20260907
-PRODUCTION_RECOGNIZER_VERSION = "1.1"
+PRODUCTION_RECOGNIZER_VERSION = "1.2"
 if os.fspath(ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(ROOT))
 
@@ -171,6 +171,11 @@ def _run_vocal(audio: Path, destination: Path, *, demucs_model: str | None) -> t
             "demucs_model": demucs_model or "htdemucs",
             "route_input": "demucs_vocals",
             "vocal_stem": os.fspath(vocal_path),
+            "onset_evidence_stems": {
+                name: os.fspath(stems[name])
+                for name in ("drums", "bass")
+                if name in stems and Path(stems[name]).is_file()
+            },
             "game_metadata": game_result.metadata,
         },
     )
@@ -210,17 +215,37 @@ def recognize(
         notes, route = _run_muscriptor(source, destination)
         cleanup_report: Mapping[str, Any] | None = None
         raw_game_events: list[dict[str, Any]] | None = None
-        onset_evidence: Sequence[float] = [float(item["start_sec"]) for item in notes]
     else:
         raw_notes, route = _run_vocal(source, destination, demucs_model=demucs_model)
         notes = raw_notes
         raw_game_events = raw_notes
-        onset_evidence = [float(item["start_sec"]) for item in raw_notes]
         cleanup_report = None
 
     # This is the single BeatNet call for the case.  It always receives the
     # original mix, even when note extraction used a stem.
-    from backend.jianpu_score.analysis import analyze_audio
+    from backend.jianpu_score.analysis import analyze_audio, extract_onset_times, load_audio
+    from backend.jianpu_score.beat_grid import beat_grid_onsets_from_notes
+
+    # Keep model note starts and audio/stem onset streams separately named.
+    # Passing a flat sequence here used to collapse every production route to
+    # the generic ``all`` source, so the drums/bass weights and provenance were
+    # never exercised.  These streams only rank BeatNet's existing half/
+    # original/double candidates; they never replace the model's beat times.
+    onset_evidence = beat_grid_onsets_from_notes(notes)
+    audio_samples, audio_rate = load_audio(source)
+    audio_onsets = extract_onset_times(audio_samples, audio_rate)
+    if audio_onsets:
+        onset_evidence["all"] = audio_onsets
+    stem_paths = route.get("onset_evidence_stems", {}) if isinstance(route, Mapping) else {}
+    if isinstance(stem_paths, Mapping):
+        for source_name, value in stem_paths.items():
+            stem_path = Path(str(value)).expanduser().resolve()
+            if not stem_path.is_file():
+                continue
+            stem_samples, stem_rate = load_audio(stem_path)
+            stem_onsets = extract_onset_times(stem_samples, stem_rate)
+            if stem_onsets:
+                onset_evidence[str(source_name)] = stem_onsets
 
     _samples, analysis = analyze_audio(source, source_onsets=onset_evidence)
 
@@ -252,6 +277,11 @@ def recognize(
         "beat_source": "original_mix",
         "beat_engine": "beatnet",
         "beat_independent_of_reference": True,
+        "beat_onset_evidence": {
+            "sources": sorted(onset_evidence),
+            "counts": {source_name: len(values) for source_name, values in sorted(onset_evidence.items())},
+            "meter_inference_uses_independent_accents": False,
+        },
         "route": route,
     }
     payload: dict[str, Any] = {

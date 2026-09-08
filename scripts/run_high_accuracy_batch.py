@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_OUTPUT = ROOT / ".cache" / "high-accuracy-benchmarks" / "runs"
 RUNNER_SCHEMA_VERSION = "1.1"
-PRODUCTION_RECOGNIZER_VERSION = "1.1"
+PRODUCTION_RECOGNIZER_VERSION = "1.2"
 MUSCRIPTOR_BENCHMARK_SEED = 20260907
 
 Adapter = Callable[[Mapping[str, Any], Mapping[str, Any], Path], Mapping[str, Any]]

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any, Mapping
 
 import mido
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,7 @@ generator = _load("high_accuracy_fixture_generator_test", ROOT / "scripts" / "ge
 runner_module = _load("high_accuracy_batch_runner_test", ROOT / "scripts" / "run_high_accuracy_batch.py")
 maestro = _load("prepare_maestro_benchmark_test", ROOT / "scripts" / "prepare_maestro_benchmark.py")
 ccmusic = _load("prepare_ccmusic_benchmark_test", ROOT / "scripts" / "prepare_ccmusic_benchmark.py")
+production_recognizer = _load("high_accuracy_production_recognizer_test", ROOT / "scripts" / "high_accuracy_production_recognizer.py")
 
 
 def _hash(path: Path) -> str:
@@ -322,6 +324,73 @@ def test_batch_runner_writes_baseline_and_new_to_explicit_independent_roots(tmp_
     assert (new_root / "separate" / "manifest.json").is_file()
     assert not (raw_root / "separate" / "baseline").exists()
     assert not (raw_root / "separate" / "new").exists()
+
+
+def test_production_recognizer_keeps_note_and_audio_onset_sources_separate(monkeypatch, tmp_path: Path) -> None:
+    import backend.jianpu_score.analysis as analysis
+    import backend.jianpu_score.vocal_cleanup as vocal_cleanup
+
+    captured: dict[str, Any] = {}
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"audio")
+    notes = [
+        {
+            "start_sec": 0.0,
+            "end_sec": 0.4,
+            "midi": 60,
+            "confidence": 0.8,
+            "velocity": 80,
+            "voice_id": "voice-0",
+            "source": "game",
+            "raw_pitch": 60,
+        },
+    ]
+    drums = tmp_path / "drums.wav"
+    bass = tmp_path / "bass.wav"
+    drums.write_bytes(b"drums")
+    bass.write_bytes(b"bass")
+
+    def fake_run(_audio: Path, _destination: Path, *, demucs_model: str | None = None):
+        return notes, {
+            "engine": "game",
+            "route_input": "demucs_vocals",
+            "onset_evidence_stems": {"drums": str(drums), "bass": str(bass)},
+        }
+
+    def fake_load(_path: Path, sample_rate: int = 22050):
+        return np.zeros(sample_rate, dtype="float32"), sample_rate
+
+    def fake_onsets(_samples, _sample_rate):
+        return [0.25]
+
+    def fake_analyze(_path: Path, *, source_onsets):
+        captured["source_onsets"] = source_onsets
+        return np.zeros(22050, dtype="float32"), SimpleNamespace(
+            sample_rate=22050,
+            duration_sec=1.0,
+            bpm=120.0,
+            time_signature="4/4",
+            key="C",
+            beat_times=[0.0, 0.5, 1.0],
+            warnings=[],
+            metadata={"beat_grid": {"tempo": {"evidence_sources": sorted(source_onsets)}}},
+        )
+
+    monkeypatch.setattr(production_recognizer, "_run_vocal", fake_run)
+    monkeypatch.setattr(
+        vocal_cleanup,
+        "clean_vocal_events",
+        lambda events, **_kwargs: SimpleNamespace(report={}, events=list(events)),
+    )
+    monkeypatch.setattr(analysis, "load_audio", fake_load)
+    monkeypatch.setattr(analysis, "extract_onset_times", fake_onsets)
+    monkeypatch.setattr(analysis, "analyze_audio", fake_analyze)
+
+    payload = production_recognizer.recognize(source, source_kind="vocal", output=tmp_path / "out")
+
+    assert sorted(captured["source_onsets"]) == ["all", "bass", "drums", "full_track"]
+    assert payload["provenance"]["beat_onset_evidence"]["sources"] == ["all", "bass", "drums", "full_track"]
+    assert payload["provenance"]["beat_onset_evidence"]["meter_inference_uses_independent_accents"] is False
 
 
 def test_maestro_selector_records_archive_and_member_hashes(tmp_path: Path, monkeypatch) -> None:

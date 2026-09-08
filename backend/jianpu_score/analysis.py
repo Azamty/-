@@ -157,6 +157,31 @@ def load_audio(path: str | Path, sample_rate: int = 22050) -> tuple[np.ndarray, 
     return np.asarray(samples, dtype=np.float32), int(actual_rate)
 
 
+def extract_onset_times(samples: np.ndarray, sample_rate: int) -> list[float]:
+    """Extract conservative audio onset evidence for beat candidate scoring.
+
+    This is supporting evidence for the pinned BeatNet output, not a second
+    beat tracker.  Keeping it as onset times lets callers combine independent
+    stem evidence (for example Demucs drums/bass) without replacing BeatNet or
+    inventing a regular grid when the audio is ambiguous.
+    """
+
+    values = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if sample_rate <= 0 or values.size < max(1024, sample_rate // 20):
+        return []
+    envelope = librosa.onset.onset_strength(y=values, sr=sample_rate, aggregate=np.median)
+    if envelope.size == 0 or not np.any(np.isfinite(envelope)):
+        return []
+    times = librosa.onset.onset_detect(
+        onset_envelope=np.nan_to_num(envelope, nan=0.0, posinf=0.0, neginf=0.0),
+        sr=sample_rate,
+        units="time",
+        backtrack=False,
+        normalize=True,
+    )
+    return [float(value) for value in np.asarray(times).reshape(-1) if math.isfinite(float(value)) and float(value) >= 0]
+
+
 def _estimate_key_candidates(samples: np.ndarray, sample_rate: int) -> list[str]:
     if samples.size < sample_rate // 4:
         return ["C"]
