@@ -2,11 +2,12 @@
 
 The repository deliberately keeps generated audio and MIDI below ``.cache``.
 This script only creates those rebuildable files; it never downloads a corpus
-and never treats a reference MIDI file as a model recognition result.  The
+and never treats a reference MIDI file as a model recognition result. The
 ``--case-id`` option is useful for a small smoke run before the full benchmark
-is authorized.  Synthetic fixtures use deterministic notated downbeat
-velocity accents and a modest additive harmonic envelope; pitch and timing are
-unchanged from the fixture recipe.
+is authorized. Synthetic fixtures use deterministic notated downbeat
+velocity accents.  Production audio is rendered directly from the resulting
+MIDI by the pinned FluidSynth/MS Basic renderer; the legacy oscillator helper
+remains only for historical diagnostics.
 """
 
 from __future__ import annotations
@@ -27,15 +28,19 @@ from typing import Any, Mapping, Sequence
 import mido
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.fluidsynth_benchmark_renderer import RENDERER_VERSION, render_midi  # noqa: E402
 REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_ROOT = ROOT / ".cache" / "high-accuracy-benchmarks" / "generated"
 GENERATOR_VERSION = "1.1"
 DEFAULT_SEED = 20260907
-SAMPLE_RATE = 16_000
+LEGACY_OSCILLATOR_SAMPLE_RATE = 16_000
 PPQ = 480
 DOWNBEAT_ACCENT_DELTA = 24
 GUITAR_ACCENT_DELTA = 4
-RENDERER_VERSION = "deterministic_harmonic_oscillator_v1"
+LEGACY_RENDERER_VERSION = "deterministic_harmonic_oscillator_v1"
 
 
 @dataclass(frozen=True)
@@ -176,7 +181,7 @@ def _render_audio(path: Path, tracks: Sequence[RenderTrack], tempo: Sequence[tup
         raise ValueError("cannot render an empty benchmark fixture")
     end_q = max(note.end for note in notes) + Fraction(1, 2)
     duration = max(0.25, _tempo_seconds(tempo, end_q))
-    frame_count = int(math.ceil(duration * SAMPLE_RATE))
+    frame_count = int(math.ceil(duration * LEGACY_OSCILLATOR_SAMPLE_RATE))
     samples = [0.0] * frame_count
     rng = random.Random(seed)
     # A tiny deterministic instrument-dependent detune makes the rendered
@@ -187,19 +192,19 @@ def _render_audio(path: Path, tracks: Sequence[RenderTrack], tempo: Sequence[tup
         weight_total = sum(weight for _harmonic, weight in weights)
         for note in track.notes:
             start_sec = max(0.0, _tempo_seconds(tempo, note.start))
-            end_sec = max(start_sec + 1.0 / SAMPLE_RATE, _tempo_seconds(tempo, note.end))
-            start_frame = max(0, int(start_sec * SAMPLE_RATE))
-            end_frame = min(frame_count, int(math.ceil(end_sec * SAMPLE_RATE)))
+            end_sec = max(start_sec + 1.0 / LEGACY_OSCILLATOR_SAMPLE_RATE, _tempo_seconds(tempo, note.end))
+            start_frame = max(0, int(start_sec * LEGACY_OSCILLATOR_SAMPLE_RATE))
+            end_frame = min(frame_count, int(math.ceil(end_sec * LEGACY_OSCILLATOR_SAMPLE_RATE)))
             frequency = _frequency(note.pitch) * (1.0 + detune * (track_index + 1))
             amplitude = 0.12 * (max(1, min(127, note.velocity)) / 127.0) / max(1.0, math.sqrt(len(tracks)))
             attack_sec, release_sec = ((0.008, 0.018) if 24 <= track.program <= 31 else (0.006, 0.030))
-            attack = max(1, int(attack_sec * SAMPLE_RATE))
-            release = max(1, int(release_sec * SAMPLE_RATE))
+            attack = max(1, int(attack_sec * LEGACY_OSCILLATOR_SAMPLE_RATE))
+            release = max(1, int(release_sec * LEGACY_OSCILLATOR_SAMPLE_RATE))
             for frame in range(start_frame, end_frame):
                 local = frame - start_frame
                 remaining = end_frame - frame
                 envelope = min(1.0, local / attack, remaining / release)
-                phase = 2.0 * math.pi * frequency * (frame / SAMPLE_RATE)
+                phase = 2.0 * math.pi * frequency * (frame / LEGACY_OSCILLATOR_SAMPLE_RATE)
                 tone = sum(weight * math.sin(harmonic * phase) for harmonic, weight in weights) / weight_total
                 samples[frame] += amplitude * envelope * tone
     peak = max(1.0, max(abs(value) for value in samples) * 1.02)
@@ -208,7 +213,7 @@ def _render_audio(path: Path, tracks: Sequence[RenderTrack], tempo: Sequence[tup
     with wave.open(str(path), "wb") as output:
         output.setnchannels(1)
         output.setsampwidth(2)
-        output.setframerate(SAMPLE_RATE)
+        output.setframerate(LEGACY_OSCILLATOR_SAMPLE_RATE)
         output.writeframes(pcm)
 
 
@@ -297,7 +302,17 @@ def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int =
     if case_root.exists() and not overwrite:
         existing = case_root / "case_manifest.json"
         if existing.is_file():
-            return json.loads(existing.read_text(encoding="utf-8"))
+            cached = json.loads(existing.read_text(encoding="utf-8"))
+            if (
+                cached.get("renderer_version") == RENDERER_VERSION
+                and cached.get("source_event_complete") is True
+                and (case_root / str(cached.get("render_manifest", ""))).is_file()
+            ):
+                return cached
+            raise FileExistsError(
+                f"fixture directory contains a stale or legacy renderer manifest: {case_root}; "
+                "rerun with --overwrite to replace it with the pinned direct FluidSynth render"
+            )
         raise FileExistsError(f"fixture directory exists without a manifest: {case_root}")
     case_root.mkdir(parents=True, exist_ok=True)
     midi_path = case_root / f"{case_id}.mid"
@@ -305,10 +320,24 @@ def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int =
     beat_path = case_root / f"{case_id}.beat_grid.json"
     midi = _midi_events(tracks, tempo, meter, key)
     midi.save(midi_path)
-    _render_audio(audio_path, tracks, tempo, seed=seed + sum(ord(char) for char in case_id))
+    render_manifest_path = case_root / f"{case_id}.render_manifest.json"
+    render_manifest = render_midi(
+        midi_path,
+        audio_path,
+        manifest_path=render_manifest_path,
+        overwrite=True,
+    )
     end_q = max(note.end for track in tracks for note in track.notes)
     _beat_annotation(beat_path, tempo=tempo, meter=meter, end_q=end_q, source="generated_from_reference_midi")
-    files = {name: {"path": file.name, "bytes": file.stat().st_size, "sha256": _sha256(file)} for name, file in (("reference_midi", midi_path), ("input_audio", audio_path), ("beat_annotation", beat_path))}
+    files = {
+        name: {"path": file.name, "bytes": file.stat().st_size, "sha256": _sha256(file)}
+        for name, file in (("reference_midi", midi_path), ("input_audio", audio_path), ("beat_annotation", beat_path))
+    }
+    files["render_manifest"] = {
+        "path": render_manifest_path.name,
+        "bytes": render_manifest_path.stat().st_size,
+        "sha256": _sha256(render_manifest_path),
+    }
     manifest = {
         "schema_version": "1.0",
         "generator_version": GENERATOR_VERSION,
@@ -335,6 +364,9 @@ def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int =
         "time_signature": f"{meter[0]}/{meter[1]}",
         "key": key,
         "files": files,
+        "render_manifest": render_manifest_path.name,
+        "renderer": render_manifest["renderer"],
+        "source_event_complete": render_manifest["verification"]["source_event_complete"],
         "license": "project-generated-deterministic-fixture",
         "source": {"url": None, "license": "project-generated-deterministic-fixture"},
     }

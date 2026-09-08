@@ -45,6 +45,49 @@ def test_registry_has_distinct_30_case_reliable_set() -> None:
     assert all(case.get("source_id") in registry["sources"] for case in reliable)
 
 
+def test_local_midi_cases_record_direct_renderer_and_input_hashes() -> None:
+    registry = benchmark._load_registry(ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json")
+    policy = registry["source_policy"]["midi_render_policy"]
+    assert policy["renderer"] == "fluidsynth_direct_ms_basic_v1"
+    assert policy["fluidsynth_version"] == "2.6.0"
+    assert policy["sample_rate"] == 44_100
+    assert policy["channels"] == 2
+    assert policy["sample_width_bytes"] == 2
+    assert policy["effects"] == {"reverb": False, "chorus": False}
+    assert policy["gain"] == 0.2
+    assert policy["tail_sec"] == 0.25
+
+    local_midi = [
+        case
+        for case in registry["cases"]
+        if case.get("source_kind") in {"synthetic", "official-midi-rendered"}
+    ]
+    assert len(local_midi) == 25
+    assert len({case["id"] for case in local_midi}) == 25
+    for case in local_midi:
+        assert case["renderer_version"] == policy["renderer"]
+        assert case["source_event_complete"] is True
+        assert case["render_manifest"].endswith(".render_manifest.json")
+        for field in (
+            "input_sha256",
+            "reference_midi_sha256",
+            "beat_annotation_sha256",
+            "render_manifest_sha256",
+        ):
+            assert len(case[field]) == 64
+            assert all(character in "0123456789abcdef" for character in case[field])
+
+        input_path = ROOT / case["input"]
+        if input_path.is_file():
+            assert _hash(input_path) == case["input_sha256"]
+        manifest_path = ROOT / case["render_manifest"]
+        if manifest_path.is_file():
+            render_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            assert render_manifest["renderer"]["renderer_version"] == policy["renderer"]
+            assert render_manifest["verification"]["byte_deterministic"] is True
+            assert render_manifest["verification"]["source_event_complete"] is True
+
+
 def test_deterministic_smoke_cases_have_midi_audio_and_beat_annotation(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -63,6 +106,18 @@ def test_deterministic_smoke_cases_have_midi_audio_and_beat_annotation(tmp_path:
         assert _hash(first_root / f"{case_id}.mid") == _hash(second_root / f"{case_id}.mid")
         assert _hash(first_root / f"{case_id}.wav") == _hash(second_root / f"{case_id}.wav")
         assert _hash(first_root / f"{case_id}.beat_grid.json") == _hash(second_root / f"{case_id}.beat_grid.json")
+
+
+def test_legacy_renderer_manifest_requires_explicit_replacement(tmp_path: Path) -> None:
+    case_root = tmp_path / "generated" / "synthetic-piano-01"
+    case_root.mkdir(parents=True)
+    (case_root / "case_manifest.json").write_text(
+        json.dumps({"renderer_version": "deterministic_harmonic_oscillator_v1"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileExistsError, match="stale or legacy renderer manifest"):
+        generator.generate_case("synthetic-piano-01", destination=tmp_path / "generated")
 
 
 def test_generated_downbeat_accents_preserve_pitch_and_timing(tmp_path: Path) -> None:
@@ -101,6 +156,7 @@ def test_generated_downbeat_accents_preserve_pitch_and_timing(tmp_path: Path) ->
     )
     assert sorted((start, start + 480, pitch) for start, pitch, _velocity in starts) == source_notes
     assert first["renderer_version"] == generator.RENDERER_VERSION
+    assert first["source_event_complete"] is True
     assert meter == (4, 4)
 
 
@@ -162,6 +218,8 @@ def test_maestro_selector_records_clip_hashes_and_domain(tmp_path: Path, monkeyp
     assert record["midi"]["path"].startswith("rendered/clips/")
     assert record["audio"]["path"].startswith("rendered/clips/")
     assert record["beat_annotation"]["path"].startswith("rendered/clips/")
+    assert record["render_manifest"]["path"].endswith(".render_manifest.json")
+    assert record["source_event_complete"] is True
     assert record["clip"]["source_meter"] == "3/4"
     for key in ("midi", "audio", "beat_annotation"):
         path = tmp_path / "maestro" / record[key]["path"]

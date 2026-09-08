@@ -7,11 +7,12 @@ hashes are recorded so a later run cannot silently switch the public data.
 Audio is rendered locally from deterministic source MIDI clips.  These clips
 are valid end-to-end model cases in the benchmark's local-render domain: the
 audio still goes through the production recognizer, while the domain limits
-are disclosed explicitly.  The local renderer is a deterministic harmonic
-oscillator; it preserves MIDI pitch, timing, tempo, and note velocity but
-does not reproduce piano timbre, pedal noise, room acoustics, or the original
-MAESTRO performance.  Clip boundaries are selected from source MIDI timing
-before recognition and never from model output.
+are disclosed explicitly.  The pinned FluidSynth 2.6.0 binary receives the
+source MIDI directly with MS Basic.sf3; it preserves MIDI pitch, timing,
+tempo, meter, and note velocity but does not reproduce piano timbre, pedal
+noise, room acoustics, or the original MAESTRO performance.  Clip boundaries
+are selected from source MIDI timing before recognition and never from model
+output.
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ import sys
 import tempfile
 import urllib.request
 import zipfile
-import wave
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Sequence
@@ -33,12 +33,14 @@ import mido
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
+from scripts.fluidsynth_benchmark_renderer import RENDERER_VERSION, render_midi  # noqa: E402
 DEFAULT_URL = "https://storage.googleapis.com/magentadata/datasets/maestro/v3.0.0/maestro-v3.0.0-midi.zip"
 EXPECTED_SHA256 = "70470ee253295c8d2c71e6d9d4a815189e35c89624b76d22fce5a019d5dde12c"
 DEFAULT_OUTPUT = ROOT / ".cache" / "high-accuracy-benchmarks" / "maestro"
-RENDERER_VERSION = "deterministic_harmonic_oscillator_v1"
 CLIP_BARS = 8
 
 
@@ -176,23 +178,6 @@ def _clip_tracks(tracks: Sequence[Any], start: Fraction, end: Fraction) -> tuple
     return tuple(clipped_tracks)
 
 
-def _pad_or_trim_wav(path: Path, duration_sec: float) -> None:
-    """Make a rendered clip exactly as long as its source timing window."""
-
-    with wave.open(str(path), "rb") as source:
-        params = source.getparams()
-        frames = source.readframes(source.getnframes())
-    target_frames = max(1, round(float(duration_sec) * params.framerate))
-    frame_width = params.nchannels * params.sampwidth
-    frames = frames[: target_frames * frame_width]
-    frames += b"\x00" * max(0, target_frames * frame_width - len(frames))
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with wave.open(str(temporary), "wb") as output:
-        output.setparams(params)
-        output.writeframes(frames)
-    temporary.replace(path)
-
-
 def _clip_window(tracks: Sequence[Any], meter: tuple[int, int]) -> tuple[Fraction, Fraction]:
     """Choose the first note's containing bar and at most eight bars."""
 
@@ -257,7 +242,7 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
             clip_meter = _clip_points(metadata["meters"], start_q, end_q, default=(4, 4))
             clip_key = _clip_points(metadata["keys"], start_q, end_q, default="C")
 
-            from generate_high_accuracy_benchmarks import _beat_annotation, _render_audio, _tempo_seconds
+            from generate_high_accuracy_benchmarks import _beat_annotation
 
             full_audio_destination = rendered_root / f"{normalized_id}.wav"
             full_beat_destination = rendered_root / f"{normalized_id}.beat_grid.json"
@@ -265,8 +250,13 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
             # be very large for MAESTRO.  Reuse an existing full render even
             # when clips are being regenerated; the clip itself is always
             # rewritten below under ``--overwrite``.
-            if not full_audio_destination.exists():
-                _render_audio(full_audio_destination, tracks, source_tempo, seed=20260907 + index)
+            full_render_manifest_path = rendered_root / f"{normalized_id}.render_manifest.json"
+            full_render_manifest = render_midi(
+                midi_destination,
+                full_audio_destination,
+                manifest_path=full_render_manifest_path,
+                overwrite=True,
+            )
             source_end_q = max((note.end for track in tracks for note in track.notes), default=Fraction(1))
             if overwrite or not full_beat_destination.exists():
                 _beat_annotation(full_beat_destination, tempo=source_tempo, meter=source_meter, end_q=source_end_q, source="official_maestro_midi_rendered")
@@ -280,8 +270,13 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
 
             clip_midi = _midi_events(clip_tracks, clip_tempo, source_meter, source_key)
             clip_midi.save(clip_midi_destination)
-            _render_audio(clip_audio_destination, clip_tracks, clip_tempo, seed=20260907 + index)
-            _pad_or_trim_wav(clip_audio_destination, _tempo_seconds(clip_tempo, clip_end_q))
+            clip_render_manifest_path = clip_root / f"{normalized_id}.render_manifest.json"
+            clip_render_manifest = render_midi(
+                clip_midi_destination,
+                clip_audio_destination,
+                manifest_path=clip_render_manifest_path,
+                overwrite=True,
+            )
             _beat_annotation(
                 clip_beat_destination,
                 tempo=clip_tempo,
@@ -300,11 +295,17 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
                     },
                     "midi": _file_record(clip_midi_destination, relative_to=output_root),
                     "audio": _file_record(clip_audio_destination, relative_to=output_root),
+                    "render_manifest": _file_record(clip_render_manifest_path, relative_to=output_root),
                     "beat_annotation": _file_record(clip_beat_destination, relative_to=output_root),
                     "full_render": {
                         "audio": _file_record(full_audio_destination, relative_to=output_root),
+                        "render_manifest": _file_record(full_render_manifest_path, relative_to=output_root),
                         "beat_annotation": _file_record(full_beat_destination, relative_to=output_root),
                     },
+                    "source_event_complete": bool(
+                        clip_render_manifest["verification"]["source_event_complete"]
+                        and full_render_manifest["verification"]["source_event_complete"]
+                    ),
                     "ticks_per_beat": midi.ticks_per_beat,
                     "clip": {
                         "start_quarter": str(start_q),
@@ -327,12 +328,14 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
         "source_url": "https://magenta.tensorflow.org/datasets/maestro",
         "download_url": DEFAULT_URL,
         "license": "CC BY-NC-SA 4.0",
-        "render_seed": 20260907,
+        "renderer": RENDERER_VERSION,
+        "render_seed": None,
         "archive": {"path": str(archive), "bytes": archive.stat().st_size, "sha256": actual_sha},
         "selection_rule": "sorted archive MIDI member names, first ten after hash verification",
         "render_domain": {
             "kind": "local_midi_render",
             "renderer": RENDERER_VERSION,
+            "renderer_policy": "see each case render_manifest for pinned FluidSynth executable/SoundFont hashes, PCM16 format, gain, effects, and fixed tail",
             "preserves": ["MIDI pitch", "MIDI onset and duration", "MIDI note velocity", "tempo map", "source meter and key at clip start"],
             "does_not_model": ["piano timbre", "pedal noise", "room acoustics", "original performance nuance"],
             "velocity_policy": "preserve_source_midi",
