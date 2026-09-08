@@ -1001,14 +1001,15 @@ def test_score_normalizer_clears_inconsistent_dots_before_bounded_fragment_repai
 
     notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
     assert [(event.midi, event.start_tick, event.end_tick, event.dots, event.tie) for event in notes] == [
-        (72, 1008, 1059, 0, None),
-        (72, 1059, 1062, 0, None),
+        (72, 1008, 1056, 0, "start"),
+        (72, 1056, 1060, 0, "stop"),
+        (72, 1060, 1062, 0, None),
     ]
     reasons = [item["reason"] for item in report["notation_grid_repairs"]]
     assert reasons == [
         "explicit_dots_cleared_after_duration_validation",
-        "fine_grid_tie_fragment_merged_for_jianpu_atom",
-        "fine_grid_note_shifted_to_jianpu_atom",
+        "fine_grid_singleton_encoded_as_explicit_tuplet",
+        "fine_grid_singleton_encoded_as_explicit_tuplet",
     ]
     dot_repair = report["notation_grid_repairs"][0]
     assert dot_repair["musicxml_event_id"] == "rounded-dotted-fragment"
@@ -1016,7 +1017,7 @@ def test_score_normalizer_clears_inconsistent_dots_before_bounded_fragment_repai
     assert dot_repair["repaired_dots"] == 0
     assert dot_repair["notated_duration_ticks"] == 4
     assert "explicit dot hints" in " ".join(score.warnings)
-    assert "bounded jianpu atom repairs" in " ".join(score.warnings)
+    assert "Independent 1/2/4/5-tick" in " ".join(score.warnings)
     for voice in score.voices:
         _validate_explicit_ties(voice)
     assert score_to_jianpu(score)
@@ -1104,14 +1105,20 @@ def test_tiny_fragment_after_tie_repair_closes_one_tick_gap_before_tuplet_infere
     voice = next(voice for voice in score.voices if voice.source_voice == "6")
     assert all(left.end_tick == right.start_tick for left, right in zip(voice.events, voice.events[1:]))
     tiny = next(event for event in voice.events if event.metadata.get("musicxml_event_id") == "following-tiny-chord")
-    assert (tiny.start_tick, tiny.end_tick) == (963, 966)
-    repairs = [
-        item
-        for item in report["notation_grid_repairs"]
-        if item.get("musicxml_event_id") == "following-tiny-chord"
+    assert (tiny.start_tick, tiny.end_tick) == (964, 966)
+    repairs = report["notation_grid_repairs"]
+    assert [item["reason"] for item in repairs] == [
+        "explicit_dots_cleared_after_duration_validation",
+        "fine_grid_singleton_encoded_as_explicit_tuplet",
+        "fine_grid_fragment_encoded_as_explicit_tuplet",
     ]
-    assert repairs and repairs[0]["movement_ticks"] == -1
-    assert repairs[0]["action"] == "move_tiny_event_across_repair_gap_to_previous_boundary"
+    singleton = repairs[1]
+    assert singleton["musicxml_event_ids"] == ["rounded-tie-stop"]
+    assert singleton["movement_ticks"] == 0
+    assert singleton["action"] == "annotate_exact_fine_grid_singleton_tuplet"
+    inferred = repairs[2]
+    assert inferred["musicxml_event_ids"] == ["following-tiny-chord", "following-rest", "following-rest-2"]
+    assert inferred["movement_ticks"] == 0
     assert score_to_jianpu(score)
 
 
@@ -1167,9 +1174,13 @@ def test_finer_binary_musescore_fragment_is_bounded_to_48_tpq_with_alignment_dia
         },
     )
     notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
-    assert [(event.midi, event.start_tick, event.end_tick) for event in notes] == [(60, 756, 765), (67, 765, 768)]
-    assert notes[0].tie is None
-    assert notes[0].tie_types == []
+    assert [(event.midi, event.start_tick, event.end_tick) for event in notes] == [
+        (60, 756, 765),
+        (60, 765, 766),
+        (67, 766, 768),
+    ]
+    assert notes[0].tie == "start"
+    assert notes[0].tie_types == ["start"]
     for voice in score.voices:
         _validate_explicit_ties(voice)
     assert score_to_jianpu(score)
@@ -1179,15 +1190,15 @@ def test_finer_binary_musescore_fragment_is_bounded_to_48_tpq_with_alignment_dia
     assert all(abs(float(item["movement_ticks"])) <= 0.5 for item in repairs)
     notation_repairs = report["notation_grid_repairs"]
     assert [item["reason"] for item in notation_repairs] == [
-        "fine_grid_tie_fragment_merged_for_jianpu_atom",
-        "fine_grid_note_shifted_to_jianpu_atom",
+        "fine_grid_singleton_encoded_as_explicit_tuplet",
+        "fine_grid_singleton_encoded_as_explicit_tuplet",
     ]
     assert all(abs(int(item["movement_ticks"])) <= 2 for item in notation_repairs)
-    assert all(event.duration_tick >= 3 for event in notes)
-    assert report["source_to_score"][0]["score_end_tick"] == 765
-    assert report["source_to_score"][0]["musicxml_to_score_movement_end_ticks"] == -1
-    assert report["source_to_score"][1]["score_start_tick"] == 765
-    assert report["source_to_score"][1]["musicxml_to_score_movement_start_ticks"] == -1
+    assert [(event.start_tick, event.end_tick) for event in notes] == [(756, 765), (765, 766), (766, 768)]
+    assert report["source_to_score"][0]["score_end_tick"] == 766
+    assert report["source_to_score"][0]["musicxml_to_score_movement_end_ticks"] == 0
+    assert report["source_to_score"][1]["score_start_tick"] == 766
+    assert report["source_to_score"][1]["musicxml_to_score_movement_start_ticks"] == 0
     assert "Finer binary MusicXML fragments" in " ".join(score.warnings)
     assert "bounded jianpu atom repairs" in " ".join(score.warnings)
 
@@ -1249,16 +1260,20 @@ def test_finer_binary_three_fragment_tie_keeps_stop_for_existing_chain() -> None
     notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
     assert [(event.midi, event.start_tick, event.end_tick, event.tie, event.tie_types) for event in notes] == [
         (60, 720, 756, "start", ["start"]),
-        (60, 756, 765, "stop", ["stop"]),
-        (55, 765, 768, None, []),
+        (60, 756, 765, "continue", ["continue"]),
+        (60, 765, 766, "stop", ["stop"]),
+        (55, 766, 768, None, []),
     ]
-    assert report["notation_grid_repairs"][0]["reason"] == "fine_grid_tie_fragment_merged_for_jianpu_atom"
+    assert [item["reason"] for item in report["notation_grid_repairs"]] == [
+        "fine_grid_singleton_encoded_as_explicit_tuplet",
+        "fine_grid_singleton_encoded_as_explicit_tuplet",
+    ]
     for voice in score.voices:
         _validate_explicit_ties(voice)
     assert score_to_jianpu(score)
 
 
-def test_finer_binary_standalone_note_consumes_following_rest_to_reach_atom() -> None:
+def test_finer_binary_standalone_note_uses_exact_singleton_tuplet() -> None:
     payload = _manual_payload()
     payload.highest_time_quarter = 8
     payload.parts[0].highest_time_quarter = 8
@@ -1286,14 +1301,199 @@ def test_finer_binary_standalone_note_consumes_following_rest_to_reach_atom() ->
     score, report = standardize_musicxml_payload(payload)
 
     note = next(event for voice in score.voices for event in voice.events if event.midi == 67)
-    assert (note.start_tick, note.duration_tick, note.end_tick) == (0, 3, 3)
-    repair = next(item for item in report["notation_grid_repairs"] if item["musicxml_event_id"] == "standalone-fine-note")
-    assert repair["reason"] == "fine_grid_note_extended_to_jianpu_atom"
-    assert repair["movement_ticks"] == 1
-    assert repair["bounded_by_ticks"] == 2
+    assert (note.start_tick, note.duration_tick, note.end_tick) == (0, 2, 2)
+    assert (note.tuplet_actual, note.tuplet_normal, note.tuplet_type) == (3, 1, "start")
+    repair = next(item for item in report["notation_grid_repairs"] if item["musicxml_event_ids"] == ["standalone-fine-note"])
+    assert repair["reason"] == "fine_grid_singleton_encoded_as_explicit_tuplet"
+    assert repair["nominal_duration_ticks"] == [6]
+    assert repair["movement_ticks"] == 0
+    assert repair["timing_preserved"] is True
+    assert repair["original_start_tick"] == 0
+    assert repair["original_end_tick"] == 2
     for voice in score.voices:
         _validate_explicit_ties(voice)
-    assert score_to_jianpu(score)
+
+
+@pytest.mark.parametrize(
+    ("duration_tick", "midi"),
+    [(1, 60), (2, None), (3, 61), (4, 62), (5, None)],
+)
+def test_fine_grid_singleton_note_and_rest_durations_are_exact(
+    duration_tick: int,
+    midi: int | None,
+) -> None:
+    event_id = f"fine-single-{duration_tick}"
+    voice = ScoreVoice(
+        voice_id="fine-singleton",
+        source_voice="1",
+        events=[
+            ScoreNote(
+                start_tick=0,
+                duration_tick=duration_tick,
+                midi=midi,
+                metadata={"musicxml_event_id": event_id},
+            )
+        ],
+    )
+    voices, repairs = _repair_fine_score_events([voice], [], total_ticks=duration_tick)
+    repaired = voices[0].events[0]
+    assert (repaired.start_tick, repaired.duration_tick, repaired.end_tick) == (0, duration_tick, duration_tick)
+
+    score = Score(
+        title="fine-grid singleton",
+        bpm=120,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=duration_tick,
+        voices=voices,
+        metadata={
+            "timeline_measures": [
+                {
+                    "start_tick": 0,
+                    "duration_tick": duration_tick,
+                    "end_tick": duration_tick,
+                    "time_signature": "4/4",
+                }
+            ]
+        },
+    )
+    serialized = score_to_jianpu(score)
+    if duration_tick in {1, 2, 4, 5}:
+        assert (repaired.tuplet_actual, repaired.tuplet_normal, repaired.tuplet_type) == (3, 1, "start")
+        assert "3:1[" in serialized
+        assert [item["musicxml_event_ids"] for item in repairs] == [[event_id]]
+        assert repairs[0]["duration_ticks"] == [duration_tick]
+        assert repairs[0]["nominal_duration_ticks"] == [duration_tick * 3]
+        assert repairs[0]["movement_ticks"] == 0
+    else:
+        assert repaired.tuplet_actual is None
+        assert repaired.tuplet_normal is None
+        assert "3:1[" not in serialized
+        assert repairs == []
+
+
+@pytest.mark.skipif(
+    not (ROOT / "vendor" / "jianpu-ly" / "jianpu-ly.py").is_file()
+    or not (ROOT / "tools" / "lilypond-2.24.4" / "bin" / "lilypond.exe").is_file(),
+    reason="pinned jianpu-ly or LilyPond is unavailable",
+)
+def test_fine_grid_singletons_render_exact_note_intervals(tmp_path: Path) -> None:
+    """The visible 3:1 brackets must survive the complete LilyPond MIDI path."""
+
+    def event(start_tick: int, duration_tick: int, midi: int | None) -> ScoreNote:
+        metadata: dict[str, object] = {}
+        kwargs: dict[str, object] = {}
+        if duration_tick in {1, 2, 4, 5}:
+            kwargs.update(tuplet_actual=3, tuplet_normal=1, tuplet_type="start")
+            metadata.update(fine_grid_tuplet=True, fine_grid_tuplet_single=True)
+        return ScoreNote(
+            start_tick=start_tick,
+            duration_tick=duration_tick,
+            midi=midi,
+            metadata=metadata,
+            **kwargs,
+        )
+
+    events: list[ScoreNote] = []
+    cursor = 0
+    for duration_tick, midi in ((1, None), (2, 60), (3, None), (4, 62), (5, None)):
+        events.append(event(cursor, duration_tick, midi))
+        cursor += duration_tick
+    for duration_tick, midi in ((144, 64), (24, None), (9, 65)):
+        events.append(ScoreNote(start_tick=cursor, duration_tick=duration_tick, midi=midi))
+        cursor += duration_tick
+
+    score = Score(
+        title="fine-grid singleton render smoke",
+        bpm=100,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=cursor,
+        voices=[ScoreVoice(voice_id="fine-grid", events=events)],
+    )
+    serialized = score_to_jianpu(score)
+    assert serialized.count("3:1[") == 4
+
+    artifacts = render_score(score, tmp_path, basename="fine-grid-singletons")
+    assert artifacts.svg_paths
+    midi = mido.MidiFile(artifacts.midi_path)
+    scale = midi.ticks_per_beat // score.quarter_ticks
+    expected = [(60, 1, 3), (62, 6, 10), (64, 15, 159), (65, 183, 192)]
+    intervals: list[tuple[int, int, int]] = []
+    note_track_end: int | None = None
+    for track in midi.tracks:
+        absolute = 0
+        active: dict[int, list[int]] = {}
+        track_intervals: list[tuple[int, int, int]] = []
+        for message in track:
+            absolute += message.time
+            if message.type == "note_on" and message.velocity:
+                active.setdefault(message.note, []).append(absolute)
+            elif message.type in {"note_off", "note_on"} and not message.velocity:
+                starts = active.get(message.note, [])
+                if starts:
+                    track_intervals.append((message.note, starts.pop(0), absolute))
+        if track_intervals:
+            intervals.extend(track_intervals)
+            note_track_end = absolute
+
+    assert intervals == [(pitch, start * scale, end * scale) for pitch, start, end in expected]
+    assert note_track_end == score.total_ticks * scale
+
+
+def test_fine_grid_singleton_at_tie_boundary_does_not_consume_tied_neighbor() -> None:
+    voice = ScoreVoice(
+        voice_id="fine-tie-boundary",
+        source_voice="1",
+        events=[
+            ScoreNote(
+                start_tick=0,
+                duration_tick=2,
+                midi=None,
+                metadata={"musicxml_event_id": "boundary-rest"},
+            ),
+            ScoreNote(
+                start_tick=2,
+                duration_tick=4,
+                midi=60,
+                tie="start",
+                tie_types=["start"],
+                metadata={"musicxml_event_id": "tie-start"},
+            ),
+            ScoreNote(
+                start_tick=6,
+                duration_tick=3,
+                midi=60,
+                tie="stop",
+                tie_types=["stop"],
+                metadata={"musicxml_event_id": "tie-stop"},
+            ),
+        ],
+    )
+    voices, repairs = _repair_fine_score_events([voice], [], total_ticks=9)
+    events = voices[0].events
+    assert [event.metadata["musicxml_event_id"] for event in events] == ["boundary-rest", "tie-start", "tie-stop"]
+    assert [(event.start_tick, event.end_tick) for event in events] == [(0, 2), (2, 6), (6, 9)]
+    assert events[0].metadata["fine_grid_tuplet_single"] is True
+    assert events[1].metadata["fine_grid_tuplet_single"] is True
+    assert events[1].tie == "start" and events[2].tie == "stop"
+    assert [item["musicxml_event_ids"] for item in repairs] == [["boundary-rest"], ["tie-start"]]
+
+    score = Score(
+        title="fine-grid tie boundary",
+        bpm=120,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=9,
+        voices=voices,
+        metadata={
+            "timeline_measures": [{"start_tick": 0, "duration_tick": 9, "end_tick": 9, "time_signature": "4/4"}]
+        },
+    )
+    assert "3:1[" in score_to_jianpu(score)
 
 
 def _fine_grid_tuplet_fixture_payload() -> WorkerPayload:
@@ -1492,8 +1692,11 @@ def test_finer_binary_chord_tie_slots_clear_only_merged_pitches() -> None:
 
     notes = [event for voice in score.voices for event in voice.events if event.midi is not None]
     assert notes[0].chord_pitches == [60, 64]
-    assert notes[0].tie is None
-    assert notes[0].tie_types == [None, None]
+    assert [(event.midi, event.start_tick, event.end_tick, event.tie, event.tie_types) for event in notes] == [
+        (60, 756, 765, "start", ["start", "start"]),
+        (60, 765, 766, "stop", ["stop", "stop"]),
+        (55, 766, 768, None, []),
+    ]
     for voice in score.voices:
         _validate_explicit_ties(voice)
     assert score_to_jianpu(score)

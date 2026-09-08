@@ -534,6 +534,11 @@ class _Slice:
     # bit on the slice, rather than widening all Score JSON tuplets, prevents
     # an arbitrary ratio from entering the production serializer silently.
     fine_grid_tuplet: bool = False
+    # A bounded 1/2/4/5-tick event can be represented as one explicit 3:1
+    # bracket whose body is one or more ordinary atoms.  This marker closes
+    # that bracket around the single Score event without treating a nearby
+    # event as an inferred tuplet member.
+    fine_grid_tuplet_single: bool = False
     dots: int = 0
 
     @property
@@ -1366,6 +1371,7 @@ def _slice_voice_events(voice: ScoreVoice, spans: list[_MeasureSpan]) -> list[li
                         else None
                     ),
                     fine_grid_tuplet=bool(event.metadata.get("fine_grid_tuplet", False)),
+                    fine_grid_tuplet_single=bool(event.metadata.get("fine_grid_tuplet_single", False)),
                     dots=event.dots if is_first and is_last else 0,
                 )
             )
@@ -1522,6 +1528,21 @@ def _explicit_tuplet_groups(slices: list[_Slice]) -> dict[int, tuple[tuple[int, 
     open_ratio: tuple[int, int] | None = None
 
     for index, (ratio, boundary) in enumerate(marked):
+        if slices[index].fine_grid_tuplet_single and boundary != "start":
+            raise JianpuSerializationError(
+                f"fine-grid singleton at tick {slices[index].start_tick} is missing its start boundary"
+            )
+        if boundary == "start" and slices[index].fine_grid_tuplet_single:
+            if open_start is not None:
+                raise JianpuSerializationError(
+                    f"nested/overlapping explicit tuplets at tick {slices[index].start_tick}"
+                )
+            if ratio is None:
+                raise JianpuSerializationError(
+                    f"fine-grid singleton at tick {slices[index].start_tick} has no ratio"
+                )
+            groups[index] = (ratio, index + 1)
+            continue
         if boundary == "start":
             if open_start is not None:
                 raise JianpuSerializationError(

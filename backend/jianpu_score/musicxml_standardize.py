@@ -2852,6 +2852,89 @@ def _fine_tuplet_repair(
     return None
 
 
+def _fine_singleton_tuplet_repair(
+    events: list[ScoreNote],
+    index: int,
+    *,
+    voice_id: str,
+) -> tuple[list[ScoreNote], dict[str, Any]] | None:
+    """Encode one unsupported fine-grid event without consuming neighbors.
+
+    The pinned renderer has exact ordinary atoms at 3 ticks and above only
+    when the duration is a sum of those atoms.  A single 1, 2, 4, or 5 tick
+    event can instead use one explicit 3:1 bracket: its nominal body is 3,
+    6, 12, or 15 ticks.  Its event boundary and tie fields remain exactly as
+    imported; no adjacent event is inferred into this representation.
+    """
+
+    event = events[index]
+    if event.duration_tick not in {1, 2, 4, 5}:
+        return None
+    if (
+        event.tuplet_actual is not None
+        or event.tuplet_normal is not None
+        or event.tuplet_type is not None
+        or event.metadata.get("fine_grid_tuplet")
+        or event.metadata.get("fine_grid_tuplet_group_id")
+        or event.dots
+        or event.metadata.get("implicit")
+    ):
+        return None
+    actual, normal = 3, 1
+    nominal_duration = event.duration_tick * actual
+    candidate = event.model_copy(
+        update={"tuplet_actual": actual, "tuplet_normal": normal, "tuplet_type": "start"}
+    )
+    if not _score_duration_is_serializable(candidate):
+        return None
+    event_id = _event_musicxml_id(event) or f"score:{event.start_tick}:{event.end_tick}"
+    group_id = ":".join(
+        [
+            "fine-grid-single",
+            voice_id,
+            str(event.start_tick),
+            str(event.end_tick),
+            str(actual),
+            str(normal),
+            event_id,
+        ]
+    )
+    repair = {
+        "reason": "fine_grid_singleton_encoded_as_explicit_tuplet",
+        "action": "annotate_exact_fine_grid_singleton_tuplet",
+        "voice_id": voice_id,
+        "musicxml_event_ids": [event_id],
+        "group_id": group_id,
+        "member_count": 1,
+        "singleton": True,
+        "start_tick": event.start_tick,
+        "end_tick": event.end_tick,
+        "original_start_tick": event.start_tick,
+        "original_end_tick": event.end_tick,
+        "duration_ticks": [event.duration_tick],
+        "nominal_duration_ticks": [nominal_duration],
+        "ratio": {"actual": actual, "normal": normal},
+        "tuplet_actual": actual,
+        "tuplet_normal": normal,
+        "movement_ticks": 0,
+        "timing_preserved": True,
+        "ordinary_atom_failure": True,
+    }
+    metadata = dict(event.metadata)
+    metadata.update(
+        {
+            "fine_grid_tuplet": True,
+            "fine_grid_tuplet_single": True,
+            "fine_grid_tuplet_ratio": {"actual": actual, "normal": normal},
+            "fine_grid_tuplet_group_id": group_id,
+            "fine_grid_tuplet_member_index": 0,
+            "fine_grid_tuplet_repair": repair,
+        }
+    )
+    events[index] = candidate.model_copy(update={"metadata": metadata})
+    return events, repair
+
+
 def _is_fine_grid_tuplet_member(event: ScoreNote | None) -> bool:
     return bool(event is not None and event.metadata.get("fine_grid_tuplet"))
 
@@ -2919,7 +3002,11 @@ def _validate_fine_grid_tuplet_groups(events: list[ScoreNote], *, voice_id: str)
             raise MusicXMLStandardizationError(
                 f"fine-grid tuplet group {group_id!r} in voice {voice_id} has inconsistent ratios or member order"
             )
-        expected_boundaries = ["start", *([None] * (expected_count - 2)), "stop"]
+        expected_boundaries = (
+            ["start"]
+            if repair.get("singleton") is True
+            else ["start", *([None] * (expected_count - 2)), "stop"]
+        )
         if [event.tuplet_type for event in members] != expected_boundaries:
             raise MusicXMLStandardizationError(
                 f"fine-grid tuplet group {group_id!r} in voice {voice_id} is not closed"
@@ -3090,6 +3177,16 @@ def _repair_fine_score_events(
             )
             if tuplet_repair is not None:
                 events, repair = tuplet_repair
+                repairs.append(repair)
+                index += 1
+                continue
+            singleton_repair = _fine_singleton_tuplet_repair(
+                events,
+                index,
+                voice_id=voice.voice_id,
+            )
+            if singleton_repair is not None:
+                events, repair = singleton_repair
                 repairs.append(repair)
                 index += 1
                 continue
@@ -4286,7 +4383,7 @@ def standardize_musicxml_payload(
         ],
         "source_note_policy": "performance metadata is used only for auditable source-to-MusicXML alignment; XML pitch/timing remains authoritative",
         "alignment_tick_semantics": "source_to_score_movement_* = final Score tick - source performance tick; musicxml_to_score_movement_* = final Score tick - MusicXML tick",
-        "score_grid_precision_policy": "48 TPQ preserves exact 1/32-note, dotted, and supported 3:2 triplet values; compact finer binary MuseScore fragments are encoded as explicit 3:2 or bounded 3:1 fine-grid tuplets when every nominal atom is integral, without moving timing; isolated one/two-tick renderer fragments may still move within a 2-tick jianpu atom bound with every movement recorded; other fractional values are rejected explicitly",
+        "score_grid_precision_policy": "48 TPQ preserves exact 1/32-note, dotted, and supported 3:2 triplet values; compact finer binary MuseScore fragments are encoded as explicit 3:2 or bounded 3:1 fine-grid tuplets when every nominal atom is integral, including single 1/2/4/5-tick events without consuming adjacent events; isolated one/two-tick renderer fragments may still move within a 2-tick jianpu atom bound with every movement recorded; other fractional values are rejected explicitly",
         "conductor_reconciliation": conductor["reconciliation"],
     }
     warnings: list[str] = []
@@ -4300,6 +4397,8 @@ def standardize_musicxml_payload(
         warnings.append("Finer MusicXML fragments required bounded jianpu atom repairs; inspect alignment_report.json")
     if any(item.get("reason") == "fine_grid_fragment_encoded_as_explicit_tuplet" for item in notation_grid_repairs):
         warnings.append("Compact finer MusicXML fragments were preserved as explicit exact fine-grid tuplets; inspect alignment_report.json")
+    if any(item.get("reason") == "fine_grid_singleton_encoded_as_explicit_tuplet" for item in notation_grid_repairs):
+        warnings.append("Independent 1/2/4/5-tick MusicXML events were preserved as explicit exact 3:1 singleton tuplets; inspect alignment_report.json")
     if tuplet_marker_repairs:
         warnings.append("MusicXML explicit tuplet markers were repaired only for an auditable orphan or cross-voice import artifact; inspect alignment_report.json")
     if meter_rebar["applied"]:
@@ -4317,7 +4416,7 @@ def standardize_musicxml_payload(
         "music21_version": payload.music21_version,
         "musicxml_worker_schema_version": payload.schema_version,
         "score_ticks_per_quarter": SCORE_QUARTER_TICKS,
-        "score_grid_precision_policy": "exact 48 TPQ for supported notation; compact finer binary MusicXML fragments use explicit exact 3:2/3:1 fine-grid tuplets when possible, while any isolated one/two-tick jianpu atom repair is bounded to 2 ticks and recorded in alignment_report.json; other unsupported fractions are rejected",
+        "score_grid_precision_policy": "exact 48 TPQ for supported notation; compact finer binary MusicXML fragments use explicit exact 3:2/3:1 fine-grid tuplets when possible, including independent 1/2/4/5-tick singleton events without adjacent-event merging, while any remaining isolated one/two-tick jianpu atom repair is bounded to 2 ticks and recorded in alignment_report.json; other unsupported fractions are rejected",
         "source_musicxml": payload.source_path,
         "parts": [
             {
