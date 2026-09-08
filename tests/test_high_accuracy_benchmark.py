@@ -25,6 +25,14 @@ def _write_midi(path: Path, *, pitch: int = 60, ppq: int = 480, pitches: tuple[i
     midi.save(path)
 
 
+def _rhythm_metric(value: float) -> dict[str, object]:
+    return {
+        "mean_rhythm_error_quarter": value,
+        "mean_fixed_total_assignment_rhythm_error_quarter": value,
+        "metric_schema": benchmark.RHYTHM_METRIC_SCHEMA,
+    }
+
+
 def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
     registry = benchmark._load_registry(ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json")
     assert registry["schema_version"] == "2.0"
@@ -119,6 +127,7 @@ def test_rhythm_assignment_penalizes_unmatched_notes_and_zero_match_cases() -> N
     assert metric["fixed_total_assignment_cost_quarter"] == 2.0
     assert metric["mean_fixed_total_assignment_rhythm_error_quarter"] == 1.0
     assert metric["mean_rhythm_error_quarter"] == 1.0
+    assert metric["metric_schema"] == benchmark.RHYTHM_METRIC_SCHEMA
 
     zero_match = benchmark.rhythm_error(
         reference,
@@ -136,10 +145,41 @@ def test_rhythm_gate_prefers_fixed_total_metric_when_report_has_both_fields() ->
             "rhythm_error": {
                 "mean_rhythm_error_quarter": 0.01,
                 "mean_fixed_total_assignment_rhythm_error_quarter": 1.25,
+                "metric_schema": benchmark.RHYTHM_METRIC_SCHEMA,
             }
         }
     }
     assert benchmark._metric_f1(case, "rhythm_error", "mean_rhythm_error_quarter") == 1.25
+
+    legacy = {"metrics": {"rhythm_error": {"mean_rhythm_error_quarter": 0.01}}}
+    assert benchmark._metric_f1(legacy, "rhythm_error", "mean_rhythm_error_quarter") is None
+    assert benchmark._has_fixed_total_rhythm_metric(legacy) is False
+
+
+def test_accuracy_gate_rejects_legacy_rhythm_report_instead_of_falling_back() -> None:
+    def legacy_case(case_id: str) -> dict[str, object]:
+        return {
+            "id": case_id,
+            "status": "evaluated",
+            "crash": False,
+            "evaluation_policy": "reference_metrics",
+            "reference_midi_reliable": True,
+            "metrics": {
+                "pitch_f1": {"f1": 0.9},
+                "chord_retention": {"retention": 0.9},
+                "rhythm_error": {"mean_rhythm_error_quarter": 0.01},
+            },
+        }
+
+    claim = benchmark.assess_accuracy_claim(
+        [legacy_case("case-1"), legacy_case("case-2")],
+        [legacy_case("case-1"), legacy_case("case-2")],
+        minimum_cases=2,
+        require_beat_metrics=False,
+    )
+    assert claim["ready"] is False
+    assert "fixed-total rhythm metric" in claim["reason"]
+    assert "需重跑" in claim["reason"]
 
 
 def test_beat_grid_time_sec_and_downbeat_metrics_are_read_correctly(tmp_path: Path) -> None:
@@ -324,7 +364,7 @@ def test_accuracy_gate_reports_quantizer_and_production_scopes_separately() -> N
             "metrics": {
                 "pitch_f1": {"f1": 0.9},
                 "chord_retention": {"retention": 0.9},
-                "rhythm_error": {"mean_rhythm_error_quarter": rhythm},
+                "rhythm_error": _rhythm_metric(rhythm),
                 "beat_f1": None,
                 "downbeat_f1": None,
             },
@@ -366,7 +406,7 @@ def test_accuracy_gate_requires_real_baseline_and_accepts_synthetic_passing_fixt
             "metrics": {
                 "pitch_f1": {"f1": pitch},
                 "chord_retention": {"retention": chord},
-                "rhythm_error": {"mean_rhythm_error_quarter": rhythm},
+                "rhythm_error": _rhythm_metric(rhythm),
                 "beat_f1": {"f1": 0.9},
                 "downbeat_f1": {"f1": 0.8},
             },
@@ -395,7 +435,7 @@ def test_accuracy_gate_rejects_disjoint_case_ids_even_when_each_side_has_thirty(
             "metrics": {
                 "pitch_f1": {"f1": 0.9},
                 "chord_retention": {"retention": 0.9},
-                "rhythm_error": {"mean_rhythm_error_quarter": 0.1},
+                "rhythm_error": _rhythm_metric(0.1),
                 "beat_f1": {"f1": 0.9},
                 "downbeat_f1": {"f1": 0.8},
             },
@@ -419,7 +459,7 @@ def test_accuracy_gate_requires_beat_coverage_in_addition_to_mean_f1() -> None:
             "metrics": {
                 "pitch_f1": {"f1": 0.9},
                 "chord_retention": {"retention": 0.9},
-                "rhythm_error": {"mean_rhythm_error_quarter": 0.1},
+                "rhythm_error": _rhythm_metric(0.1),
                 "beat_f1": {"f1": 0.95} if with_beats else None,
                 "downbeat_f1": {"f1": 0.85} if with_beats else None,
             },
@@ -463,7 +503,7 @@ def test_build_report_requires_thirty_shared_production_cases(monkeypatch) -> No
             "metrics": {
                 "pitch_f1": {"f1": 0.9},
                 "chord_retention": {"retention": 0.9},
-                "rhythm_error": {"mean_rhythm_error_quarter": 0.1},
+                "rhythm_error": _rhythm_metric(0.1),
                 "beat_f1": {"f1": beat} if beat is not None else None,
                 "downbeat_f1": {"f1": 0.8} if beat is not None else None,
             },
@@ -475,8 +515,8 @@ def test_build_report_requires_thirty_shared_production_cases(monkeypatch) -> No
     }
     baseline_values = {
         **values,
-        "quantizer": {**values["quantizer"], "metrics": {**values["quantizer"]["metrics"], "rhythm_error": {"mean_rhythm_error_quarter": 0.2}}},
-        "production": {**values["production"], "metrics": {**values["production"]["metrics"], "rhythm_error": {"mean_rhythm_error_quarter": 0.2}}},
+        "quantizer": {**values["quantizer"], "metrics": {**values["quantizer"]["metrics"], "rhythm_error": _rhythm_metric(0.2)}},
+        "production": {**values["production"], "metrics": {**values["production"]["metrics"], "rhythm_error": _rhythm_metric(0.2)}},
     }
     monkeypatch.setattr(benchmark, "evaluate_case", lambda case, result_root=None: values[str(case["id"])])
     report = benchmark.build_report(

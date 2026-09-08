@@ -26,6 +26,7 @@ DEFAULT_REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.jso
 DEFAULT_OUTPUT = ROOT / "artifacts" / "review" / "high-accuracy-benchmark" / "latest.json"
 MidiNote = tuple[int, Fraction, Fraction]
 UNMATCHED_NOTE_PENALTY_QUARTERS = Fraction(1, 1)
+RHYTHM_METRIC_SCHEMA = "fixed_total_assignment_v1"
 
 
 def _sha256(path: Path) -> str:
@@ -175,6 +176,7 @@ def rhythm_error(reference: Sequence[MidiNote], predicted: Sequence[MidiNote], *
         "fixed_total_denominator_reference_notes": fixed_total_denominator,
         "unmatched_penalty_quarter_each_fn_or_fp": float(UNMATCHED_NOTE_PENALTY_QUARTERS),
         "mean_fixed_total_assignment_rhythm_error_quarter": float(fixed_total_cost / fixed_total_denominator),
+        "metric_schema": RHYTHM_METRIC_SCHEMA,
         # Preserve the historical field name as the official gate metric.  It
         # now has fixed-total semantics; matched-only timing remains available
         # under mean_matched_rhythm_error_quarter above.
@@ -440,10 +442,19 @@ def _metric_f1(case: Mapping[str, Any], name: str, field: str) -> float | None:
         return None
     number = value.get(field)
     if name == "rhythm_error" and field == "mean_rhythm_error_quarter":
-        # Reports produced before the fixed-total metric only have the legacy
-        # matched-only field; new reports explicitly prefer the stricter value.
-        number = value.get("mean_fixed_total_assignment_rhythm_error_quarter", number)
+        # Never fall back to the historical matched-only value for a formal
+        # gate comparison.  The capability check below adds an explicit
+        # rerun reason for old baseline reports.
+        number = value.get("mean_fixed_total_assignment_rhythm_error_quarter")
     return float(number) if isinstance(number, (int, float)) and math.isfinite(float(number)) else None
+
+
+def _has_fixed_total_rhythm_metric(case: Mapping[str, Any]) -> bool:
+    value = (case.get("metrics") or {}).get("rhythm_error")
+    if not isinstance(value, Mapping) or value.get("metric_schema") != RHYTHM_METRIC_SCHEMA:
+        return False
+    number = value.get("mean_fixed_total_assignment_rhythm_error_quarter")
+    return isinstance(number, (int, float)) and math.isfinite(float(number))
 
 
 def _mean_metric(cases: Sequence[Mapping[str, Any]], name: str, field: str) -> float | None:
@@ -494,8 +505,9 @@ def assess_accuracy_claim(
     """Apply the stated accuracy gate without filling missing results.
 
     The gate is deliberately separate from per-case scoring so a future run
-    can supply a baseline produced by the old chain without changing this
-    registry or pretending that unrun cases passed.
+    can supply a baseline produced by the old chain after it has been
+    regenerated with the current fixed-total rhythm metric; legacy reports
+    cannot silently participate with a different metric definition.
     """
 
     reasons: list[str] = []
@@ -539,6 +551,19 @@ def assess_accuracy_claim(
     if len(shared_ids) < minimum_cases:
         reasons.append(f"相同可靠 case ID 只有 {len(shared_ids)}/{minimum_cases} 个")
 
+    new_rhythm_missing = [case_id for case_id in shared_ids if not _has_fixed_total_rhythm_metric(new_by_id[case_id])]
+    baseline_rhythm_missing = [case_id for case_id in shared_ids if not _has_fixed_total_rhythm_metric(baseline_by_id[case_id])]
+    if new_rhythm_missing:
+        reasons.append(
+            "新链路缺少 fixed-total rhythm metric "
+            f"({RHYTHM_METRIC_SCHEMA})，需重跑：{', '.join(new_rhythm_missing)}"
+        )
+    if baseline_rhythm_missing:
+        reasons.append(
+            "baseline 缺少 fixed-total rhythm metric "
+            f"({RHYTHM_METRIC_SCHEMA})，需重跑：{', '.join(baseline_rhythm_missing)}"
+        )
+
     new_beat = _mean_metric(reliable, "beat_f1", "f1")
     new_downbeat = _mean_metric(reliable, "downbeat_f1", "f1")
     beat_case_count = sum(
@@ -562,7 +587,8 @@ def assess_accuracy_claim(
     baseline_chord = _mean_metric(baseline_reliable, "chord_retention", "retention")
     new_chord = _mean_metric(reliable, "chord_retention", "retention")
     if baseline_rhythm is None or new_rhythm is None:
-        reasons.append("新链路或 baseline 缺少可比较的四分音符节奏误差")
+        if not new_rhythm_missing and not baseline_rhythm_missing:
+            reasons.append("新链路或 baseline 缺少可比较的四分音符节奏误差")
     elif baseline_rhythm <= 0:
         reasons.append("baseline 节奏误差为零，无法计算20%下降")
     elif new_rhythm > baseline_rhythm * 0.8:
