@@ -3215,6 +3215,11 @@ def _allocate_lanes(events: Iterable[_RawEvent]) -> list[list[_RawEvent]]:
                 }
                 if tied_pitches.issubset(set(previous.pitches) & previous_ties):
                     tie_lane_candidates.append(index)
+        if len(tie_lane_candidates) > 1:
+            raise MusicXMLStandardizationError(
+                "ambiguous incoming tie lane at tick "
+                f"{event.start_tick}: pitches={sorted(tied_pitches)}"
+            )
         lane_index = (
             tuplet_lane_candidates[0]
             if len(tuplet_lane_candidates) == 1

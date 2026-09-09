@@ -653,6 +653,86 @@ def test_score_normalizer_rejoins_tie_fragments_exposed_in_different_music21_voi
     assert "~" in jianpu
 
 
+def test_score_normalizer_keeps_repaired_tie_stop_ahead_of_overlapping_filler() -> None:
+    """An incoming tie must claim its contiguous lane before a same-tick rest."""
+
+    payload = _manual_payload()
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="tie-start",
+            kind="note",
+            offset_quarter=1,
+            duration_quarter=1,
+            pitches=[64],
+            tie="start",
+            tie_types=["start"],
+            voice="5",
+        ),
+        WorkerEvent(
+            event_id="tie-stop",
+            kind="note",
+            offset_quarter=2,
+            duration_quarter=1,
+            pitches=[64],
+            tie="stop",
+            tie_types=["stop"],
+            voice="6",
+        ),
+        WorkerEvent(
+            event_id="overlapping-filler",
+            kind="rest",
+            offset_quarter=2,
+            duration_quarter=0.5,
+            voice="5",
+        ),
+        WorkerEvent(
+            event_id="following-note",
+            kind="note",
+            offset_quarter=2.5,
+            duration_quarter=0.5,
+            pitches=[55],
+            voice="5",
+        ),
+        WorkerEvent(
+            event_id="tail",
+            kind="rest",
+            offset_quarter=3,
+            duration_quarter=1,
+            voice="5",
+        ),
+    ]
+
+    score, report = standardize_musicxml_payload(payload)
+
+    tied = [
+        (voice, event)
+        for voice in score.voices
+        for event in voice.events
+        if event.midi == 64 and event.tie_types
+    ]
+    assert len(tied) == 2
+    assert len({voice.voice_id for voice, _event in tied}) == 1
+    tie_voice, _ = tied[0]
+    assert tie_voice.staff == 1
+    assert [(event.midi, event.start_tick, event.end_tick, event.tie) for _voice, event in tied] == [
+        (64, 48, 96, "start"),
+        (64, 96, 144, "stop"),
+    ]
+    assert report["tie_voice_repairs"] == [
+        {
+            "reason": "tie_chain_voice_reassigned",
+            "musicxml_event_id": "tie-stop",
+            "source_voice": "6",
+            "source_staff": 1,
+            "target_voice": "5",
+            "target_staff": 1,
+            "pitches": [64],
+        }
+    ]
+    _validate_explicit_ties(tie_voice)
+    assert "~" in score_to_jianpu(score)
+
+
 def test_score_normalizer_keeps_a_normal_cross_measure_tie_in_one_voice() -> None:
     payload = _manual_payload()
     payload.highest_time_quarter = 8
