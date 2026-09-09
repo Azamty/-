@@ -10,6 +10,8 @@ from backend.jianpu_score.musicxml_standardize import (
     _RawEvent,
     _align_source_notes,
     _estimate_source_alignment,
+    _logical_pitch_units,
+    _split_source_retrigger_events,
     WorkerEvent,
     WorkerKeySignature,
     WorkerMeasure,
@@ -246,6 +248,113 @@ def test_cross_part_source_reconciliation_uses_global_one_to_one_model() -> None
     assert [item["musicxml_event_id"] for item in report] == ["xml-60", "xml-62", "xml-64"]
     assert {item["accounting_category"] for item in report} == {"matched"}
     assert all(item["matching_evidence"] == "monotonic_pitch_affine_alignment" for item in report)
+
+
+def test_midi_lane_identity_reconciles_duplicate_pitch_across_imported_parts() -> None:
+    events = [
+        _parted_timed_event("p1-60", 60, 10, 34, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("p1-62", 62, 58, 82, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("p1-64", 64, 106, 130, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event(
+            "p2-60",
+            60,
+            154,
+            178,
+            part_id="Piano, lane two",
+            part_group="Piano, lane two",
+            staff=1,
+        ),
+    ]
+    sources = [
+        _timed_source(0, 60, 100, 124),
+        _timed_source(1, 62, 148, 172),
+        _timed_source(2, 64, 196, 220),
+        _timed_source(3, 60, 244, 268),
+    ]
+    for source in sources:
+        source["midi_lane"] = 0 if source["source_index"] < 3 else 1
+        source["midi_track_name"] = "lane one" if source["midi_lane"] == 0 else "lane two"
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert audit["applied"] is True
+    assert audit["method"] == "midi_lane_identity_affine_models"
+    assert audit["one_to_one"] is True
+    assert audit["mapped_groups"]["Piano, lane two"] == 1
+    assert len(audit["models"]) == 2
+    report = _align_source_notes(events, sources, alignment_hints=hints)
+    assert {item["accounting_category"] for item in report} == {"matched"}
+    assert {item["musicxml_event_id"] for item in report} == {"p1-60", "p1-62", "p1-64", "p2-60"}
+
+
+def test_source_retrigger_split_preserves_each_nonduplicate_source_event() -> None:
+    events = [
+        _timed_event("anchor-40", 40, 0, 6),
+        _timed_event("anchor-41", 41, 10, 16),
+        _timed_event("anchor-42", 42, 20, 26),
+        _RawEvent(
+            event_id="imported-chord",
+            part_group="p1",
+            part_id="p1",
+            staff=1,
+            voice="1",
+            start_tick=30,
+            end_tick=36,
+            pitches=[48, 60],
+            kind="chord",
+            tie=None,
+            tie_types=[None, None],
+            tuplet_actual=None,
+            tuplet_normal=None,
+            tuplet_type=None,
+            dots=0,
+            measure_number=1,
+            metadata={},
+        ),
+    ]
+    sources = [
+        _timed_source(0, 40, 0, 6),
+        _timed_source(1, 41, 10, 16),
+        _timed_source(2, 42, 20, 26),
+        _timed_source(3, 48, 30, 32),
+        _timed_source(4, 48, 32, 36),
+        _timed_source(5, 60, 32, 36),
+    ]
+
+    repairs = _split_source_retrigger_events(events, sources)
+
+    assert repairs
+    assert any(item["reason"] == "musicxml_event_split_for_source_retriggers" for item in repairs)
+    units = _logical_pitch_units(events)
+    assert len(units) == len(sources)
+    hints, audit = _estimate_source_alignment(events, sources)
+    assert audit["applied"] is False
+    assert audit["reason"] == "existing_source_alignment_within_strict_window"
+    report = _align_source_notes(events, sources, alignment_hints=hints)
+    assert len(report) == len(sources)
+    assert {item["accounting_category"] for item in report} == {"matched"}
+    assert {item["source_index"] for item in report if item["source_midi"] == 48} == {3, 4}
+    assert len({item["musicxml_unit_id"] for item in report if item["source_midi"] == 48}) == 2
+
+
+def test_source_retrigger_split_rejects_a_gap_between_same_pitch_events() -> None:
+    events = [
+        _timed_event("anchor-40", 40, 0, 6),
+        _timed_event("anchor-41", 41, 10, 16),
+        _timed_event("anchor-42", 42, 20, 26),
+        _timed_event("imported-48", 48, 30, 36),
+    ]
+    sources = [
+        _timed_source(0, 40, 0, 6),
+        _timed_source(1, 41, 10, 16),
+        _timed_source(2, 42, 20, 26),
+        _timed_source(3, 48, 30, 31),
+        _timed_source(4, 48, 34, 36),
+    ]
+
+    assert _split_source_retrigger_events(events, sources) == []
+    with pytest.raises(MusicXMLStandardizationError, match=r"count=2; index=3,midi=48; index=4,midi=48"):
+        _align_source_notes(events, sources)
 
 
 def test_source_coordinate_reconciliation_rejects_pitch_multiset_changes() -> None:

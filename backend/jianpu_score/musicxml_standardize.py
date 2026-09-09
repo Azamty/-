@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal
@@ -58,6 +58,11 @@ MAX_FINE_SCORE_REPAIR_MOVEMENT_TICKS = 2
 # one-to-one, and the residuals remain bounded.
 MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS = 12
 MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS = 64
+# A complete, unique pitch-order affine model is stronger evidence than a
+# nearest-neighbour match. Permit the same 24-tick onset window that the
+# ordinary matcher already uses for that model; pitch, residual, and
+# one-to-one checks remain mandatory.
+MAX_AFFINE_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS = 24
 MIN_SOURCE_ALIGNMENT_MODEL_POINTS = 3
 MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS = 384
 # MuseScore can split one imported performance into several synthetic parts
@@ -70,6 +75,8 @@ MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS = 384
 MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS = 64
 MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS = 64
 MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS = 512
+MAX_SOURCE_RETRIGGER_RESIDUAL_TICKS = 64
+MAX_SOURCE_RETRIGGER_INTERNAL_GAP_TICKS = 2
 WORKER = ROOT / "scripts" / "musicxml_score_worker.py"
 
 
@@ -390,6 +397,9 @@ def _source_notes(performance_metadata: Mapping[str, Any] | None) -> list[dict[s
     values = performance_metadata.get("notes", [])
     if not isinstance(values, list):
         return []
+    lane_names = performance_metadata.get("instrument_lane_track_names", [])
+    if not isinstance(lane_names, list):
+        lane_names = []
     result: list[dict[str, Any]] = []
     for index, value in enumerate(values):
         if not isinstance(value, Mapping):
@@ -402,17 +412,34 @@ def _source_notes(performance_metadata: Mapping[str, Any] | None) -> list[dict[s
             continue
         if end_480 <= start_480:
             continue
-        result.append(
-            {
-                "source_index": int(value.get("source_index", value.get("index", index))),
-                "midi": midi,
-                "start_tick_480": start_480,
-                "end_tick_480": end_480,
-                "start_tick": round(start_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS),
-                "end_tick": round(end_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS),
-                "voice_id": value.get("voice_id"),
-            }
-        )
+        source = {
+            "source_index": int(value.get("source_index", value.get("index", index))),
+            "midi": midi,
+            "start_tick_480": start_480,
+            "end_tick_480": end_480,
+            "start_tick": round(start_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS),
+            "end_tick": round(end_480 * SCORE_QUARTER_TICKS / PERFORMANCE_QUARTER_TICKS),
+            "voice_id": value.get("voice_id"),
+        }
+        # Keep the MIDI identity that survives into the performance file.
+        # MuseScore can turn one imported track into several synthetic parts;
+        # the lane identity is therefore evidence for partitioning an
+        # otherwise ambiguous same-pitch assignment, never a replacement for
+        # pitch/time matching.
+        for key in ("midi_lane", "midi_track_index", "midi_channel"):
+            try:
+                if value.get(key) is not None:
+                    source[key] = int(value[key])
+            except (TypeError, ValueError):
+                pass
+        if value.get("midi_lane") is not None:
+            try:
+                lane = int(value["midi_lane"])
+            except (TypeError, ValueError):
+                lane = -1
+            if 0 <= lane < len(lane_names) and isinstance(lane_names[lane], str):
+                source["midi_track_name"] = lane_names[lane]
+        result.append(source)
     return result
 
 
@@ -871,6 +898,11 @@ def _reassemble_split_source_tuplets(events: list[_RawEvent]) -> list[dict[str, 
                 continue
             if event.part_group != group.get("part_group") or event.staff != target_staff or event.voice != target_voice:
                 continue
+            if not event.pitches:
+                # Empty MusicXML timeline fillers can occupy the same raw
+                # voice; _allocate_lanes will place them in a separate lane
+                # after the proven pitched tuplet is reconstructed.
+                continue
             if any(
                 event.start_tick < int(member["end_tick"]) and int(member["start_tick"]) < event.end_tick
                 for member in members
@@ -1084,7 +1116,19 @@ def _raw_tuplet_span(
         and event.start_tick >= start.start_tick
         and event.end_tick <= stop.end_tick
     ]
-    ordered = sorted(context, key=lambda event: (event.start_tick, event.end_tick, event.event_id))
+    ordered_all = sorted(context, key=lambda event: (event.start_tick, event.end_tick, event.event_id))
+    # Tie voice normalization can split one MusicXML chord into multiple raw
+    # fragments with the same source event id and interval.  They are one
+    # tuplet slot for contiguity, while the full fragment list must still be
+    # returned so pitch fragments are included in overlap checks and audit.
+    ordered: list[_RawEvent] = []
+    seen_slots: set[tuple[str, int, int]] = set()
+    for event in ordered_all:
+        slot = (_source_event_id(event), event.start_tick, event.end_tick)
+        if slot in seen_slots:
+            continue
+        seen_slots.add(slot)
+        ordered.append(event)
     if not ordered or ordered[0] is not start or ordered[-1] is not stop:
         return None
     if ordered[-1].end_tick != stop.end_tick:
@@ -1100,7 +1144,7 @@ def _raw_tuplet_span(
         return None
     if len({event.voice for event in ordered}) > 1 and not allow_cross_voice:
         return None
-    return ordered
+    return ordered_all
 
 
 def _raw_tuplet_voice_has_overlap(
@@ -1115,6 +1159,13 @@ def _raw_tuplet_voice_has_overlap(
             if id(other) in component_ids or other.voice != target_voice:
                 continue
             if other.part_group != event.part_group or other.staff != event.staff:
+                continue
+            # A MusicXML rest is a timeline filler, not an occupied pitch
+            # lane.  It may overlap a repaired note group and will be split
+            # into its own ScoreVoice lane by _allocate_lanes; treating it as
+            # a musical overlap would leave a proven tuplet fragment
+            # stranded in a voice with no valid bracket.
+            if not other.pitches:
                 continue
             if other.start_tick < event.end_tick and event.start_tick < other.end_tick:
                 return True
@@ -1285,6 +1336,7 @@ def _normalize_orphan_tuplet_markers(events: list[_RawEvent]) -> list[dict[str, 
                 continue
             voice_events = same_voice_context(event)
             same_voice_group = [candidate for candidate in voice_events if _raw_tuplet_context(candidate) == _raw_tuplet_context(event)]
+
             starts = [candidate for candidate in same_voice_group if candidate.tuplet_type == "start"]
             stops = [candidate for candidate in same_voice_group if candidate.tuplet_type == "stop"]
             if starts and stops:
@@ -1423,6 +1475,340 @@ def _logical_pitch_units(events: list[_RawEvent]) -> list[_LogicalPitchUnit]:
     return units
 
 
+def _source_retrigger_split_groups(
+    source_rows: list[dict[str, Any]],
+    unit_rows: list[_LogicalPitchUnit],
+    *,
+    scale: float,
+    offset: float,
+) -> list[list[dict[str, Any]]] | None:
+    """Assign extra source retriggers to target units without dropping events."""
+
+    ordered_sources = sorted(
+        source_rows,
+        key=lambda value: (int(value["start_tick"]), int(value["end_tick"]), int(value["source_index"])),
+    )
+    ordered_units = sorted(unit_rows, key=lambda value: (value.start_tick, value.end_tick, value.unit_id))
+    if len(ordered_sources) <= len(ordered_units):
+        return None
+    if any(int(source["end_tick"]) <= int(source["start_tick"]) for source in ordered_sources):
+        return None
+    if any(len(unit.chain) != 1 for unit in ordered_units):
+        return None
+    if any(
+        unit.chain[0][0].tie is not None
+        or any(value is not None for value in unit.chain[0][0].tie_types)
+        or unit.chain[0][0].tuplet_actual is not None
+        or unit.chain[0][0].tuplet_normal is not None
+        or unit.chain[0][0].tuplet_type is not None
+        or unit.chain[0][0].dots
+        for unit in ordered_units
+    ):
+        return None
+
+    def candidate(
+        unit: _LogicalPitchUnit,
+        rows: list[dict[str, Any]],
+    ) -> bool:
+        predicted = [
+            (
+                scale * int(source["start_tick"]) + offset,
+                scale * int(source["end_tick"]) + offset,
+            )
+            for source in rows
+        ]
+        if any(
+            right[0] < left[1]
+            or right[1] < right[0]
+            or right[0] - left[1] > MAX_SOURCE_RETRIGGER_INTERNAL_GAP_TICKS
+            for left, right in zip(predicted, predicted[1:], strict=False)
+        ):
+            return False
+        if (
+            abs(unit.start_tick - predicted[0][0]) > MAX_SOURCE_RETRIGGER_RESIDUAL_TICKS
+            or abs(unit.end_tick - predicted[-1][1]) > MAX_SOURCE_RETRIGGER_RESIDUAL_TICKS
+        ):
+            return False
+        source_intervals: list[tuple[int, int]] = []
+        for index, (_source, bounds) in enumerate(zip(rows, predicted, strict=True)):
+            start = unit.start_tick if index == 0 else round(bounds[0])
+            end = unit.end_tick if index == len(rows) - 1 else round(predicted[index + 1][0])
+            start = max(unit.start_tick, min(unit.end_tick, start))
+            end = max(unit.start_tick, min(unit.end_tick, end))
+            if end <= start:
+                return False
+            source_intervals.append((start, end))
+        if any(left[1] != right[0] for left, right in zip(source_intervals, source_intervals[1:], strict=False)):
+            return False
+        return True
+
+    source_count = len(ordered_sources)
+    unit_count = len(ordered_units)
+    ways = [[0] * (unit_count + 1) for _ in range(source_count + 1)]
+    choices: list[list[tuple[int, int] | None]] = [[None] * (unit_count + 1) for _ in range(source_count + 1)]
+    ways[0][0] = 1
+    for source_position in range(source_count + 1):
+        for unit_position in range(unit_count):
+            if not ways[source_position][unit_position]:
+                continue
+            remaining_sources = source_count - source_position
+            remaining_units = unit_count - unit_position
+            max_group_size = remaining_sources - (remaining_units - 1)
+            for group_size in range(1, max_group_size + 1):
+                rows = ordered_sources[source_position : source_position + group_size]
+                result = candidate(ordered_units[unit_position], rows)
+                if not result:
+                    continue
+                target_source_position = source_position + group_size
+                target_unit_position = unit_position + 1
+                ways[target_source_position][target_unit_position] = min(
+                    2,
+                    ways[target_source_position][target_unit_position]
+                    + ways[source_position][unit_position],
+                )
+                if choices[target_source_position][target_unit_position] is None:
+                    choices[target_source_position][target_unit_position] = (source_position, group_size)
+    if ways[source_count][unit_count] != 1:
+        return None
+    groups: list[list[dict[str, Any]]] = []
+    source_position, unit_position = source_count, unit_count
+    while unit_position:
+        choice = choices[source_position][unit_position]
+        if choice is None:
+            return None
+        previous_source_position, group_size = choice
+        groups.append(ordered_sources[previous_source_position:source_position])
+        source_position = previous_source_position
+        unit_position -= 1
+    if source_position != 0:
+        return None
+    groups.reverse()
+    return groups
+
+
+def _split_source_retrigger_events(
+    events: list[_RawEvent],
+    source_notes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Split only a proven MusicXML note that hides source retriggers.
+
+    MuseScore may turn adjacent same-pitch MIDI note-ons into one MusicXML
+    slot.  A split is accepted only when a complete pitch-order anchor model
+    exists, all source rows are positive and strictly ordered, and the
+    resulting fragments stay inside the original event boundaries.  Other
+    pitch/count mismatches remain unresolved and fail normally.
+    """
+
+    units = _logical_pitch_units(events)
+    source_by_pitch: dict[int, list[dict[str, Any]]] = {}
+    units_by_pitch: dict[int, list[_LogicalPitchUnit]] = {}
+    for source in source_notes:
+        source_by_pitch.setdefault(int(source["midi"]), []).append(source)
+    for unit in units:
+        units_by_pitch.setdefault(unit.pitch, []).append(unit)
+    mismatched = [pitch for pitch in sorted(source_by_pitch) if len(source_by_pitch[pitch]) > len(units_by_pitch.get(pitch, []))]
+    if not mismatched or any(
+        pitch not in source_by_pitch or len(source_by_pitch[pitch]) < len(units_by_pitch[pitch])
+        for pitch in units_by_pitch
+    ):
+        return []
+    anchor_pairs: list[tuple[dict[str, Any], _LogicalPitchUnit]] = []
+    for pitch in sorted(source_by_pitch):
+        if len(source_by_pitch[pitch]) != len(units_by_pitch.get(pitch, [])):
+            continue
+        sources = sorted(
+            source_by_pitch[pitch],
+            key=lambda value: (int(value["start_tick"]), int(value["end_tick"]), int(value["source_index"])),
+        )
+        targets = sorted(
+            units_by_pitch[pitch],
+            key=lambda value: (value.start_tick, value.end_tick, value.unit_id),
+        )
+        if len({(int(value["start_tick"]), int(value["end_tick"])) for value in sources}) != len(sources):
+            return []
+        if len({(value.start_tick, value.end_tick) for value in targets}) != len(targets):
+            return []
+        anchor_pairs.extend(zip(sources, targets, strict=True))
+    if len(anchor_pairs) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
+        return []
+    scale, offset = _fit_source_alignment_line(anchor_pairs)
+    if not 0.5 <= scale <= 1.8:
+        return []
+    anchor_residuals = [
+        _source_alignment_residuals(pair, scale=scale, offset=offset)
+        for pair in anchor_pairs
+    ]
+    if any(
+        start > MAX_SOURCE_RETRIGGER_RESIDUAL_TICKS or end > MAX_SOURCE_RETRIGGER_RESIDUAL_TICKS
+        for start, end in anchor_residuals
+    ):
+        return []
+
+    unit_source_groups: dict[int, list[dict[str, Any]]] = {}
+    for pitch in sorted(source_by_pitch):
+        sources = sorted(
+            source_by_pitch[pitch],
+            key=lambda value: (int(value["start_tick"]), int(value["end_tick"]), int(value["source_index"])),
+        )
+        targets = sorted(
+            units_by_pitch[pitch],
+            key=lambda value: (value.start_tick, value.end_tick, value.unit_id),
+        )
+        if len(sources) == len(targets):
+            for source, target in zip(sources, targets, strict=True):
+                unit_source_groups[target.unit_id] = [source]
+            continue
+        groups = _source_retrigger_split_groups(sources, targets, scale=scale, offset=offset)
+        if groups is None or len(groups) != len(targets):
+            return []
+        for target, group in zip(targets, groups, strict=True):
+            unit_source_groups[target.unit_id] = group
+
+    plans_by_event: dict[str, list[tuple[int, list[dict[str, Any]], _LogicalPitchUnit]]] = {}
+    for unit in units:
+        rows = unit_source_groups.get(unit.unit_id)
+        if rows is None or len(rows) <= 1:
+            continue
+        event = unit.chain[0][0] if len(unit.chain) == 1 else None
+        if event is None:
+            return []
+        plans_by_event.setdefault(event.event_id, []).append((unit.pitch, rows, unit))
+    if not plans_by_event:
+        return []
+    replacements: list[_RawEvent] = []
+    repairs: list[dict[str, Any]] = []
+    for event in events:
+        plans = plans_by_event.get(event.event_id)
+        if not plans:
+            replacements.append(event)
+            continue
+        if (
+            event.tie is not None
+            or any(value is not None for value in event.tie_types)
+            or event.tuplet_actual is not None
+            or event.tuplet_normal is not None
+            or event.tuplet_type is not None
+            or event.dots
+        ):
+            return []
+        pitch_segments: dict[int, list[tuple[int, int, list[int]]]] = {}
+        planned_pitches = {pitch for pitch, _rows, _unit in plans}
+
+        def fragment(
+            event_id: str,
+            start: int,
+            end: int,
+            pitches: list[int],
+            metadata: dict[str, Any],
+        ) -> _RawEvent:
+            return replace(
+                event,
+                event_id=event_id,
+                start_tick=start,
+                end_tick=end,
+                pitches=sorted(pitches),
+                kind="chord" if len(pitches) > 1 else "note",
+                tie=None,
+                tie_types=[None] * len(pitches),
+                tuplet_actual=None,
+                tuplet_normal=None,
+                tuplet_type=None,
+                dots=0,
+                metadata=metadata,
+            )
+
+        for pitch, rows, _unit in plans:
+            predicted = [
+                (
+                    scale * int(source["start_tick"]) + offset,
+                    scale * int(source["end_tick"]) + offset,
+                )
+                for source in rows
+            ]
+            boundaries = [event.start_tick, event.end_tick]
+            boundaries.extend(
+                round(predicted[index][0])
+                for index in range(1, len(predicted))
+            )
+            boundaries = sorted({max(event.start_tick, min(event.end_tick, value)) for value in boundaries})
+            if len(boundaries) != len(rows) + 1:
+                return []
+            segments: list[tuple[int, int, list[int]]] = []
+            for index, (start, end) in enumerate(zip(boundaries, boundaries[1:], strict=False)):
+                segment_source_indices = [int(rows[index]["source_index"])]
+                if end <= start:
+                    return []
+                segments.append((start, end, segment_source_indices))
+            pitch_segments[pitch] = segments
+        intervals: dict[tuple[int, int], list[int]] = {}
+        interval_source_indices: dict[tuple[int, int], list[int]] = {}
+        for pitch, segments in pitch_segments.items():
+            for start, end, source_indices in segments:
+                intervals.setdefault((start, end), []).append(pitch)
+                interval_source_indices.setdefault((start, end), []).extend(source_indices)
+        fragment_ids: list[str] = []
+        for fragment_index, ((start, end), pitches) in enumerate(sorted(intervals.items())):
+            metadata = dict(event.metadata)
+            repair = {
+                "reason": "musicxml_event_split_for_source_retriggers",
+                "action": "split_imported_pitch_slot_at_proven_source_boundaries",
+                "original_musicxml_event_id": event.event_id,
+                "original_start_tick": event.start_tick,
+                "original_end_tick": event.end_tick,
+                "fragment_start_tick": start,
+                "fragment_end_tick": end,
+                "pitches": sorted(pitches),
+                "source_indices": sorted(set(interval_source_indices.get((start, end), []))),
+                "anchor_scale": scale,
+                "anchor_offset_ticks": offset,
+                "timing_preserved_within_original_event": True,
+                "one_to_one_source_events": True,
+            }
+            metadata["source_retrigger_split"] = repair
+            event_id = f"{event.event_id}:source-retrigger:{fragment_index}"
+            fragment_ids.append(event_id)
+            replacements.append(fragment(event_id, start, end, pitches, metadata))
+            repairs.append(repair)
+        residual_pitches = [pitch for pitch in event.pitches if pitch not in planned_pitches]
+        if residual_pitches:
+            residual_id = f"{event.event_id}:source-retrigger:residual"
+            residual_repair = {
+                "reason": "musicxml_event_split_for_source_retriggers",
+                "action": "preserve_unplanned_pitch_on_original_interval",
+                "original_musicxml_event_id": event.event_id,
+                "original_start_tick": event.start_tick,
+                "original_end_tick": event.end_tick,
+                "pitches": sorted(residual_pitches),
+                "source_indices": [],
+                "anchor_scale": scale,
+                "anchor_offset_ticks": offset,
+                "timing_preserved_within_original_event": True,
+                "one_to_one_source_events": True,
+            }
+            residual_metadata = dict(event.metadata)
+            residual_metadata["source_retrigger_split"] = residual_repair
+            fragment_ids.append(residual_id)
+            replacements.append(
+                fragment(residual_id, event.start_tick, event.end_tick, residual_pitches, residual_metadata)
+            )
+        repairs.append(
+            {
+                "reason": "musicxml_event_split_for_source_retriggers",
+                "action": "split_imported_event",
+                "original_musicxml_event_id": event.event_id,
+                "replacement_musicxml_event_ids": fragment_ids,
+                "original_pitches": list(event.pitches),
+                "source_retrigger_pitch_count": len(plans),
+                "anchor_scale": scale,
+                "anchor_offset_ticks": offset,
+                "timing_preserved_within_original_event": True,
+                "one_to_one_source_events": True,
+            }
+        )
+    events[:] = replacements
+    return repairs
+
+
 def _alignment_unit_group(unit: _LogicalPitchUnit) -> tuple[str, int]:
     event = unit.chain[0][0]
     return event.part_group, event.staff
@@ -1467,6 +1853,310 @@ def _source_alignment_residuals(
     return abs(unit.start_tick - predicted_start), abs(unit.end_tick - predicted_end)
 
 
+def _source_track_identity_partitions(
+    events: list[_RawEvent],
+    source_notes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """Partition source notes by preserved MIDI lane when imported parts prove it.
+
+    A multi-track performance can be imported as one parent part plus a
+    track-specific part.  Pitch-order matching across those parts is unsafe
+    when the same pitch occurs in both tracks.  We use a lane only when the
+    MusicXML part group contains the lane's original track name and every
+    remaining group has exactly one remaining lane.  Any incomplete identity
+    evidence returns an explicit failed audit instead of falling back to a
+    potentially wrong global match.
+    """
+
+    lane_values = [source.get("midi_lane") for source in source_notes]
+    if not lane_values or any(value is None for value in lane_values):
+        return None
+    try:
+        lanes = sorted({int(value) for value in lane_values})
+    except (TypeError, ValueError):
+        return None
+    if len(lanes) < 2:
+        return None
+
+    def fail(reason: str, **details: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return [], {"applied": False, "reason": reason, **details}
+
+    units = _logical_pitch_units(events)
+    groups = sorted({_alignment_unit_group(unit)[0] for unit in units})
+    names_by_lane: dict[int, str] = {}
+    for source in source_notes:
+        lane = int(source["midi_lane"])
+        name = source.get("midi_track_name")
+        if isinstance(name, str) and name:
+            previous = names_by_lane.get(lane)
+            if previous is not None and previous != name:
+                return fail(
+                    "source_midi_lane_track_names_conflict",
+                    lane=lane,
+                    names=sorted({previous, name}),
+                )
+            names_by_lane[lane] = name
+    group_to_lane: dict[str, int] = {}
+    for group in groups:
+        candidates = [
+            (len(name), lane)
+            for lane, name in names_by_lane.items()
+            if name.casefold() in group.casefold()
+        ]
+        if not candidates:
+            continue
+        candidates.sort(reverse=True)
+        if len(candidates) > 1 and candidates[0][0] == candidates[1][0] and candidates[0][1] != candidates[1][1]:
+            return fail(
+                "source_midi_lane_part_identity_ambiguous",
+                part_group=group,
+                candidate_lanes=[lane for _length, lane in candidates],
+            )
+        group_to_lane[group] = candidates[0][1]
+    if not group_to_lane:
+        return None
+    unassigned_lanes = [lane for lane in lanes if lane not in set(group_to_lane.values())]
+    unassigned_groups = [group for group in groups if group not in group_to_lane]
+    if len(unassigned_lanes) != 1:
+        return fail(
+            "source_midi_lane_part_identity_incomplete",
+            mapped_groups=dict(group_to_lane),
+            unassigned_lanes=unassigned_lanes,
+            unassigned_groups=unassigned_groups,
+        )
+    fallback_lane = unassigned_lanes[0]
+    for group in unassigned_groups:
+        group_to_lane[group] = fallback_lane
+
+    sources_by_lane: dict[int, list[dict[str, Any]]] = {lane: [] for lane in lanes}
+    for source in source_notes:
+        sources_by_lane[int(source["midi_lane"])].append(source)
+    units_by_lane: dict[int, list[_LogicalPitchUnit]] = {lane: [] for lane in lanes}
+    for unit in units:
+        units_by_lane[group_to_lane[_alignment_unit_group(unit)[0]]].append(unit)
+    partitions: list[dict[str, Any]] = []
+    used_units: set[int] = set()
+    for lane in lanes:
+        source_rows = sources_by_lane[lane]
+        unit_rows = units_by_lane[lane]
+        source_by_pitch: dict[int, list[dict[str, Any]]] = {}
+        units_by_pitch: dict[int, list[_LogicalPitchUnit]] = {}
+        for source in source_rows:
+            source_by_pitch.setdefault(int(source["midi"]), []).append(source)
+        for unit in unit_rows:
+            units_by_pitch.setdefault(unit.pitch, []).append(unit)
+        if {pitch: len(rows) for pitch, rows in source_by_pitch.items()} != {
+            pitch: len(rows) for pitch, rows in units_by_pitch.items()
+        }:
+            return fail(
+                "source_midi_lane_pitch_counts_differ",
+                lane=lane,
+                source_pitch_counts={str(pitch): len(rows) for pitch, rows in sorted(source_by_pitch.items())},
+                musicxml_pitch_counts={str(pitch): len(rows) for pitch, rows in sorted(units_by_pitch.items())},
+            )
+        pairs: list[tuple[dict[str, Any], _LogicalPitchUnit]] = []
+        for pitch in sorted(source_by_pitch):
+            ordered_sources = sorted(
+                source_by_pitch[pitch],
+                key=lambda value: (int(value["start_tick"]), int(value["end_tick"]), int(value["source_index"])),
+            )
+            ordered_units = sorted(
+                units_by_pitch[pitch],
+                key=lambda value: (value.start_tick, value.end_tick, value.unit_id),
+            )
+            source_timing = [(int(value["start_tick"]), int(value["end_tick"])) for value in ordered_sources]
+            unit_timing = [(value.start_tick, value.end_tick) for value in ordered_units]
+            if len(source_timing) != len(set(source_timing)) or len(unit_timing) != len(set(unit_timing)):
+                return fail(
+                    "source_midi_lane_alignment_not_unique_same_pitch_timing",
+                    lane=lane,
+                    pitch=pitch,
+                )
+            pairs.extend(zip(ordered_sources, ordered_units, strict=True))
+        if len(pairs) != len(source_rows) or len({unit.unit_id for _source, unit in pairs}) != len(unit_rows):
+            return fail(
+                "source_midi_lane_alignment_not_one_to_one",
+                lane=lane,
+                source_count=len(source_rows),
+                musicxml_count=len(unit_rows),
+            )
+        used_units.update(unit.unit_id for _source, unit in pairs)
+        partitions.append(
+            {
+                "lane": lane,
+                "pairs": pairs,
+            }
+        )
+    if len(used_units) != len(units):
+        return fail(
+            "source_midi_lane_alignment_does_not_cover_musicxml_units",
+            matched_unit_count=len(used_units),
+            musicxml_unit_count=len(units),
+        )
+    return partitions, {
+        "mapped_groups": dict(group_to_lane),
+    }
+
+
+def _track_identity_alignment(
+    events: list[_RawEvent],
+    source_notes: list[dict[str, Any]],
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any]] | None:
+    partitioned = _source_track_identity_partitions(events, source_notes)
+    if partitioned is None:
+        return None
+    partitions, partition_audit = partitioned
+    if not partitions:
+        return {}, {**partition_audit, "applied": False}
+
+    def fail(reason: str, **details: Any) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+        return {}, {**partition_audit, "applied": False, "reason": reason, **details}
+
+    source_hints: dict[int, dict[str, Any]] = {}
+    models: list[dict[str, Any]] = []
+    max_start_residual = 0.0
+    max_end_residual = 0.0
+    for partition in partitions:
+        pairs = list(partition["pairs"])
+        if len(pairs) >= MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
+            scale, offset = _fit_source_alignment_line(pairs)
+            method = "midi_lane_affine_alignment"
+        elif len(pairs) == 1:
+            source, unit = pairs[0]
+            scale = 1.0
+            offset = float(unit.start_tick - int(source["start_tick"]))
+            method = "midi_lane_singleton_offset_alignment"
+        else:
+            return fail(
+                "source_midi_lane_alignment_has_insufficient_anchors",
+                lane=partition["lane"],
+                pair_count=len(pairs),
+                minimum_model_points=MIN_SOURCE_ALIGNMENT_MODEL_POINTS,
+            )
+        if not 0.5 <= scale <= 1.8:
+            return fail(
+                "source_midi_lane_alignment_scale_out_of_bounds",
+                lane=partition["lane"],
+                scale=scale,
+            )
+        residuals = [
+            _source_alignment_residuals(pair, scale=scale, offset=offset)
+            for pair in pairs
+        ]
+        model_start_residual = max((value[0] for value in residuals), default=0.0)
+        model_end_residual = max((value[1] for value in residuals), default=0.0)
+        if (
+            model_start_residual > MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS
+            or model_end_residual > MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS
+        ):
+            return fail(
+                "source_midi_lane_alignment_residual_exceeds_bound",
+                lane=partition["lane"],
+                max_start_residual_ticks=model_start_residual,
+                max_end_residual_ticks=model_end_residual,
+            )
+        predicted_movements = [
+            abs(scale * int(source[key]) + offset - int(source[key]))
+            for source, _unit in pairs
+            for key in ("start_tick", "end_tick")
+        ]
+        movement_bound = max(
+            MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS,
+            math.ceil(max(predicted_movements, default=0.0) + max(
+                MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
+                MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
+            )),
+        )
+        raw_start = max(
+            (abs(unit.start_tick - int(source["start_tick"])) for source, unit in pairs),
+            default=0,
+        )
+        raw_end = max(
+            (abs(unit.end_tick - int(source["end_tick"])) for source, unit in pairs),
+            default=0,
+        )
+        if max(raw_start, raw_end) > movement_bound:
+            return fail(
+                "source_midi_lane_alignment_movement_exceeds_bound",
+                lane=partition["lane"],
+                max_raw_start_difference_ticks=raw_start,
+                max_raw_end_difference_ticks=raw_end,
+                movement_bound_ticks=movement_bound,
+            )
+        model_index = len(models)
+        model = {
+            "lane": partition["lane"],
+            "scale": scale,
+            "offset": offset,
+            "method": method,
+            "pair_count": len(pairs),
+            "source_indices": [int(source["source_index"]) for source, _unit in pairs],
+            "musicxml_unit_ids": [unit.unit_id for _source, unit in pairs],
+            "movement_bound_ticks": movement_bound,
+        }
+        models.append(model)
+        for position, (source, unit) in enumerate(pairs):
+            start_residual, end_residual = residuals[position]
+            source_hints[int(source["source_index"])] = {
+                "scale": scale,
+                "offset": offset,
+                "aligned_start_tick": round(scale * int(source["start_tick"]) + offset),
+                "aligned_end_tick": round(scale * int(source["end_tick"]) + offset),
+                "musicxml_unit_id": unit.unit_id,
+                "group": {
+                    "scope": "midi_lane_identity",
+                    "lane": partition["lane"],
+                },
+                "model_index": model_index,
+                "method": method,
+                "start_residual_ticks": start_residual,
+                "end_residual_ticks": end_residual,
+                "start_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
+                "end_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
+            }
+            max_start_residual = max(max_start_residual, start_residual)
+            max_end_residual = max(max_end_residual, end_residual)
+    if len(source_hints) != len(source_notes) or len({hint["musicxml_unit_id"] for hint in source_hints.values()}) != len(source_notes):
+        return fail(
+            "source_midi_lane_alignment_is_not_one_to_one",
+            source_count=len(source_notes),
+            hint_count=len(source_hints),
+        )
+    classification = (
+        "midi_lane_global_offset"
+        if all(abs(float(model["scale"]) - 1.0) <= 0.01 for model in models)
+        else "midi_lane_affine_scale_and_offset"
+    )
+    return source_hints, {
+        **partition_audit,
+        "applied": True,
+        "method": "midi_lane_identity_affine_models",
+        "classification": classification,
+        "pairing": "monotonic_per_pitch_order_with_preserved_midi_lane_identity",
+        "global_order_preserved": True,
+        "pitch_multiset_equal": True,
+        "one_to_one": True,
+        "provisional_pair_count": len(source_notes),
+        "model_count": len(models),
+        "models": models,
+        "max_start_residual_ticks": max_start_residual,
+        "max_end_residual_ticks": max_end_residual,
+        "strict_start_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
+        "strict_end_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
+        "max_raw_start_difference_ticks": max(
+            abs(unit.start_tick - int(source["start_tick"]))
+            for partition in partitions
+            for source, unit in partition["pairs"]
+        ),
+        "max_raw_end_difference_ticks": max(
+            abs(unit.end_tick - int(source["end_tick"]))
+            for partition in partitions
+            for source, unit in partition["pairs"]
+        ),
+        "movement_bound_ticks": max((int(model["movement_bound_ticks"]) for model in models), default=0),
+    }
+
+
 def _cross_part_alignment(
     provisional: list[tuple[dict[str, Any], _LogicalPitchUnit]],
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]] | None:
@@ -1503,7 +2193,22 @@ def _cross_part_alignment(
         abs(unit.end_tick - int(source["end_tick"]))
         for source, unit in provisional
     )
-    if max(raw_start_movement, raw_end_movement) > MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS:
+    predicted_movements = [
+        abs(scale * int(source[key]) + offset - int(source[key]))
+        for source, _unit in provisional
+        for key in ("start_tick", "end_tick")
+    ]
+    movement_bound = max(
+        MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS,
+        math.ceil(
+            max(predicted_movements, default=0.0)
+            + max(
+                MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
+                MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
+            )
+        ),
+    )
+    if max(raw_start_movement, raw_end_movement) > movement_bound:
         return None
     needs_reconciliation = any(
         abs(unit.start_tick - int(source["start_tick"])) > 24
@@ -1538,27 +2243,13 @@ def _cross_part_alignment(
             "end_residual_ticks": end_residual,
             "start_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
             "end_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
+            "movement_bound_ticks": movement_bound,
         }
     source_hints_count = len(source_hints)
     unit_ids = {hint["musicxml_unit_id"] for hint in source_hints.values()}
     if source_hints_count != len(provisional) or len(unit_ids) != len(provisional):
         return None
     classification = "global_offset" if abs(scale - 1.0) <= 0.01 else "global_affine_scale_and_offset"
-    sample_pairs = []
-    for source, unit in sorted(provisional, key=lambda pair: int(pair[0]["source_index"]))[:10]:
-        sample_pairs.append(
-            {
-                "source_index": int(source["source_index"]),
-                "pitch": int(source["midi"]),
-                "source_start_tick": int(source["start_tick"]),
-                "source_end_tick": int(source["end_tick"]),
-                "musicxml_unit_id": unit.unit_id,
-                "musicxml_start_tick": unit.start_tick,
-                "musicxml_end_tick": unit.end_tick,
-                "raw_start_difference_ticks": unit.start_tick - int(source["start_tick"]),
-                "raw_end_difference_ticks": unit.end_tick - int(source["end_tick"]),
-            }
-        )
     return source_hints, {
         "applied": True,
         "method": "monotonic_pitch_assignment_cross_part_affine_model",
@@ -1585,8 +2276,7 @@ def _cross_part_alignment(
         "strict_end_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
         "max_raw_start_difference_ticks": raw_start_movement,
         "max_raw_end_difference_ticks": raw_end_movement,
-        "movement_bound_ticks": MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS,
-        "sample_pairs": sample_pairs,
+        "movement_bound_ticks": movement_bound,
     }
 
 
@@ -1611,6 +2301,9 @@ def _estimate_source_alignment(
         source_by_pitch.setdefault(int(source["midi"]), []).append(source)
     for unit in units:
         units_by_pitch.setdefault(int(unit.pitch), []).append(unit)
+    track_identity = _track_identity_alignment(events, source_notes)
+    if track_identity is not None:
+        return track_identity
     if set(source_by_pitch) != set(units_by_pitch):
         return {}, {
             "applied": False,
@@ -1729,7 +2422,7 @@ def _estimate_source_alignment(
                     position
                     for position in remaining
                     if _source_alignment_residuals(ordered[position], scale=scale, offset=offset)[0]
-                    <= MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+                    <= MAX_AFFINE_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
                 ]
                 if len(inliers) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
                     continue
@@ -1742,7 +2435,7 @@ def _estimate_source_alignment(
                         scale=fitted_scale,
                         offset=fitted_offset,
                     )[0]
-                    <= MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+                        <= MAX_AFFINE_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
                 ]
                 if len(inliers) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
                     continue
@@ -1805,7 +2498,7 @@ def _estimate_source_alignment(
                         offset=float(model["offset"]),
                     )
                     if (
-                        start_residual <= MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+                        start_residual <= MAX_AFFINE_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
                         and end_residual <= MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS
                     ):
                         choices.append((start_residual + end_residual / 10.0, model))
@@ -1852,7 +2545,7 @@ def _estimate_source_alignment(
                     offset=float(model["offset"]),
                 )
                 if (
-                    start_residual > MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
+                    start_residual > MAX_AFFINE_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS
                     or end_residual > MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS
                 ):
                     return {}, {
@@ -1886,6 +2579,8 @@ def _estimate_source_alignment(
                     "method": model["method"],
                     "start_residual_ticks": start_residual,
                     "end_residual_ticks": end_residual,
+                    "start_residual_bound_ticks": MAX_AFFINE_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS,
+                    "end_residual_bound_ticks": MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS,
                 }
 
     if len(source_hints) != len(source_notes) or len({hint["musicxml_unit_id"] for hint in source_hints.values()}) != len(source_notes):
@@ -1965,7 +2660,7 @@ def _estimate_source_alignment(
         ],
         "max_start_residual_ticks": max(hint["start_residual_ticks"] for hint in source_hints.values()),
         "max_end_residual_ticks": max(hint["end_residual_ticks"] for hint in source_hints.values()),
-        "strict_start_residual_bound_ticks": MAX_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS,
+        "strict_start_residual_bound_ticks": MAX_AFFINE_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS,
         "strict_end_residual_bound_ticks": MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS,
         "source_pitch_counts": {str(pitch): len(rows) for pitch, rows in sorted(source_by_pitch.items())},
         "musicxml_pitch_counts": {str(pitch): len(rows) for pitch, rows in sorted(units_by_pitch.items())},
@@ -2447,8 +3142,58 @@ def _align_source_notes(
 def _allocate_lanes(events: Iterable[_RawEvent]) -> list[list[_RawEvent]]:
     lanes: list[list[_RawEvent]] = []
     lane_ends: list[int] = []
-    for event in sorted(events, key=lambda item: (item.start_tick, item.end_tick, item.event_id)):
-        lane_index = next((index for index, end in enumerate(lane_ends) if end <= event.start_tick), None)
+    def lane_order(event: _RawEvent) -> tuple[int, int, int, str]:
+        has_incoming_tie = any(
+            (event.tie_types[index] if index < len(event.tie_types) else event.tie) in {"stop", "continue"}
+            for index in range(len(event.pitches))
+        )
+        return event.start_tick, 0 if has_incoming_tie else 1, event.end_tick, event.event_id
+
+    for event in sorted(events, key=lane_order):
+        tied_pitches = {
+            pitch
+            for index, pitch in enumerate(event.pitches)
+            if (event.tie_types[index] if index < len(event.tie_types) else event.tie) in {"stop", "continue"}
+        }
+        event_ratio = (
+            (event.tuplet_actual, event.tuplet_normal)
+            if event.tuplet_actual is not None and event.tuplet_normal is not None
+            else None
+        )
+        tuplet_lane_candidates: list[int] = []
+        if event_ratio is not None and event.tuplet_type in {"continue", "stop"}:
+            for index, (lane, end) in enumerate(zip(lanes, lane_ends, strict=True)):
+                if end != event.start_tick or not lane:
+                    continue
+                previous = lane[-1]
+                previous_ratio = (
+                    (previous.tuplet_actual, previous.tuplet_normal)
+                    if previous.tuplet_actual is not None and previous.tuplet_normal is not None
+                    else None
+                )
+                if previous_ratio == event_ratio and previous.tuplet_type != "stop":
+                    tuplet_lane_candidates.append(index)
+        tie_lane_candidates: list[int] = []
+        if tied_pitches:
+            for index, (lane, end) in enumerate(zip(lanes, lane_ends, strict=True)):
+                if end != event.start_tick or not lane:
+                    continue
+                previous = lane[-1]
+                previous_ties = {
+                    pitch
+                    for tie_index, pitch in enumerate(previous.pitches)
+                    if (previous.tie_types[tie_index] if tie_index < len(previous.tie_types) else previous.tie)
+                    in {"start", "continue"}
+                }
+                if tied_pitches.issubset(set(previous.pitches) & previous_ties):
+                    tie_lane_candidates.append(index)
+        lane_index = (
+            tuplet_lane_candidates[0]
+            if len(tuplet_lane_candidates) == 1
+            else tie_lane_candidates[0]
+            if len(tie_lane_candidates) == 1
+            else next((index for index, end in enumerate(lane_ends) if end <= event.start_tick), None)
+        )
         if lane_index is None:
             lane_index = len(lanes)
             lanes.append([])
@@ -4150,13 +4895,6 @@ def standardize_musicxml_payload(
     conductor = _reconcile_conductor_metadata(payload, performance_metadata)
     key = conductor["key"]
     time_signature = conductor["time_signature"]
-    tempo_values = conductor["tempo_values"]
-    tempo_events = [
-        TempoEvent(start_tick=max(0, _quarter_to_tick(float(item["offset_quarter"]))), bpm=float(item["bpm"]))
-        for item in tempo_values
-    ]
-    if tempo_events[0].start_tick > 0:
-        tempo_events.insert(0, TempoEvent(start_tick=0, bpm=tempo_events[0].bpm))
 
     total_quarter = max(
         payload.highest_time_quarter,
@@ -4174,6 +4912,8 @@ def standardize_musicxml_payload(
     )
     raw_events, diagnostics = _worker_raw_events(payload)
     source_notes = _source_notes(performance_metadata)
+    if source_notes:
+        diagnostics.extend(_split_source_retrigger_events(raw_events, source_notes))
     source_alignment_hints: dict[int, dict[str, Any]] = {}
     source_alignment_report: dict[str, Any] = {
         "applied": False,
@@ -4185,6 +4925,13 @@ def standardize_musicxml_payload(
             hint = source_alignment_hints.get(int(source["source_index"]))
             if hint is not None:
                 source["_alignment_hint"] = hint
+    tempo_values = conductor["tempo_values"]
+    tempo_events = [
+        TempoEvent(start_tick=max(0, _quarter_to_tick(float(item["offset_quarter"]))), bpm=float(item["bpm"]))
+        for item in tempo_values
+    ]
+    if tempo_events[0].start_tick > 0:
+        tempo_events.insert(0, TempoEvent(start_tick=0, bpm=tempo_events[0].bpm))
     alignment = (
         _align_source_notes(raw_events, source_notes, alignment_hints=source_alignment_hints)
         if source_notes
@@ -4405,6 +5152,8 @@ def standardize_musicxml_payload(
         warnings.append("Production meter authority rebuilt MusicXML measure boundaries; inspect alignment_report.json for imported/final spans and event splits")
     if any(item.get("reason") in {"tie_chain_voice_reassigned", "tie_chain_event_split"} for item in diagnostics):
         warnings.append("MusicXML tie fragments were normalized into serializable ScoreVoice lanes")
+    if any(item.get("reason") == "musicxml_event_split_for_source_retriggers" for item in diagnostics):
+        warnings.append("An imported MusicXML pitch slot was split only at proven source retrigger boundaries; inspect alignment_report.json")
     if lane_reasons:
         warnings.append("Overlapping MusicXML events were preserved in additional ScoreVoice lanes")
     if any(item.get("reason") not in {"matched_musicxml_event", "matched_musicxml_tie_chain"} for item in alignment):
