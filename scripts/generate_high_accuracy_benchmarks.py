@@ -34,13 +34,15 @@ if str(ROOT) not in sys.path:
 from scripts.fluidsynth_benchmark_renderer import RENDERER_VERSION, render_midi  # noqa: E402
 REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_ROOT = ROOT / ".cache" / "high-accuracy-benchmarks" / "generated"
-GENERATOR_VERSION = "1.1"
+GENERATOR_VERSION = "1.2"
 DEFAULT_SEED = 20260907
 LEGACY_OSCILLATOR_SAMPLE_RATE = 16_000
 PPQ = 480
 DOWNBEAT_ACCENT_DELTA = 24
 GUITAR_ACCENT_DELTA = 4
 LEGACY_RENDERER_VERSION = "deterministic_harmonic_oscillator_v1"
+SPECIAL_CONTEXT_MIN_MEASURES = 4
+SPECIAL_CONTEXT_RULE = "minimum_four_complete_notated_measures_v1"
 
 
 @dataclass(frozen=True)
@@ -155,10 +157,69 @@ def _harmonic_weights(program: int) -> tuple[tuple[int, float], ...]:
     return ((1, 1.0), (2, 0.09), (3, 0.03), (4, 0.01))
 
 
-def _accent_downbeats(tracks: Sequence[RenderTrack], meter: tuple[int, int]) -> tuple[RenderTrack, ...]:
+def _bar_quarters(meter: tuple[int, int]) -> Fraction:
+    return Fraction(int(meter[0]) * 4, int(meter[1]))
+
+
+def _special_pickup_quarters(case_id: str) -> Fraction:
+    """Return the fixed notated pickup span for a specialized fixture.
+
+    ``special-pickup-3-4`` deliberately starts with a one-quarter anacrusis.
+    The other deterministic fixtures begin on a full bar boundary.  This is
+    fixture metadata, rather than a choice made from model output, and is
+    copied into the beat annotation and case manifest so the short-context
+    rule remains auditable.
+    """
+
+    return Fraction(1) if case_id == "special-pickup-3-4" else Fraction(0)
+
+
+def _special_context_plan(
+    case_id: str,
+    *,
+    tracks: Sequence[RenderTrack],
+    meter: tuple[int, int],
+    minimum_measures: int = SPECIAL_CONTEXT_MIN_MEASURES,
+) -> dict[str, Any]:
+    """Describe the deterministic context requirement for one special case."""
+
+    if not case_id.startswith("special-"):
+        raise ValueError(f"not a specialized fixture: {case_id!r}")
+    if minimum_measures < 1:
+        raise ValueError("minimum_measures must be positive")
+    note_ends = [note.end for track in tracks for note in track.notes]
+    source_end = max(note_ends, default=Fraction(0))
+    pickup = _special_pickup_quarters(case_id)
+    bar_quarters = _bar_quarters(meter)
+    post_pickup_duration = max(Fraction(0), source_end - pickup)
+    complete_measures = int(post_pickup_duration // bar_quarters)
+    required_end = pickup + bar_quarters * minimum_measures
+    extension_quarters = max(Fraction(0), required_end - source_end)
+    return {
+        "rule": SPECIAL_CONTEXT_RULE,
+        "minimum_complete_measures": int(minimum_measures),
+        "meter": f"{meter[0]}/{meter[1]}",
+        "bar_quarters": str(bar_quarters),
+        "pickup_quarters": str(pickup),
+        "pickup_is_explicit": pickup > 0,
+        "source_end_quarter": str(source_end),
+        "required_end_quarter": str(required_end),
+        "extension_quarters": str(extension_quarters),
+        "complete_measures_after_pickup": complete_measures,
+        "meets_requirement": complete_measures >= minimum_measures,
+        "preserve_tempo_events": True,
+    }
+
+
+def _accent_downbeats(
+    tracks: Sequence[RenderTrack],
+    meter: tuple[int, int],
+    *,
+    pickup_quarters: Fraction = Fraction(0),
+) -> tuple[RenderTrack, ...]:
     """Raise only notated bar starts while retaining every pitch and boundary."""
 
-    bar_quarters = Fraction(meter[0] * 4, meter[1])
+    bar_quarters = _bar_quarters(meter)
     accented: list[RenderTrack] = []
     for track in tracks:
         accent_delta = GUITAR_ACCENT_DELTA if 24 <= track.program <= 31 else DOWNBEAT_ACCENT_DELTA
@@ -167,7 +228,7 @@ def _accent_downbeats(tracks: Sequence[RenderTrack], meter: tuple[int, int]) -> 
                 note,
                 velocity=min(112, max(1, int(note.velocity)) + accent_delta),
             )
-            if note.start % bar_quarters == 0
+            if note.start >= pickup_quarters and (note.start - pickup_quarters) % bar_quarters == 0
             else note
             for note in track.notes
         )
@@ -217,22 +278,71 @@ def _render_audio(path: Path, tracks: Sequence[RenderTrack], tempo: Sequence[tup
         output.writeframes(pcm)
 
 
-def _beat_annotation(path: Path, *, tempo: Sequence[tuple[Fraction, float]], meter: tuple[int, int], end_q: Fraction, source: str) -> None:
+def _beat_annotation(
+    path: Path,
+    *,
+    tempo: Sequence[tuple[Fraction, float]],
+    meter: tuple[int, int],
+    end_q: Fraction,
+    source: str,
+    pickup_quarters: Fraction = Fraction(0),
+) -> None:
     # For compound 6/8 keep the notated eighth-note beat positions.  The
     # selected downbeat list remains explicit, so readers never infer every
     # beat to be a downbeat.
     beat_step = Fraction(1, 2) if meter == (6, 8) else Fraction(1)
     beats: list[dict[str, Any]] = []
-    index = 0
-    current = Fraction(0)
     beats_per_bar = 6 if meter == (6, 8) else meter[0]
-    while current <= end_q:
-        bar_index, beat_index = divmod(index, beats_per_bar)
-        downbeat = beat_index == 0
-        beats.append({"index": index, "bar_index": bar_index, "beat_index": beat_index, "time_sec": _tempo_seconds(tempo, current), "downbeat": downbeat})
+    if pickup_quarters < 0 or pickup_quarters >= _bar_quarters(meter):
+        raise ValueError(f"pickup must be within one bar: {pickup_quarters}")
+
+    # Keep any pickup beats in the grid, but make the first full-bar boundary
+    # the first downbeat.  The local MIDI has no negative-time events, so the
+    # pickup span is represented explicitly in provenance and beat metadata.
+    current = Fraction(0)
+    index = 0
+    while current < pickup_quarters:
+        beats.append(
+            {
+                "index": index,
+                "bar_index": -1,
+                "beat_index": int(index),
+                "time_sec": _tempo_seconds(tempo, current),
+                "downbeat": False,
+                "pickup": True,
+            }
+        )
         index += 1
         current += beat_step
-    _atomic_json(path, {"schema_version": "1.0", "source": source, "beat_grid": {"beats": beats, "downbeats": [item for item in beats if item["downbeat"]], "time_signature": f"{meter[0]}/{meter[1]}", "annotation_policy": "derived_from_reference_midi"}})
+
+    full_bar_index = 0
+    while current <= end_q:
+        beat_index = int(round(float((current - pickup_quarters) / beat_step))) % beats_per_bar
+        downbeat = beat_index == 0
+        beat = {
+            "index": index,
+            "bar_index": full_bar_index,
+            "beat_index": beat_index,
+            "time_sec": _tempo_seconds(tempo, current),
+            "downbeat": downbeat,
+        }
+        if pickup_quarters > 0:
+            beat["pickup"] = False
+        beats.append(beat)
+        index += 1
+        current += beat_step
+        if beat_index == beats_per_bar - 1:
+            full_bar_index += 1
+    beat_grid: dict[str, Any] = {
+        "beats": beats,
+        "downbeats": [item for item in beats if item["downbeat"]],
+        "time_signature": f"{meter[0]}/{meter[1]}",
+    }
+    if pickup_quarters > 0:
+        beat_grid["pickup_quarters"] = str(pickup_quarters)
+        beat_grid["pickup_is_explicit"] = True
+    beat_grid["annotation_policy"] = "derived_from_reference_midi"
+    _atomic_json(path, {"schema_version": "1.0", "source": source, "beat_grid": beat_grid})
 
 
 def _melody(root: int, length: int = 16, *, step: Fraction = Fraction(1)) -> tuple[RenderNote, ...]:
@@ -272,21 +382,40 @@ def _spec_for(case_id: str) -> tuple[tuple[RenderTrack, ...], tuple[tuple[Fracti
         tracks = (piano, lead, bass) if variant >= 2 else (piano, lead)
         return tracks, ((Fraction(0), 120.0),), (4, 4), "D"
     if case_id == "special-pickup-3-4":
-        notes = (RenderNote(Fraction(1, 2), Fraction(1), 67),) + _melody(60, 9)
+        # The first quarter is an explicit anacrusis; q=1 is the first full
+        # 3/4 bar boundary.  Keep the original pickup material and continue
+        # the deterministic melody through four complete bars after it.
+        notes = (RenderNote(Fraction(1, 2), Fraction(1), 67),) + _melody(60, 13)
         return (RenderTrack("pickup", 0, notes),), ((Fraction(0), 100.0),), (3, 4), "C"
     if case_id == "special-6-8":
         notes = tuple(RenderNote(Fraction(i, 2), Fraction(i + 1, 2), 60 + (i % 6), 80) for i in range(24))
         return (RenderTrack("compound", 0, notes),), ((Fraction(0), 90.0),), (6, 8), "F"
     if case_id == "special-triplet":
-        notes = tuple(RenderNote(Fraction(i, 3), Fraction(i + 1, 3), 72 + (i % 3), 82) for i in range(12))
+        # Four bars of exact quarter-triplet subdivisions.  Each event is
+        # 160 ticks at PPQ=480, so no renderer or notation stage needs to
+        # infer a triplet from a short one-bar excerpt.
+        notes = tuple(RenderNote(Fraction(i, 3), Fraction(i + 1, 3), 72 + (i % 3), 82) for i in range(48))
         return (RenderTrack("triplet", 40, notes),), ((Fraction(0), 110.0),), (4, 4), "G"
     if case_id == "special-tempo-change":
         notes = _melody(60, 16)
         return (RenderTrack("tempo change", 0, notes),), ((Fraction(0), 72.0), (Fraction(8), 132.0)), (4, 4), "Am"
     if case_id == "special-complex-chord":
-        first = tuple(RenderNote(Fraction(0), Fraction(2), pitch, 76) for pitch in (48, 52, 55, 59))
-        second = tuple(RenderNote(Fraction(2), Fraction(4), pitch, 76) for pitch in (50, 53, 57, 60))
-        return (RenderTrack("complex chords", 0, (*first, *second)),), ((Fraction(0), 104.0),), (3, 4), "Eb"
+        # Retain the original two chord changes and continue the same
+        # two-quarter harmonic unit to the end of four complete 3/4 bars.
+        chord_shapes = (
+            (48, 52, 55, 59),
+            (50, 53, 57, 60),
+            (52, 55, 59, 62),
+            (53, 57, 60, 64),
+            (55, 59, 62, 65),
+            (57, 60, 64, 67),
+        )
+        notes = tuple(
+            RenderNote(Fraction(index * 2), Fraction(index * 2 + 2), pitch, 76)
+            for index, shape in enumerate(chord_shapes)
+            for pitch in shape
+        )
+        return (RenderTrack("complex chords", 0, notes),), ((Fraction(0), 104.0),), (3, 4), "Eb"
     raise ValueError(f"no deterministic fixture recipe for {case_id!r}")
 
 
@@ -297,7 +426,14 @@ def _case_ids_from_registry(registry_path: Path) -> list[str]:
 
 def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int = DEFAULT_SEED, overwrite: bool = False) -> dict[str, Any]:
     tracks, tempo, meter, key = _spec_for(case_id)
-    tracks = _accent_downbeats(tracks, meter)
+    pickup_quarters = _special_pickup_quarters(case_id) if case_id.startswith("special-") else Fraction(0)
+    if case_id.startswith("special-"):
+        context_plan = _special_context_plan(case_id, tracks=tracks, meter=meter)
+        if not context_plan["meets_requirement"]:
+            raise ValueError(f"special fixture does not meet context rule: {context_plan}")
+    else:
+        context_plan = None
+    tracks = _accent_downbeats(tracks, meter, pickup_quarters=pickup_quarters)
     case_root = (destination / case_id).resolve()
     if case_root.exists() and not overwrite:
         existing = case_root / "case_manifest.json"
@@ -328,7 +464,14 @@ def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int =
         overwrite=True,
     )
     end_q = max(note.end for track in tracks for note in track.notes)
-    _beat_annotation(beat_path, tempo=tempo, meter=meter, end_q=end_q, source="generated_from_reference_midi")
+    _beat_annotation(
+        beat_path,
+        tempo=tempo,
+        meter=meter,
+        end_q=end_q,
+        source="generated_from_reference_midi",
+        pickup_quarters=pickup_quarters,
+    )
     files = {
         name: {"path": file.name, "bytes": file.stat().st_size, "sha256": _sha256(file)}
         for name, file in (("reference_midi", midi_path), ("input_audio", audio_path), ("beat_annotation", beat_path))
@@ -363,6 +506,7 @@ def generate_case(case_id: str, *, destination: Path = DEFAULT_ROOT, seed: int =
         "tempo_map": [{"quarter": str(position), "bpm": bpm} for position, bpm in tempo],
         "time_signature": f"{meter[0]}/{meter[1]}",
         "key": key,
+        "music_context": context_plan,
         "files": files,
         "render_manifest": render_manifest_path.name,
         "renderer": render_manifest["renderer"],

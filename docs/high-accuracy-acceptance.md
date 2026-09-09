@@ -48,6 +48,8 @@ MuseScore 也可以直接启动检查安装（项目解包目录或系统安装�
 
 验收登记文件是 `fixtures/high_accuracy/benchmark_manifest.json`。当前清单登记 30 个选定 production case，另保留 5 个 PJS 孤立歌声诊断 case 和 `luv-letter` 本机完整性候选；脚本不会把音频或语料复制进 Git。30 个选定 case 的构成为：10 个固定 seed 的钢琴/吉他/贝斯/多轨合成样本、10 个 MAESTRO v3 官方钢琴 MIDI 渲染片段、5 个 CCMusic 中文混合曲片段和 5 个弱起/3/4/6/8/三连音/变速/复杂和弦专门 fixture。它们都必须走真实 audio→MuScriptor/GAME→BeatNet raw→baseline/new 链路；`model_output=true`、输入 hash 匹配、存在 pitched events 和独立 beat annotation 是硬条件，reference-isolation raw 永远不能替代 production raw。合成和本地 MIDI 渲染仍保留 `render_domain` 限制，但只要 raw 来自真实模型，就与 CCMusic 一起参加 30-case 主 gate。CCMusic 的五段来自同一首 Yueding 录音，分别覆盖 MusicXML q40、56、72、88、104 的 16 个四分音符（每段 12 秒），用于真实混合人声 production smoke；它们不是五首独立歌曲。
 
+五个专门 fixture 在识别前都遵循固定的 `minimum_four_complete_notated_measures_v1` 上下文规则：普通起拍至少保留四个完整记谱小节，弱起先保留弱起再保留其后的四个完整小节，所有中途 tempo change 原样保留。当前审计结果为：`special-pickup-3-4` 是一拍弱起加四个 3/4 小节（13 个四分音符），`special-6-8` 是四个 6/8 小节（12 个四分音符），`special-triplet` 是四个 4/4 小节的精确四分音符三连音（16 个四分音符），`special-tempo-change` 是含 q=8 tempo change 的四个 4/4 小节（16 个四分音符），`special-complex-chord` 是四个 3/4 小节（12 个四分音符）。规则只追加确定性的记谱音乐事件；不以静音尾部充数，也不根据模型输出裁剪。弱起和 beat/downbeat 原点写入各自 case manifest 与 beat annotation，源 MIDI、WAV、render manifest 和 registry hash 必须一起更新。
+
 ```powershell
 & .\.venv\Scripts\python.exe scripts\high_accuracy_benchmark.py --check
 ```

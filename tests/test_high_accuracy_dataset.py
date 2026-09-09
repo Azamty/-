@@ -88,6 +88,33 @@ def test_local_midi_cases_record_direct_renderer_and_input_hashes() -> None:
             assert render_manifest["verification"]["source_event_complete"] is True
 
 
+def test_special_registry_records_fixed_music_context_rule() -> None:
+    registry = benchmark._load_registry(ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json")
+    special = {
+        item["id"]: item
+        for item in registry["cases"]
+        if item["category"] == "specialized_fixture"
+    }
+    assert set(special) == {
+        "special-pickup-3-4",
+        "special-6-8",
+        "special-triplet",
+        "special-tempo-change",
+        "special-complex-chord",
+    }
+    assert all(
+        item["music_context_policy"]["rule"] == generator.SPECIAL_CONTEXT_RULE
+        and item["music_context_policy"]["minimum_complete_measures"] == 4
+        and item["music_context_policy"]["preserve_tempo_events"] is True
+        for item in special.values()
+    )
+    assert special["special-pickup-3-4"]["music_context_policy"]["pickup_quarters"] == "1"
+    assert all(
+        special[case_id]["music_context_policy"]["complete_measures_after_pickup"] == 4
+        for case_id in special
+    )
+
+
 def test_deterministic_smoke_cases_have_midi_audio_and_beat_annotation(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -106,6 +133,58 @@ def test_deterministic_smoke_cases_have_midi_audio_and_beat_annotation(tmp_path:
         assert _hash(first_root / f"{case_id}.mid") == _hash(second_root / f"{case_id}.mid")
         assert _hash(first_root / f"{case_id}.wav") == _hash(second_root / f"{case_id}.wav")
         assert _hash(first_root / f"{case_id}.beat_grid.json") == _hash(second_root / f"{case_id}.beat_grid.json")
+        render_manifest = json.loads((first_root / f"{case_id}.render_manifest.json").read_text(encoding="utf-8"))
+        assert render_manifest["verification"]["byte_deterministic"] is True
+
+
+def test_special_context_rule_keeps_four_complete_measures() -> None:
+    expected = {
+        "special-pickup-3-4": ("1", "13", 4),
+        "special-6-8": ("0", "12", 4),
+        "special-triplet": ("0", "16", 4),
+        "special-tempo-change": ("0", "16", 4),
+        "special-complex-chord": ("0", "12", 4),
+    }
+    for case_id, (pickup, required_end, complete_measures) in expected.items():
+        tracks, _tempo, meter, _key = generator._spec_for(case_id)
+        plan = generator._special_context_plan(case_id, tracks=tracks, meter=meter)
+        assert plan["rule"] == generator.SPECIAL_CONTEXT_RULE
+        assert plan["pickup_quarters"] == pickup
+        assert plan["required_end_quarter"] == required_end
+        assert plan["complete_measures_after_pickup"] == complete_measures
+        assert plan["meets_requirement"] is True
+        assert plan["preserve_tempo_events"] is True
+
+
+def test_special_triplet_keeps_exact_triplet_ticks_and_pickup_grid(tmp_path: Path) -> None:
+    generator.generate_case("special-triplet", destination=tmp_path / "generated")
+    triplet = mido.MidiFile(tmp_path / "generated" / "special-triplet" / "special-triplet.mid")
+    absolute = 0
+    note_intervals: list[tuple[int, int, int]] = []
+    active: dict[tuple[int, int], list[int]] = {}
+    for message in triplet.tracks[1]:
+        absolute += int(message.time)
+        key = (int(message.channel), int(message.note)) if hasattr(message, "note") else None
+        if message.type == "note_on" and message.velocity > 0:
+            active.setdefault(key, []).append(absolute)
+        elif message.type in {"note_off", "note_on"} and key in active and active[key]:
+            note_intervals.append((active[key].pop(0), absolute, int(message.note)))
+    assert len(note_intervals) == 48
+    assert {end - start for start, end, _pitch in note_intervals} == {160}
+    assert note_intervals[-1][1] == 16 * generator.PPQ
+
+    generator.generate_case("special-pickup-3-4", destination=tmp_path / "generated")
+    pickup = json.loads(
+        (tmp_path / "generated" / "special-pickup-3-4" / "special-pickup-3-4.beat_grid.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    grid = pickup["beat_grid"]
+    assert grid["pickup_is_explicit"] is True
+    assert grid["pickup_quarters"] == "1"
+    assert grid["beats"][0]["pickup"] is True
+    assert grid["beats"][0]["downbeat"] is False
+    assert [item["time_sec"] for item in grid["downbeats"][:4]] == pytest.approx([0.6, 2.4, 4.2, 6.0])
 
 
 def test_legacy_renderer_manifest_requires_explicit_replacement(tmp_path: Path) -> None:

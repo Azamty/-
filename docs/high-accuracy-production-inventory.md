@@ -48,6 +48,10 @@ This report is generated from the registry and local result roots. `production_m
 | `special-complex-chord` | `specialized_fixture` | `specialized_local_midi_render` | `production_scope` | yes | yes | `production_model_failed` | — | — |
 | `luv-letter` | `local_manual_only` | `manual_local_candidate` | `manual_only` | yes | no | `no_raw` | — | — |
 
+## Special context v1 follow-up
+
+The dedicated raw-only rerun in `.artifacts/review/fluidsynth-special-context-production-raw-v1` uses the registry hashes after applying `minimum_four_complete_notated_measures_v1`; it does not overwrite the historical raw roots used for the table above. All three changed fixtures completed the real MuScriptor 1.2 + BeatNet route with `model_output=true`: `special-pickup-3-4` returned 13 pitched events, `special-triplet` returned 47, and `special-complex-chord` returned 20. `special-6-8` and `special-tempo-change` were unchanged and were not rerun. No baseline or new score pipeline was run in this follow-up.
+
 ## Gate interpretation
 
 The registry's 30-case production composition is the stated acceptance plan: 10 deterministic known-MIDI renders, 10 public MIDI-annotated MAESTRO renders, 5 CCMusic mixed-song segments, and 5 specialized deterministic segments. Synthetic and local-MIDI cases remain explicitly labeled by render domain and renderer limitations, but a real `model_output=true` MuScriptor/GAME payload with a pitched event and independent beat annotation is eligible for the same production gate. A reference-isolation payload, empty model result, failed recognizer, or input mismatch never substitutes for a missing model result. PJS remains a five-case vocal diagnostic set because its beat annotation is derived from the same reference MIDI and is not independent.
