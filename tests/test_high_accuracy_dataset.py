@@ -520,6 +520,51 @@ def test_batch_runner_can_resume_failed_pipeline_without_rerunning_raw(tmp_path:
     assert calls["recognizer"] == 1
 
 
+def test_batch_runner_records_adapter_failure_and_retries_only_failed_pipeline(tmp_path: Path) -> None:
+    calls = {"recognizer": 0, "baseline": 0, "new": 0}
+
+    def recognizer(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
+        calls["recognizer"] += 1
+        return {"notes": [{"midi": 60}], "beat_grid": {"beats": []}, "model_output": True}
+
+    def baseline(_case: Mapping[str, Any], _raw: Mapping[str, Any], destination: Path) -> Mapping[str, Any]:
+        calls["baseline"] += 1
+        destination.mkdir(parents=True, exist_ok=True)
+        return {"ok": "baseline"}
+
+    def flaky_new(_case: Mapping[str, Any], _raw: Mapping[str, Any], destination: Path) -> Mapping[str, Any]:
+        calls["new"] += 1
+        destination.mkdir(parents=True, exist_ok=True)
+        if calls["new"] == 1:
+            (destination / "partial-service-log.txt").write_text("failed attempt", encoding="utf-8")
+            raise RuntimeError("synthetic adapter failure")
+        return {"ok": "new"}
+
+    root = tmp_path / "results"
+    runner = runner_module.BenchmarkBatchRunner(
+        recognizer=recognizer,
+        baseline=baseline,
+        new_chain=flaky_new,
+        timeout_sec=5,
+    )
+    first = runner.run_case({"id": "failed-pipeline", "evaluation_scope": "test"}, result_root=root)
+    assert first["status"] == "partial"
+    assert first["pipelines"]["baseline"]["status"] == "success"
+    assert first["pipelines"]["new"]["status"] == "failed"
+    failed_manifest = json.loads((root / "new" / "failed-pipeline" / "manifest.json").read_text(encoding="utf-8"))
+    assert failed_manifest["status"] == "failed"
+    assert failed_manifest["stage"] == "new"
+    assert failed_manifest["error"]["message"].endswith("synthetic adapter failure")
+    assert failed_manifest["raw_recognition_sha256"] == first["raw"]["recognition_sha256"]
+
+    second = runner.run_case({"id": "failed-pipeline", "evaluation_scope": "test"}, result_root=root)
+    assert second["status"] == "success"
+    assert calls == {"recognizer": 1, "baseline": 1, "new": 2}
+    assert json.loads((root / "new" / "failed-pipeline" / "manifest.json").read_text(encoding="utf-8"))["status"] == "success"
+    history_files = list((root / "new" / "failed-pipeline" / "retry_history").rglob("partial-service-log.txt"))
+    assert len(history_files) == 1
+
+
 def test_batch_runner_writes_baseline_and_new_to_explicit_independent_roots(tmp_path: Path) -> None:
     def recognizer(_case: Mapping[str, Any], _raw: Mapping[str, Any], _destination: Path) -> Mapping[str, Any]:
         return {"notes": [{"midi": 60}], "beat_grid": {"beats": []}, "model_output": True}

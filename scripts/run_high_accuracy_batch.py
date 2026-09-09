@@ -17,6 +17,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -77,6 +78,30 @@ def _replace_json(path: Path, payload: Mapping[str, Any]) -> str:
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(path)
     return _sha256(path)
+
+
+def _archive_failed_pipeline_destination(destination: Path, *, pipeline_manifest: Path) -> None:
+    """Preserve a failed or stale attempt before a resumable retry.
+
+    The score service deliberately refuses to overwrite a non-empty output
+    directory.  A failed adapter may nevertheless leave MusicXML, logs, or a
+    partial service output behind.  Move those files into a per-attempt
+    history directory, leaving the pipeline case directory available for a
+    clean retry.  Raw artifacts live under a separate result root and are
+    never touched here.
+    """
+
+    if pipeline_manifest.parent.resolve() != destination.resolve():
+        raise ValueError("pipeline manifest must be owned by its pipeline case directory")
+    if not destination.is_dir():
+        return
+    entries = [item for item in destination.iterdir() if item.name != "retry_history"]
+    if not entries:
+        return
+    history = destination / "retry_history" / str(time.time_ns())
+    history.mkdir(parents=True, exist_ok=True)
+    for item in entries:
+        shutil.move(os.fspath(item), os.fspath(history / item.name))
 
 
 def _safe_case_dir(root: Path, case_id: str) -> Path:
@@ -711,6 +736,16 @@ class BenchmarkBatchRunner:
                     ):
                         state["pipelines"][name] = existing
                         continue
+                    # A previous adapter failure is retryable.  Preserve its
+                    # logs/artifacts before giving the service the empty
+                    # output directory it requires; immutable raw and the
+                    # successful sibling pipeline are left in place.
+                    _archive_failed_pipeline_destination(destination, pipeline_manifest=pipeline_manifest)
+                elif destination.exists():
+                    # Older runner versions did not write a pipeline failure
+                    # manifest.  Treat their leftover directory as a failed
+                    # attempt and preserve it before retrying.
+                    _archive_failed_pipeline_destination(destination, pipeline_manifest=pipeline_manifest)
                 if adapter is None:
                     failure = {
                         "schema_version": RUNNER_SCHEMA_VERSION,
@@ -731,7 +766,29 @@ class BenchmarkBatchRunner:
                     _replace_json(destination / "manifest.json", failure)
                     state["pipelines"][name] = failure
                     continue
-                result = self._call_with_timeout(adapter, case, raw, destination, name)
+                try:
+                    result = self._call_with_timeout(adapter, case, raw, destination, name)
+                except BatchRunError as exc:
+                    failure = {
+                        "schema_version": RUNNER_SCHEMA_VERSION,
+                        "case_id": case_id,
+                        "pipeline": name,
+                        "status": "failed",
+                        "stage": exc.stage,
+                        "error": {"stage": exc.stage, "message": exc.cause},
+                        "evaluation_scope": effective_scope,
+                        "effective_evaluation_scope": effective_scope,
+                        "case_evaluation_scope": case.get("evaluation_scope"),
+                        "source_kind": case.get("source_kind"),
+                        "raw_model_output": raw.get("model_output") is True,
+                        "raw_recognition_sha256": raw_hash,
+                        "recognizer_mode": recognizer_provenance["mode"],
+                        "recognizer_fingerprint": recognizer_provenance["fingerprint"],
+                    }
+                    destination.mkdir(parents=True, exist_ok=True)
+                    failure["manifest_sha256"] = _replace_json(pipeline_manifest, failure)
+                    state["pipelines"][name] = failure
+                    continue
                 pipeline_state = {
                     "schema_version": RUNNER_SCHEMA_VERSION,
                     "case_id": case_id,
