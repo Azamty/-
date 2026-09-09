@@ -1353,6 +1353,131 @@ def test_finer_binary_three_fragment_tie_keeps_stop_for_existing_chain() -> None
     assert score_to_jianpu(score)
 
 
+def test_explicit_tuplet_tie_fragment_keeps_boundaries_and_following_events() -> None:
+    """A tied 2-tick tuplet member must not be merged into its predecessor."""
+
+    payload = _manual_payload()
+    payload.highest_time_quarter = 24
+    payload.parts[0].highest_time_quarter = 24
+    payload.parts[0].events = [
+        WorkerEvent(
+            event_id="tuple-tie-start",
+            kind="note",
+            offset_quarter=33 / 8,
+            duration_quarter=1 / 8,
+            pitches=[75],
+            tie="start",
+            tie_types=["start"],
+            voice="2",
+        ),
+        WorkerEvent(
+            event_id="tuple-tie-stop",
+            kind="note",
+            offset_quarter=17 / 4,
+            duration_quarter=1 / 24,
+            pitches=[75],
+            tie="stop",
+            tie_types=["stop"],
+            tuplet_actual=3,
+            tuplet_normal=2,
+            tuplet_type="start",
+            voice="2",
+        ),
+        WorkerEvent(
+            event_id="tuple-rest",
+            kind="rest",
+            offset_quarter=103 / 24,
+            duration_quarter=1 / 24,
+            tuplet_actual=3,
+            tuplet_normal=2,
+            voice="2",
+        ),
+        WorkerEvent(
+            event_id="tuple-note",
+            kind="note",
+            offset_quarter=13 / 3,
+            duration_quarter=1 / 8,
+            pitches=[68],
+            tuplet_actual=3,
+            tuplet_normal=2,
+            voice="2",
+        ),
+        WorkerEvent(
+            event_id="tuple-stop",
+            kind="note",
+            offset_quarter=107 / 24,
+            duration_quarter=1 / 24,
+            pitches=[72],
+            tie="start",
+            tie_types=["start"],
+            tuplet_actual=3,
+            tuplet_normal=2,
+            tuplet_type="stop",
+            voice="2",
+        ),
+        WorkerEvent(
+            event_id="following-tie-stop",
+            kind="note",
+            offset_quarter=9 / 2,
+            duration_quarter=1 / 8,
+            pitches=[72],
+            tie="stop",
+            tie_types=["stop"],
+            voice="2",
+        ),
+    ]
+    measure = WorkerMeasure(
+        part_index=0,
+        number=1,
+        start_quarter=0,
+        duration_quarter=24,
+        end_quarter=24,
+        time_signature="4/4",
+    )
+    payload.parts[0].measures = [measure]
+    payload.measures = [measure]
+
+    score, report = standardize_musicxml_payload(payload)
+
+    voice = next(voice for voice in score.voices if voice.source_voice == "2")
+    events = [
+        event
+        for event in voice.events
+        if event.metadata.get("musicxml_event_id") in {
+            "tuple-tie-start",
+            "tuple-tie-stop",
+            "tuple-rest",
+            "tuple-note",
+            "tuple-stop",
+            "following-tie-stop",
+        }
+    ]
+    assert [(event.start_tick, event.end_tick) for event in events] == [
+        (198, 204),
+        (204, 206),
+        (206, 208),
+        (208, 214),
+        (214, 216),
+        (216, 222),
+    ]
+    assert [(event.tie, event.tie_types) for event in events if event.midi is not None] == [
+        ("start", ["start"]),
+        ("stop", ["stop"]),
+        (None, []),
+        ("start", ["start"]),
+        ("stop", ["stop"]),
+    ]
+    assert [(event.tuplet_type, event.tuplet_actual, event.tuplet_normal) for event in events[1:5]] == [
+        ("start", 3, 2),
+        (None, 3, 2),
+        (None, 3, 2),
+        ("stop", 3, 2),
+    ]
+    assert all(left.end_tick == right.start_tick for left, right in zip(voice.events, voice.events[1:]))
+    assert report["notation_grid_repairs"] == []
+    assert score_to_jianpu(score)
+
+
 def test_finer_binary_standalone_note_uses_exact_singleton_tuplet() -> None:
     payload = _manual_payload()
     payload.highest_time_quarter = 8

@@ -3987,6 +3987,14 @@ def _repair_fine_score_events(
                 and previous_pitches == current_pitches
                 and previous.end_tick == current.start_tick
                 and all(value in {"stop", "continue"} for value in current_ties)
+                # An explicit MusicXML tuplet already provides a legal
+                # renderer representation for the fine fragment.  Keep that
+                # event in the closed group so merging it into the preceding
+                # tie cannot delete a tuplet boundary or change a following
+                # event's onset.
+                and current.tuplet_actual is None
+                and current.tuplet_normal is None
+                and current.tuplet_type is None
             ):
                 combined_ticks = current.end_tick - previous.start_tick
                 snapped_duration = max(
@@ -4084,6 +4092,9 @@ def _repair_fine_score_events(
             if (
                 current_pitches
                 and not _is_fine_grid_tuplet_member(current)
+                and current.tuplet_actual is None
+                and current.tuplet_normal is None
+                and current.tuplet_type is None
                 and current.duration_tick < MIN_JIANPU_ATOM_TICKS
                 and index + 1 < len(events)
                 and events[index + 1].is_rest
