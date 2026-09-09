@@ -648,6 +648,7 @@ class BenchmarkBatchRunner:
             "recognizer_mode": recognizer_provenance["mode"],
             "recognizer_fingerprint": recognizer_provenance["fingerprint"],
             "raw": None,
+            "raw_only": self.raw_only,
             "pipelines": {},
             "pipeline_roots": {"baseline": str(baseline_root), "new": str(new_root)},
             "error": None,
