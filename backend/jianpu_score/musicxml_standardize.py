@@ -2216,7 +2216,15 @@ def _cross_part_alignment(
         for source, unit in provisional
     )
     if not needs_reconciliation:
-        return None
+        return {}, {
+            "applied": False,
+            "reason": "existing_source_alignment_within_strict_window",
+            "provisional_pair_count": len(provisional),
+            "identity_proven": True,
+            "pitch_multiset_equal": True,
+            "one_to_one": True,
+            "global_order_preserved": True,
+        }
 
     source_hints: dict[int, dict[str, Any]] = {}
     model = {
@@ -2266,6 +2274,7 @@ def _cross_part_alignment(
                 "scale": scale,
                 "offset_ticks": offset,
                 "method": model["method"],
+                "pair_count": len(provisional),
                 "source_indices": list(model["source_indices"]),
                 "musicxml_unit_ids": list(model["musicxml_unit_ids"]),
             }
@@ -2381,6 +2390,21 @@ def _estimate_source_alignment(
                 "current_source_index": int(current_source["source_index"]),
                 "current_musicxml_unit_id": current_unit.unit_id,
             }
+
+    if all(
+        int(source["start_tick"]) == unit.start_tick
+        and int(source["end_tick"]) == unit.end_tick
+        for source, unit in provisional
+    ):
+        return {}, {
+            "applied": False,
+            "reason": "existing_source_alignment_within_strict_window",
+            "provisional_pair_count": len(provisional),
+            "identity_proven": True,
+            "pitch_multiset_equal": True,
+            "one_to_one": True,
+            "global_order_preserved": True,
+        }
 
     imported_groups = {_alignment_unit_group(unit) for _source, unit in provisional}
     if len(imported_groups) > 1:
@@ -2608,6 +2632,10 @@ def _estimate_source_alignment(
             "applied": False,
             "reason": "existing_source_alignment_within_strict_window",
             "provisional_pair_count": len(provisional),
+            "identity_proven": True,
+            "pitch_multiset_equal": True,
+            "one_to_one": True,
+            "global_order_preserved": True,
         }
     if len(models) == 1:
         classification = (
@@ -4884,6 +4912,245 @@ def _reconcile_conductor_metadata(
     }
 
 
+def _map_source_tempo_values_to_score(
+    conductor: dict[str, Any],
+    *,
+    performance_metadata: Mapping[str, Any] | None,
+    source_alignment_report: Mapping[str, Any],
+    total_ticks: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Map source tempo points through a proven source-to-score model.
+
+    ``conductor`` initially contains production points in the recognizer's
+    480-TPQ coordinate.  The source alignment models use the shared 48-TPQ
+    score coordinate, so every production point is transformed before Score
+    validation.  Out-of-range or conflicting mapped points are errors: a
+    tempo event is never silently clipped or discarded.
+    """
+
+    source_records = _source_tempo_records(performance_metadata)
+    if not source_records:
+        return list(conductor["tempo_values"]), [], total_ticks
+    if source_alignment_report.get("reason") == "no_performance_source_metadata":
+        # Metadata-only callers do not provide a source note coordinate to
+        # reconcile.  Preserve the already validated MusicXML conductor map;
+        # production raw payloads always carry source notes and therefore take
+        # the strict mapping path below.
+        return list(conductor["tempo_values"]), [], total_ticks
+    if all(abs(float(item["offset_quarter"])) <= 1e-9 for item in source_records):
+        # A sole initial tempo is anchored by the Score origin itself.  There
+        # is no scale or tail coordinate to infer, so retain it explicitly and
+        # audit the identity instead of inventing a note-derived model.
+        source = source_records[0]
+        return list(conductor["tempo_values"]), [
+            {
+                "field": "tempo",
+                "source_offset_quarter": 0.0,
+                "source_tick": 0.0,
+                "mapped_tick": 0,
+                "final_offset_quarter": 0.0,
+                "bpm": float(source["bpm"]),
+                "alignment_method": "score_origin_identity",
+                "alignment_model": {"scale": 1.0, "offset_ticks": 0.0, "pair_count": 0},
+                "origin_rebased": False,
+                "reason": "source_tempo_initial_origin_identity",
+            }
+        ], total_ticks
+    models = [item for item in source_alignment_report.get("models", []) if isinstance(item, Mapping)]
+    if not models and (
+        source_alignment_report.get("reason") == "existing_source_alignment_within_strict_window"
+        and source_alignment_report.get("identity_proven") is True
+        and source_alignment_report.get("pitch_multiset_equal") is True
+        and source_alignment_report.get("one_to_one") is True
+        and source_alignment_report.get("global_order_preserved") is True
+    ):
+        # The importer already occupies the source coordinate in this case.
+        # Keep the report's ``applied=false`` meaning (no repair was needed),
+        # but make the identity proof explicit before using it for tempo.
+        models = [
+            {
+                "scale": 1.0,
+                "offset_ticks": 0.0,
+                "method": "strict_identity_source_alignment",
+                "pair_count": int(source_alignment_report.get("provisional_pair_count", 0)),
+            }
+        ]
+    if not models:
+        raise MusicXMLStandardizationError(
+            "production tempo points require a proven source-to-score alignment model"
+        )
+    ranked = sorted(
+        models,
+        key=lambda item: int(item.get("pair_count", len(item.get("source_indices", [])))),
+        reverse=True,
+    )
+    model = ranked[0]
+    strength = int(model.get("pair_count", len(model.get("source_indices", []))))
+    for candidate in ranked[1:]:
+        candidate_strength = int(candidate.get("pair_count", len(candidate.get("source_indices", []))))
+        if candidate_strength != strength:
+            break
+        try:
+            same_model = (
+                abs(float(candidate["scale"]) - float(model["scale"])) <= 1e-9
+                and abs(
+                    float(candidate.get("offset_ticks", candidate.get("offset", 0.0)))
+                    - float(model.get("offset_ticks", model.get("offset", 0.0)))
+                )
+                <= 0.5
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MusicXMLStandardizationError("source tempo coordinate model is malformed") from exc
+        if not same_model:
+            raise MusicXMLStandardizationError(
+                "source tempo points have tied, incompatible source-to-score alignment models"
+            )
+    try:
+        scale = float(model["scale"])
+        offset = float(model.get("offset_ticks", model.get("offset", 0.0)))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MusicXMLStandardizationError("source tempo coordinate model is malformed") from exc
+    if not 0.5 <= scale <= 1.8 or not math.isfinite(offset):
+        raise MusicXMLStandardizationError("source tempo coordinate model is outside the supported affine range")
+
+    source_by_offset = {
+        round(float(item["offset_quarter"]), 9): item
+        for item in source_records
+    }
+    mapped: list[dict[str, Any]] = []
+    repairs: list[dict[str, Any]] = []
+    for item in conductor["tempo_values"]:
+        offset_quarter = float(item["offset_quarter"])
+        source = source_by_offset.get(round(offset_quarter, 9))
+        if source is None:
+            mapped.append(dict(item))
+            continue
+        source_tick = offset_quarter * SCORE_QUARTER_TICKS
+        mapped_tick = scale * source_tick + offset
+        origin_rebased = False
+        if mapped_tick < 0:
+            if (
+                round(offset_quarter, 9) != 0.0
+                or mapped_tick < -MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS
+            ):
+                raise MusicXMLStandardizationError(
+                    "mapped production tempo lies before the imported Score origin: "
+                    f"source_tick={source_tick:.3f}, mapped_tick={mapped_tick:.3f}; "
+                    "only an auditable initial pre-origin boundary may be rebased"
+                )
+            # The first production tempo can precede the first imported note
+            # by the bounded affine residual.  It is an origin boundary, not
+            # a score event at a negative tick; retain it at score tick 0 and
+            # record the rebase explicitly.
+            final_tick = 0
+            origin_rebased = True
+        else:
+            final_tick = round(mapped_tick)
+        if final_tick < 0:
+            raise MusicXMLStandardizationError(
+                f"mapped production tempo produced an invalid score tick {final_tick}"
+            )
+        mapped.append({**item, "offset_quarter": final_tick / SCORE_QUARTER_TICKS})
+        repairs.append(
+            {
+                "field": "tempo",
+                "source_offset_quarter": offset_quarter,
+                "source_tick": source_tick,
+                "mapped_tick_before_rounding": mapped_tick,
+                "mapped_tick": final_tick,
+                "final_offset_quarter": final_tick / SCORE_QUARTER_TICKS,
+                "bpm": float(source["bpm"]),
+                "alignment_method": source_alignment_report.get("method") or model.get("method"),
+                "alignment_model": {
+                    "scale": scale,
+                    "offset_ticks": offset,
+                    "pair_count": strength,
+                },
+                "origin_rebased": origin_rebased,
+                "reason": (
+                    "source_tempo_initial_pre_origin_rebased_to_score_start"
+                    if origin_rebased
+                    else "source_tempo_mapped_through_proven_musicxml_alignment"
+                ),
+            }
+        )
+
+    by_tick: dict[int, dict[str, Any]] = {}
+    for item in sorted(mapped, key=lambda value: float(value["offset_quarter"])):
+        tick = _quarter_to_tick(float(item["offset_quarter"]))
+        previous = by_tick.get(tick)
+        if previous is not None:
+            if abs(float(previous["bpm"]) - float(item["bpm"])) > 1e-6:
+                raise MusicXMLStandardizationError(
+                    f"conflicting tempo events map to score tick {tick}: "
+                    f"{previous['bpm']} vs {item['bpm']}"
+                )
+            repairs.append(
+                {
+                    "field": "tempo",
+                    "mapped_tick": tick,
+                    "bpm": float(item["bpm"]),
+                    "reason": "duplicate_tempo_event_removed_at_same_score_tick",
+                }
+            )
+            continue
+        by_tick[tick] = {"offset_quarter": tick / SCORE_QUARTER_TICKS, "bpm": float(item["bpm"])}
+    required_total_tick = max(total_ticks, max(by_tick, default=0))
+    return list(by_tick.values()), repairs, required_total_tick
+
+
+def _extend_timeline_for_tempo_tail(
+    timeline: list[dict[str, Any]],
+    *,
+    total_ticks: int,
+    required_total_ticks: int,
+) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
+    """Add complete final bars when an explicit source tempo tail needs them."""
+
+    if required_total_ticks <= total_ticks:
+        return timeline, total_ticks, {"applied": False}
+    if not timeline or int(timeline[-1]["end_tick"]) != total_ticks:
+        raise MusicXMLStandardizationError(
+            "cannot extend the Score timeline for source tempo: imported measure timeline is not contiguous"
+        )
+    meter = _normalize_worker_meter(str(timeline[-1].get("time_signature") or "4/4"))
+    bar_ticks = _meter_bar_ticks(meter)
+    target_total = max(
+        total_ticks + bar_ticks,
+        math.ceil(required_total_ticks / bar_ticks) * bar_ticks,
+    )
+    extended = list(timeline)
+    cursor = total_ticks
+    next_number = max(
+        (int(item["number"]) for item in extended if item.get("number") is not None),
+        default=0,
+    ) + 1
+    while cursor < target_total:
+        end = min(target_total, cursor + bar_ticks)
+        extended.append(
+            {
+                "start_tick": cursor,
+                "duration_tick": end - cursor,
+                "end_tick": end,
+                "time_signature": meter,
+                "is_pickup": False,
+                "number": next_number,
+                "rebar_reason": "production_tempo_tail_boundary",
+            }
+        )
+        cursor = end
+        next_number += 1
+    _validate_timeline_measures(extended, target_total)
+    return extended, target_total, {
+        "applied": True,
+        "start_tick": total_ticks,
+        "end_tick": target_total,
+        "required_total_ticks": required_total_ticks,
+        "time_signature": meter,
+        "reason": "extended_terminal_bars_to_retain_source_tempo_tail",
+    }
+
+
 def standardize_musicxml_payload(
     payload: WorkerPayload,
     *,
@@ -4925,7 +5192,21 @@ def standardize_musicxml_payload(
             hint = source_alignment_hints.get(int(source["source_index"]))
             if hint is not None:
                 source["_alignment_hint"] = hint
-    tempo_values = conductor["tempo_values"]
+    tempo_values, tempo_coordinate_repairs, tempo_required_total_ticks = _map_source_tempo_values_to_score(
+        conductor,
+        performance_metadata=performance_metadata,
+        source_alignment_report=source_alignment_report,
+        total_ticks=total_ticks,
+    )
+    if tempo_required_total_ticks > total_ticks:
+        timeline_measures, total_ticks, tempo_tail_repair = _extend_timeline_for_tempo_tail(
+            timeline_measures,
+            total_ticks=total_ticks,
+            required_total_ticks=tempo_required_total_ticks,
+        )
+        meter_rebar.setdefault("tempo_tail_extensions", []).append(tempo_tail_repair)
+    conductor["tempo_values"] = tempo_values
+    conductor["reconciliation"].extend(tempo_coordinate_repairs)
     tempo_events = [
         TempoEvent(start_tick=max(0, _quarter_to_tick(float(item["offset_quarter"]))), bpm=float(item["bpm"]))
         for item in tempo_values

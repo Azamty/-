@@ -10,7 +10,9 @@ from backend.jianpu_score.musicxml_standardize import (
     _RawEvent,
     _align_source_notes,
     _estimate_source_alignment,
+    _extend_timeline_for_tempo_tail,
     _logical_pitch_units,
+    _map_source_tempo_values_to_score,
     _split_source_retrigger_events,
     WorkerEvent,
     WorkerKeySignature,
@@ -250,6 +252,24 @@ def test_cross_part_source_reconciliation_uses_global_one_to_one_model() -> None
     assert all(item["matching_evidence"] == "monotonic_pitch_affine_alignment" for item in report)
 
 
+def test_exact_source_timing_proves_identity_when_model_has_one_anchor() -> None:
+    events = [_timed_event("xml-60", 60, 0, 48)]
+    sources = [_timed_source(0, 60, 0, 48)]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert hints == {}
+    assert audit == {
+        "applied": False,
+        "reason": "existing_source_alignment_within_strict_window",
+        "provisional_pair_count": 1,
+        "identity_proven": True,
+        "pitch_multiset_equal": True,
+        "one_to_one": True,
+        "global_order_preserved": True,
+    }
+
+
 def test_midi_lane_identity_reconciles_duplicate_pitch_across_imported_parts() -> None:
     events = [
         _parted_timed_event("p1-60", 60, 10, 34, part_id="P1-Staff1", part_group="P1", staff=1),
@@ -411,6 +431,107 @@ def test_source_coordinate_reconciliation_rejects_ambiguous_same_pitch_timing() 
     assert audit["applied"] is False
     assert audit["reason"] == "provisional_alignment_not_unique_same_pitch_timing"
     assert audit["pitch"] == 60
+
+
+def test_source_tempo_points_map_through_proven_alignment_and_dedupe_same_tick() -> None:
+    conductor = {
+        "tempo_values": [
+            {"offset_quarter": 0.0, "bpm": 120.0},
+            {"offset_quarter": 0.5, "bpm": 110.0},
+            {"offset_quarter": 1.0, "bpm": 110.0},
+        ]
+    }
+    mapped, repairs, required_total_ticks = _map_source_tempo_values_to_score(
+        conductor,
+        performance_metadata={
+            "tempo_points": [
+                {"tick": 0, "bpm": 120.0},
+                {"tick": 480, "bpm": 110.0},
+            ]
+        },
+        source_alignment_report={
+            "applied": True,
+            "method": "test_affine",
+            "models": [{"scale": 0.5, "offset": 0.0, "pair_count": 3}],
+        },
+        total_ticks=96,
+    )
+
+    assert mapped == [
+        {"offset_quarter": 0.0, "bpm": 120.0},
+        {"offset_quarter": 0.5, "bpm": 110.0},
+    ]
+    assert any(item["reason"] == "duplicate_tempo_event_removed_at_same_score_tick" for item in repairs)
+    source_repair = next(item for item in repairs if item.get("source_offset_quarter") == 1.0)
+    assert source_repair["source_tick"] == 48.0
+    assert source_repair["mapped_tick"] == 24
+    assert required_total_ticks == 96
+
+
+def test_source_tempo_points_use_proven_strict_identity_without_repair() -> None:
+    mapped, repairs, required_total_ticks = _map_source_tempo_values_to_score(
+        {"tempo_values": [{"offset_quarter": 0.0, "bpm": 96.0}, {"offset_quarter": 2.0, "bpm": 104.0}]},
+        performance_metadata={
+            "tempo_points": [
+                {"tick": 0, "bpm": 96.0},
+                {"tick": 960, "bpm": 104.0},
+            ]
+        },
+        source_alignment_report={
+            "applied": False,
+            "reason": "existing_source_alignment_within_strict_window",
+            "identity_proven": True,
+            "pitch_multiset_equal": True,
+            "one_to_one": True,
+            "global_order_preserved": True,
+            "provisional_pair_count": 4,
+        },
+        total_ticks=96,
+    )
+
+    assert mapped == [
+        {"offset_quarter": 0.0, "bpm": 96.0},
+        {"offset_quarter": 2.0, "bpm": 104.0},
+    ]
+    assert required_total_ticks == 96
+    assert all(item["alignment_model"]["scale"] == 1.0 for item in repairs)
+    assert all(item["alignment_method"] == "strict_identity_source_alignment" for item in repairs)
+
+
+def test_source_tempo_mapping_rejects_conflict_and_out_of_range_without_clamp() -> None:
+    with pytest.raises(MusicXMLStandardizationError, match="conflicting tempo events"):
+        _map_source_tempo_values_to_score(
+            {"tempo_values": [{"offset_quarter": 0.5, "bpm": 100.0}, {"offset_quarter": 1.0, "bpm": 110.0}]},
+            performance_metadata={"tempo_points": [{"tick": 480, "bpm": 110.0}]},
+            source_alignment_report={"applied": True, "models": [{"scale": 0.5, "offset": 0.0, "pair_count": 3}]},
+            total_ticks=96,
+        )
+    mapped, _repairs, required_total_ticks = _map_source_tempo_values_to_score(
+        {"tempo_values": [{"offset_quarter": 3.0, "bpm": 110.0}]},
+        performance_metadata={"tempo_points": [{"tick": 1440, "bpm": 110.0}]},
+        source_alignment_report={"applied": True, "models": [{"scale": 1.0, "offset": 0.0, "pair_count": 3}]},
+        total_ticks=96,
+    )
+    assert mapped == [{"offset_quarter": 3.0, "bpm": 110.0}]
+    assert required_total_ticks == 144
+
+    timeline, final_total, audit = _extend_timeline_for_tempo_tail(
+        [
+            {
+                "start_tick": 0,
+                "duration_tick": 144,
+                "end_tick": 144,
+                "time_signature": "3/4",
+                "is_pickup": False,
+                "number": 1,
+            }
+        ],
+        total_ticks=144,
+        required_total_ticks=200,
+    )
+    assert final_total == 288
+    assert timeline[-1]["start_tick"] == 144
+    assert audit["reason"] == "extended_terminal_bars_to_retain_source_tempo_tail"
 
 
 def test_source_coordinate_reconciliation_rejects_global_order_reversal() -> None:
