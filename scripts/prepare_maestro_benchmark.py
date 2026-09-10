@@ -5,9 +5,12 @@ available for an explicitly authorized local run, but this task does not run
 it.  The archive hash is checked before extraction; selected members and their
 hashes are recorded so a later run cannot silently switch the public data.
 Audio is rendered locally from deterministic source MIDI clips.  These clips
-are valid end-to-end model cases in the benchmark's local-render domain: the
-audio still goes through the production recognizer, while the domain limits
-are disclosed explicitly.  The pinned FluidSynth 2.6.0 binary receives the
+are valid pitch/event-time model cases in the benchmark's local-render domain:
+the audio still goes through the production recognizer, while the domain
+limits are disclosed explicitly.  MAESTRO performance MIDI does not provide
+score-aligned beat labels; its fixed transport tick grid is retained only as a
+diagnostic ruler and must not be scored as beat/downbeat ground truth.  The
+pinned FluidSynth 2.6.0 binary receives the
 source MIDI directly with MS Basic.sf3; it preserves MIDI pitch, timing,
 tempo, meter, and note velocity but does not reproduce piano timbre, pedal
 noise, room acoustics, or the original MAESTRO performance.  Clip boundaries
@@ -259,7 +262,7 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
             )
             source_end_q = max((note.end for track in tracks for note in track.notes), default=Fraction(1))
             if overwrite or not full_beat_destination.exists():
-                _beat_annotation(full_beat_destination, tempo=source_tempo, meter=source_meter, end_q=source_end_q, source="official_maestro_midi_rendered")
+                _beat_annotation(full_beat_destination, tempo=source_tempo, meter=source_meter, end_q=source_end_q, source="official_maestro_performance_midi_tick_grid_diagnostic_only")
 
             clip_midi_destination = clip_root / f"{normalized_id}.mid"
             clip_audio_destination = clip_root / f"{normalized_id}.wav"
@@ -282,7 +285,7 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
                 tempo=clip_tempo,
                 meter=source_meter,
                 end_q=clip_end_q,
-                source="official_maestro_midi_clip_ground_truth",
+                source="official_maestro_performance_midi_tick_grid_diagnostic_only",
             )
             records.append(
                 {
@@ -297,6 +300,8 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
                     "audio": _file_record(clip_audio_destination, relative_to=output_root),
                     "render_manifest": _file_record(clip_render_manifest_path, relative_to=output_root),
                     "beat_annotation": _file_record(clip_beat_destination, relative_to=output_root),
+                    "beat_annotation_independent": False,
+                    "beat_annotation_role": "performance_midi_tick_grid_diagnostic_only",
                     "full_render": {
                         "audio": _file_record(full_audio_destination, relative_to=output_root),
                         "render_manifest": _file_record(full_render_manifest_path, relative_to=output_root),
@@ -315,6 +320,7 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
                         "bar_quarters": str(Fraction(source_meter[0] * 4, source_meter[1])),
                         "source_end_quarter": str(source_end_q),
                         "policy": "first_source_note_aligned_to_containing_bar_then_eight_source_bars_or_final_complete_bars",
+                        "policy_limitation": "quarter positions are performance transport ticks, not independently annotated musical bars",
                         "source_meter": f"{source_meter[0]}/{source_meter[1]}",
                         "source_key": source_key,
                         "tempo_points": [{"quarter": str(point), "bpm": bpm} for point, bpm in clip_tempo],
@@ -342,7 +348,9 @@ def prepare_archive(archive: Path, *, output_root: Path = DEFAULT_OUTPUT, count:
             "evaluation_scope": "production_end_to_end",
             "benchmark_role": "production_end_to_end_render_domain",
             "production_end_to_end": True,
-            "clip_policy": f"deterministic source-MIDI selection: first note's containing bar plus {CLIP_BARS} bars, never model-output selected",
+            "beat_evaluation_eligible": False,
+            "beat_evaluation_reason": "MAESTRO performance MIDI has aligned key-event time but no score-aligned beat/downbeat labels",
+            "clip_policy": f"deterministic source-MIDI transport-tick window: first note's containing {CLIP_BARS * 4}-quarter block, never model-output selected",
         },
         "cases": records,
     }

@@ -297,6 +297,9 @@ def test_maestro_selector_records_clip_hashes_and_domain(tmp_path: Path, monkeyp
     assert record["midi"]["path"].startswith("rendered/clips/")
     assert record["audio"]["path"].startswith("rendered/clips/")
     assert record["beat_annotation"]["path"].startswith("rendered/clips/")
+    assert record["beat_annotation_independent"] is False
+    assert record["beat_annotation_role"] == "performance_midi_tick_grid_diagnostic_only"
+    assert result["render_domain"]["beat_evaluation_eligible"] is False
     assert record["render_manifest"]["path"].endswith(".render_manifest.json")
     assert record["source_event_complete"] is True
     assert record["clip"]["source_meter"] == "3/4"
@@ -304,6 +307,8 @@ def test_maestro_selector_records_clip_hashes_and_domain(tmp_path: Path, monkeyp
         path = tmp_path / "maestro" / record[key]["path"]
         assert path.is_file()
         assert record[key]["sha256"] == _hash(path)
+    annotation = json.loads((tmp_path / "maestro" / record["beat_annotation"]["path"]).read_text(encoding="utf-8"))
+    assert annotation["source"] == "official_maestro_performance_midi_tick_grid_diagnostic_only"
 
 
 def test_batch_runner_recognizes_once_and_shares_immutable_raw_between_pipelines(tmp_path: Path) -> None:

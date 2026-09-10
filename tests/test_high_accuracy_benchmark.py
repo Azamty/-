@@ -64,14 +64,16 @@ def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
         "research_mixed_song",
         "specialized_local_midi_render",
     }
-    assert sum(item.get("beat_annotation_independent") is True for item in reliable) == 30
-    assert sum(item.get("beat_annotation_independent") is False for item in reliable) == 0
+    assert sum(item.get("beat_annotation_independent") is True for item in reliable) == 20
+    assert sum(item.get("beat_annotation_independent") is False for item in reliable) == 10
     assert all(
         item.get("beat_annotation_source") in {"deterministic_midi_render_ground_truth", "ccmusic_musicxml_score_ground_truth"}
         for item in reliable
         if item.get("beat_annotation_independent") is True
     )
     assert all(item.get("reference_midi_reliable") is False for item in registry["cases"] if item["category"] == "vocal_diagnostic")
+    maestro = [item for item in registry["cases"] if item["category"] == "official_piano_rendered"]
+    assert all(item["beat_annotation_source"] == "maestro_performance_midi_tick_grid_diagnostic_only" for item in maestro)
     assert all(item.get("evaluation_policy") == "diagnostic_only" for item in registry["cases"] if item["category"] == "vocal_diagnostic")
     assert registry["sources"]["ccmusic-demo"]["archive_sha256"] == "477b5466936eec40cef7dfd43205900e3e4a651b8ec671fdccaff48910523053"
     luv = next(item for item in registry["cases"] if item["id"] == "luv-letter")
