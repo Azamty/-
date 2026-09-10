@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -35,3 +36,25 @@ def test_pilot_targets_and_stop_thresholds_are_explicit() -> None:
     assert pilot.TARGET_DOWNBEAT_F1 == 0.75
     assert pilot.CLOSE_BEAT_F1 < pilot.TARGET_BEAT_F1
     assert pilot.CLOSE_DOWNBEAT_F1 < pilot.TARGET_DOWNBEAT_F1
+
+
+def test_dbn_profiles_are_fixed_and_separate_from_minimal() -> None:
+    assert pilot.OFFICIAL_DBN_ID == "final0_official_dbn_34"
+    assert pilot.OFFICIAL_DBN_BEATS_PER_BAR == [3, 4]
+    assert pilot.MADMOM_DBN_ID == "final0_madmom_dbn_2346"
+    assert pilot.MADMOM_DBN_BEATS_PER_BAR == [2, 3, 4, 6]
+
+
+def test_combined_dbn_activation_matches_official_probability_contract() -> None:
+    activation = pilot._combined_dbn_activation(np.asarray([0.0, 4.0]), np.asarray([0.0, -4.0]))
+    assert activation.shape == (2, 2)
+    assert activation[0, 1] > 0.49
+    assert activation[1, 0] > 0.9
+    assert activation[1, 1] < 0.1
+
+
+def test_official_dbn_gate_controls_expansion_decision() -> None:
+    row = {"candidate_id": pilot.OFFICIAL_DBN_ID, "case_count": 4, "failure_count": 0, "mean_beat_f1": 0.80, "mean_downbeat_f1": 0.70}
+    result = pilot._with_target_gate(row)
+    assert result["close_to_target"]["met"] is True
+    assert result["decision"] == "expand_to_full_batch"
