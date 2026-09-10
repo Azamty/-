@@ -223,6 +223,52 @@ def test_source_coordinate_reconciliation_requires_complete_affine_evidence() ->
     assert all(item["source_alignment_start_residual_ticks"] == 0 for item in report)
 
 
+def test_source_coordinate_reconciliation_allows_long_movement_proven_by_affine_anchors() -> None:
+    # A MuseScore import can rescale a long performance timeline.  The final
+    # raw displacement exceeds 384 ticks here, but three exact anchors prove
+    # the 0.5 scale; the accepted movement bound must come from that model and
+    # its checked residual limit rather than from a broad matching window.
+    events = [
+        _timed_event("xml-60", 60, 0, 48),
+        _timed_event("xml-62", 62, 480, 528),
+        _timed_event("xml-64", 64, 960, 1008),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 960, 1056),
+        _timed_source(2, 64, 1920, 2016),
+    ]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert audit["applied"] is True
+    assert audit["classification"] == "global_affine_scale_and_offset"
+    assert audit["max_raw_end_difference_ticks"] == 1008
+    assert audit["movement_bound_ticks"] == 1072
+    assert audit["models"][0]["movement_bound_ticks"] == 1072
+
+    report = _align_source_notes(events, sources, alignment_hints=hints)
+    assert [item["musicxml_event_id"] for item in report] == ["xml-60", "xml-62", "xml-64"]
+    assert all(item["reason"] == "matched_musicxml_affine_source_alignment" for item in report)
+
+
+def test_source_coordinate_reconciliation_keeps_unproven_long_offset_fail_closed() -> None:
+    events = [
+        _timed_event("xml-60", 60, 0, 48),
+        _timed_event("xml-62", 62, 480, 528),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 960, 1056),
+    ]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert hints == {}
+    assert audit["applied"] is False
+    assert audit["reason"] == "insufficient_alignment_model_points"
+
+
 def test_cross_part_source_reconciliation_uses_global_one_to_one_model() -> None:
     # Each synthetic MuseScore part has only one anchor.  The complete pitch
     # assignment is still unique, so a global model can reconcile the parts
@@ -250,6 +296,58 @@ def test_cross_part_source_reconciliation_uses_global_one_to_one_model() -> None
     assert [item["musicxml_event_id"] for item in report] == ["xml-60", "xml-62", "xml-64"]
     assert {item["accounting_category"] for item in report} == {"matched"}
     assert all(item["matching_evidence"] == "monotonic_pitch_affine_alignment" for item in report)
+
+
+def test_cross_part_source_reconciliation_allows_bounded_overlap_reordering() -> None:
+    events = [
+        _parted_timed_event("xml-60", 60, 0, 38, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("xml-62", 62, 96, 134, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("xml-64", 64, 192, 230, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("xml-65", 65, 180, 277, part_id="P1-Staff2", part_group="P1", staff=2),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 120, 168),
+        _timed_source(2, 64, 240, 288),
+        _timed_source(3, 65, 250, 346),
+    ]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert audit["applied"] is True
+    assert audit["global_order_preserved"] is False
+    assert audit["pairing"].endswith("bounded_cross_part_overlap_reordering")
+    assert audit["order_reconciliation"]["reordered_pair_count"] == 1
+    assert audit["order_reconciliation"]["pairs"][0]["source_gap_ticks"] == -38
+    assert audit["order_reconciliation"]["pairs"][0]["musicxml_score_overlap_ticks"] == 38
+    report = _align_source_notes(events, sources, alignment_hints=hints)
+    assert [item["musicxml_event_id"] for item in report] == [
+        "xml-60",
+        "xml-62",
+        "xml-64",
+        "xml-65",
+    ]
+
+
+def test_cross_part_source_reconciliation_rejects_disjoint_order_reordering() -> None:
+    events = [
+        _parted_timed_event("xml-60", 60, 0, 38, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("xml-62", 62, 96, 134, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("xml-64", 64, 192, 230, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("xml-65", 65, 144, 192, part_id="P1-Staff2", part_group="P1", staff=2),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 120, 168),
+        _timed_source(2, 64, 240, 288),
+        _timed_source(3, 65, 250, 346),
+    ]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert hints == {}
+    assert audit["applied"] is False
+    assert audit["reason"] == "provisional_alignment_global_order_reversed"
 
 
 def test_exact_source_timing_proves_identity_when_model_has_one_anchor() -> None:
@@ -305,6 +403,75 @@ def test_midi_lane_identity_reconciles_duplicate_pitch_across_imported_parts() -
     report = _align_source_notes(events, sources, alignment_hints=hints)
     assert {item["accounting_category"] for item in report} == {"matched"}
     assert {item["musicxml_event_id"] for item in report} == {"p1-60", "p1-62", "p1-64", "p2-60"}
+
+
+def test_midi_lane_singleton_reuses_unique_shared_affine_model() -> None:
+    events = [
+        _parted_timed_event("lane1-60", 60, 0, 48, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-62", 62, 480, 528, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-64", 64, 960, 1008, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event(
+            "lane2-65",
+            65,
+            1200,
+            1248,
+            part_id="Piano, lane two",
+            part_group="Piano, lane two",
+            staff=1,
+        ),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 960, 1056),
+        _timed_source(2, 64, 1920, 2016),
+        _timed_source(3, 65, 2400, 2496),
+    ]
+    for source in sources:
+        source["midi_lane"] = 0 if source["source_index"] < 3 else 1
+        source["midi_track_name"] = "lane one" if source["midi_lane"] == 0 else "lane two"
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert audit["applied"] is True
+    singleton = next(model for model in audit["models"] if model["lane"] == 1)
+    assert singleton["method"] == "midi_lane_shared_affine_alignment"
+    assert singleton["shared_anchor_lane"] == 0
+    assert singleton["shared_anchor_pair_count"] == 3
+    assert hints[3]["scale"] == pytest.approx(0.5)
+    assert hints[3]["musicxml_unit_id"] == 3
+
+
+def test_midi_lane_singleton_shared_model_keeps_duration_residual_fail_closed() -> None:
+    events = [
+        _parted_timed_event("lane1-60", 60, 0, 48, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-62", 62, 480, 528, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-64", 64, 960, 1008, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event(
+            "lane2-65",
+            65,
+            1200,
+            1313,
+            part_id="Piano, lane two",
+            part_group="Piano, lane two",
+            staff=1,
+        ),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 960, 1056),
+        _timed_source(2, 64, 1920, 2016),
+        _timed_source(3, 65, 2400, 2496),
+    ]
+    for source in sources:
+        source["midi_lane"] = 0 if source["source_index"] < 3 else 1
+        source["midi_track_name"] = "lane one" if source["midi_lane"] == 0 else "lane two"
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert hints == {}
+    assert audit["applied"] is False
+    assert audit["reason"] == "source_midi_lane_alignment_residual_exceeds_bound"
+    assert audit["lane"] == 1
 
 
 def test_source_retrigger_split_preserves_each_nonduplicate_source_event() -> None:

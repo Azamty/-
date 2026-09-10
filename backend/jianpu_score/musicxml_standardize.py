@@ -1853,6 +1853,125 @@ def _source_alignment_residuals(
     return abs(unit.start_tick - predicted_start), abs(unit.end_tick - predicted_end)
 
 
+def _proven_alignment_movement_bound(
+    pairs: Sequence[tuple[dict[str, Any], _LogicalPitchUnit]],
+    *,
+    scale: float,
+    offset: float,
+    minimum_ticks: int,
+    start_residual_bound: int,
+    end_residual_bound: int,
+) -> int:
+    """Bound raw movement implied by an already-proven affine model.
+
+    A coordinate transform can move a late source note by more than the
+    historical fixed 384-tick window even when every anchor is a close fit.
+    The raw difference is bounded by the model's predicted movement plus the
+    residual limit that was already checked for that model.  This keeps the
+    fail-closed proof tied to the fitted anchors instead of accepting an
+    arbitrary larger nearest-neighbour window.
+    """
+
+    predicted_movements = [
+        abs(scale * int(source[key]) + offset - int(source[key]))
+        for source, _unit in pairs
+        for key in ("start_tick", "end_tick")
+    ]
+    return max(
+        int(minimum_ticks),
+        math.ceil(
+            max(predicted_movements, default=0.0)
+            + max(int(start_residual_bound), int(end_residual_bound))
+        ),
+    )
+
+
+def _source_order_reversals(
+    provisional: Sequence[tuple[dict[str, Any], _LogicalPitchUnit]],
+) -> list[tuple[tuple[dict[str, Any], _LogicalPitchUnit], tuple[dict[str, Any], _LogicalPitchUnit]]]:
+    """Return cross-pitch pairs whose imported starts reverse source order."""
+
+    ordered = sorted(
+        provisional,
+        key=lambda pair: (
+            int(pair[0]["start_tick"]),
+            int(pair[0]["end_tick"]),
+            int(pair[0]["source_index"]),
+        ),
+    )
+    return [
+        (previous, current)
+        for previous, current in zip(ordered, ordered[1:], strict=False)
+        if int(current[0]["start_tick"]) > int(previous[0]["start_tick"])
+        and current[1].start_tick < previous[1].start_tick
+    ]
+
+
+def _bounded_cross_part_order_reconciliation(
+    reversals: Sequence[
+        tuple[
+            tuple[dict[str, Any], _LogicalPitchUnit],
+            tuple[dict[str, Any], _LogicalPitchUnit],
+        ]
+    ],
+) -> dict[str, Any] | None:
+    """Audit a local cross-staff order reversal caused by overlapping spans.
+
+    A global affine model remains auditable when MuseScore quantizes two
+    adjacent source notes into overlapping synthetic staves.  The source pair
+    must be adjacent/overlapping in time, the imported units must overlap in
+    score coordinates, and the parts must differ.  A disjoint or same-staff
+    reversal remains unresolved.
+    """
+
+    if not reversals:
+        return None
+    evidence: list[dict[str, Any]] = []
+    for previous, current in reversals:
+        previous_source, previous_unit = previous
+        current_source, current_unit = current
+        previous_group = _alignment_unit_group(previous_unit)
+        current_group = _alignment_unit_group(current_unit)
+        if previous_group == current_group:
+            return None
+        source_gap = int(current_source["start_tick"]) - int(previous_source["end_tick"])
+        if not (
+            -MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS
+            <= source_gap
+            <= MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS
+        ):
+            return None
+        score_overlap = min(previous_unit.end_tick, current_unit.end_tick) - max(
+            previous_unit.start_tick,
+            current_unit.start_tick,
+        )
+        if score_overlap <= 0:
+            return None
+        evidence.append(
+            {
+                "previous_source_index": int(previous_source["source_index"]),
+                "previous_musicxml_unit_id": previous_unit.unit_id,
+                "current_source_index": int(current_source["source_index"]),
+                "current_musicxml_unit_id": current_unit.unit_id,
+                "previous_group": {
+                    "part_group": previous_group[0],
+                    "staff": previous_group[1],
+                },
+                "current_group": {
+                    "part_group": current_group[0],
+                    "staff": current_group[1],
+                },
+                "source_gap_ticks": source_gap,
+                "musicxml_score_overlap_ticks": int(score_overlap),
+            }
+        )
+    return {
+        "policy": "bounded_cross_part_overlap_reordering",
+        "reordered_pair_count": len(evidence),
+        "pairs": evidence,
+    }
+
+
 def _source_track_identity_partitions(
     events: list[_RawEvent],
     source_notes: list[dict[str, Any]],
@@ -2016,6 +2135,33 @@ def _track_identity_alignment(
     models: list[dict[str, Any]] = []
     max_start_residual = 0.0
     max_end_residual = 0.0
+    shared_affine_models: list[dict[str, Any]] = []
+    for candidate_partition in partitions:
+        candidate_pairs = list(candidate_partition["pairs"])
+        if len(candidate_pairs) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
+            continue
+        candidate_scale, candidate_offset = _fit_source_alignment_line(candidate_pairs)
+        if not 0.5 <= candidate_scale <= 1.8:
+            continue
+        candidate_residuals = [
+            _source_alignment_residuals(pair, scale=candidate_scale, offset=candidate_offset)
+            for pair in candidate_pairs
+        ]
+        if (
+            max((value[0] for value in candidate_residuals), default=0.0)
+            > MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS
+            or max((value[1] for value in candidate_residuals), default=0.0)
+            > MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS
+        ):
+            continue
+        shared_affine_models.append(
+            {
+                "lane": candidate_partition["lane"],
+                "scale": candidate_scale,
+                "offset": candidate_offset,
+                "pair_count": len(candidate_pairs),
+            }
+        )
     for partition in partitions:
         pairs = list(partition["pairs"])
         if len(pairs) >= MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
@@ -2023,9 +2169,30 @@ def _track_identity_alignment(
             method = "midi_lane_affine_alignment"
         elif len(pairs) == 1:
             source, unit = pairs[0]
-            scale = 1.0
-            offset = float(unit.start_tick - int(source["start_tick"]))
-            method = "midi_lane_singleton_offset_alignment"
+            shared_candidates = [
+                candidate
+                for candidate in shared_affine_models
+                if int(candidate["lane"]) != int(partition["lane"])
+            ]
+            distinct_shared_models: list[dict[str, Any]] = []
+            for candidate in shared_candidates:
+                if not any(
+                    abs(float(candidate["scale"]) - float(previous["scale"])) <= 1e-9
+                    and abs(float(candidate["offset"]) - float(previous["offset"])) <= 0.5
+                    for previous in distinct_shared_models
+                ):
+                    distinct_shared_models.append(candidate)
+            if len(distinct_shared_models) == 1:
+                shared = distinct_shared_models[0]
+                scale = float(shared["scale"])
+                offset = float(shared["offset"])
+                method = "midi_lane_shared_affine_alignment"
+                shared_anchor_lane = int(shared["lane"])
+            else:
+                scale = 1.0
+                offset = float(unit.start_tick - int(source["start_tick"]))
+                method = "midi_lane_singleton_offset_alignment"
+                shared_anchor_lane = None
         else:
             return fail(
                 "source_midi_lane_alignment_has_insufficient_anchors",
@@ -2055,17 +2222,13 @@ def _track_identity_alignment(
                 max_start_residual_ticks=model_start_residual,
                 max_end_residual_ticks=model_end_residual,
             )
-        predicted_movements = [
-            abs(scale * int(source[key]) + offset - int(source[key]))
-            for source, _unit in pairs
-            for key in ("start_tick", "end_tick")
-        ]
-        movement_bound = max(
-            MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS,
-            math.ceil(max(predicted_movements, default=0.0) + max(
-                MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
-                MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
-            )),
+        movement_bound = _proven_alignment_movement_bound(
+            pairs,
+            scale=scale,
+            offset=offset,
+            minimum_ticks=MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS,
+            start_residual_bound=MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
+            end_residual_bound=MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
         )
         raw_start = max(
             (abs(unit.start_tick - int(source["start_tick"])) for source, unit in pairs),
@@ -2094,6 +2257,13 @@ def _track_identity_alignment(
             "musicxml_unit_ids": [unit.unit_id for _source, unit in pairs],
             "movement_bound_ticks": movement_bound,
         }
+        if method == "midi_lane_shared_affine_alignment":
+            model["shared_anchor_lane"] = shared_anchor_lane
+            model["shared_anchor_pair_count"] = next(
+                int(candidate["pair_count"])
+                for candidate in shared_affine_models
+                if int(candidate["lane"]) == int(shared_anchor_lane)
+            )
         models.append(model)
         for position, (source, unit) in enumerate(pairs):
             start_residual, end_residual = residuals[position]
@@ -2159,6 +2329,13 @@ def _track_identity_alignment(
 
 def _cross_part_alignment(
     provisional: list[tuple[dict[str, Any], _LogicalPitchUnit]],
+    *,
+    order_reversals: Sequence[
+        tuple[
+            tuple[dict[str, Any], _LogicalPitchUnit],
+            tuple[dict[str, Any], _LogicalPitchUnit],
+        ]
+    ] = (),
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]] | None:
     """Build a bounded affine model across MuseScore's synthetic parts.
 
@@ -2166,7 +2343,8 @@ def _cross_part_alignment(
     values.  A per-staff model is then underdetermined for a short synthetic
     part even though the complete source/pitch assignment is unambiguous.  A
     global model is accepted only after the caller has established exact
-    pitch counts, unique same-pitch timing, and global monotonic order.
+    pitch counts, unique same-pitch timing, and either global monotonic order
+    or a bounded cross-part overlap reordering proof.
     """
 
     if len(provisional) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
@@ -2193,22 +2371,18 @@ def _cross_part_alignment(
         abs(unit.end_tick - int(source["end_tick"]))
         for source, unit in provisional
     )
-    predicted_movements = [
-        abs(scale * int(source[key]) + offset - int(source[key]))
-        for source, _unit in provisional
-        for key in ("start_tick", "end_tick")
-    ]
-    movement_bound = max(
-        MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS,
-        math.ceil(
-            max(predicted_movements, default=0.0)
-            + max(
-                MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
-                MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
-            )
-        ),
+    movement_bound = _proven_alignment_movement_bound(
+        provisional,
+        scale=scale,
+        offset=offset,
+        minimum_ticks=MAX_CROSS_PART_ALIGNMENT_MOVEMENT_TICKS,
+        start_residual_bound=MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
+        end_residual_bound=MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
     )
     if max(raw_start_movement, raw_end_movement) > movement_bound:
+        return None
+    order_reconciliation = _bounded_cross_part_order_reconciliation(order_reversals)
+    if order_reversals and order_reconciliation is None:
         return None
     needs_reconciliation = any(
         abs(unit.start_tick - int(source["start_tick"])) > 24
@@ -2262,8 +2436,12 @@ def _cross_part_alignment(
         "applied": True,
         "method": "monotonic_pitch_assignment_cross_part_affine_model",
         "classification": classification,
-        "pairing": "monotonic_per_pitch_start_end_order",
-        "global_order_preserved": True,
+        "pairing": (
+            "monotonic_per_pitch_start_end_order_with_bounded_cross_part_overlap_reordering"
+            if order_reversals
+            else "monotonic_per_pitch_start_end_order"
+        ),
+        "global_order_preserved": not bool(order_reversals),
         "pitch_multiset_equal": True,
         "one_to_one": True,
         "provisional_pair_count": len(provisional),
@@ -2277,6 +2455,7 @@ def _cross_part_alignment(
                 "pair_count": len(provisional),
                 "source_indices": list(model["source_indices"]),
                 "musicxml_unit_ids": list(model["musicxml_unit_ids"]),
+                "movement_bound_ticks": movement_bound,
             }
         ],
         "max_start_residual_ticks": max_start_residual,
@@ -2286,6 +2465,7 @@ def _cross_part_alignment(
         "max_raw_start_difference_ticks": raw_start_movement,
         "max_raw_end_difference_ticks": raw_end_movement,
         "movement_bound_ticks": movement_bound,
+        **({"order_reconciliation": order_reconciliation} if order_reconciliation else {}),
     }
 
 
@@ -2367,29 +2547,24 @@ def _estimate_source_alignment(
             }
         provisional.extend(zip(source_rows, unit_rows, strict=True))
 
-    source_ordered = sorted(
-        provisional,
-        key=lambda pair: (
-            int(pair[0]["start_tick"]),
-            int(pair[0]["end_tick"]),
-            int(pair[0]["source_index"]),
-        ),
-    )
-    for previous, current in zip(source_ordered, source_ordered[1:], strict=False):
+    order_reversals = _source_order_reversals(provisional)
+    imported_groups = {_alignment_unit_group(unit) for _source, unit in provisional}
+    if order_reversals and len(imported_groups) > 1:
+        cross_part = _cross_part_alignment(provisional, order_reversals=order_reversals)
+        if cross_part is not None:
+            return cross_part
+    if order_reversals:
+        previous, current = order_reversals[0]
         previous_source, previous_unit = previous
         current_source, current_unit = current
-        if (
-            int(current_source["start_tick"]) > int(previous_source["start_tick"])
-            and current_unit.start_tick < previous_unit.start_tick
-        ):
-            return {}, {
-                "applied": False,
-                "reason": "provisional_alignment_global_order_reversed",
-                "previous_source_index": int(previous_source["source_index"]),
-                "previous_musicxml_unit_id": previous_unit.unit_id,
-                "current_source_index": int(current_source["source_index"]),
-                "current_musicxml_unit_id": current_unit.unit_id,
-            }
+        return {}, {
+            "applied": False,
+            "reason": "provisional_alignment_global_order_reversed",
+            "previous_source_index": int(previous_source["source_index"]),
+            "previous_musicxml_unit_id": previous_unit.unit_id,
+            "current_source_index": int(current_source["source_index"]),
+            "current_musicxml_unit_id": current_unit.unit_id,
+        }
 
     if all(
         int(source["start_tick"]) == unit.start_tick
@@ -2406,7 +2581,6 @@ def _estimate_source_alignment(
             "global_order_preserved": True,
         }
 
-    imported_groups = {_alignment_unit_group(unit) for _source, unit in provisional}
     if len(imported_groups) > 1:
         cross_part = _cross_part_alignment(provisional)
         if cross_part is not None:
@@ -2560,6 +2734,22 @@ def _estimate_source_alignment(
 
         for model_index, model in enumerate(group_models):
             model["model_index"] = model_index
+            model_pairs = [ordered[position] for position in model["pair_positions"]]
+            if model["method"] == "affine_staff_alignment":
+                model["movement_bound_ticks"] = _proven_alignment_movement_bound(
+                    model_pairs,
+                    scale=float(model["scale"]),
+                    offset=float(model["offset"]),
+                    minimum_ticks=MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS,
+                    start_residual_bound=MAX_AFFINE_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS,
+                    end_residual_bound=MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS,
+                )
+            else:
+                # Offset-only fragments have no multi-anchor scale proof.  Keep
+                # the historical fixed bound for those explicit singleton
+                # repairs rather than deriving a permissive limit from one
+                # arbitrary point.
+                model["movement_bound_ticks"] = MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS
             models.append(model)
             for position in model["pair_positions"]:
                 source, unit = ordered[position]
@@ -2582,7 +2772,8 @@ def _estimate_source_alignment(
                     }
                 source_start_movement = abs(unit.start_tick - int(source["start_tick"]))
                 source_end_movement = abs(unit.end_tick - int(source["end_tick"]))
-                if max(source_start_movement, source_end_movement) > MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS:
+                movement_bound = int(model["movement_bound_ticks"])
+                if max(source_start_movement, source_end_movement) > movement_bound:
                     return {}, {
                         "applied": False,
                         "reason": "source_alignment_movement_exceeds_bound",
@@ -2590,7 +2781,7 @@ def _estimate_source_alignment(
                         "musicxml_unit_id": unit.unit_id,
                         "start_movement_ticks": source_start_movement,
                         "end_movement_ticks": source_end_movement,
-                        "movement_bound_ticks": MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS,
+                        "movement_bound_ticks": movement_bound,
                     }
                 source_hints[int(source["source_index"])] = {
                     "scale": float(model["scale"]),
@@ -2605,6 +2796,7 @@ def _estimate_source_alignment(
                     "end_residual_ticks": end_residual,
                     "start_residual_bound_ticks": MAX_AFFINE_SOURCE_ALIGNMENT_START_RESIDUAL_TICKS,
                     "end_residual_bound_ticks": MAX_SOURCE_ALIGNMENT_END_RESIDUAL_TICKS,
+                    "movement_bound_ticks": movement_bound,
                 }
 
     if len(source_hints) != len(source_notes) or len({hint["musicxml_unit_id"] for hint in source_hints.values()}) != len(source_notes):
@@ -2683,6 +2875,7 @@ def _estimate_source_alignment(
                 "pair_count": len(model["pair_positions"]),
                 "source_indices": list(model["source_indices"]),
                 "musicxml_unit_ids": list(model["musicxml_unit_ids"]),
+                "movement_bound_ticks": int(model["movement_bound_ticks"]),
             }
             for model in models
         ],
@@ -2694,7 +2887,10 @@ def _estimate_source_alignment(
         "musicxml_pitch_counts": {str(pitch): len(rows) for pitch, rows in sorted(units_by_pitch.items())},
         "max_raw_start_difference_ticks": max(raw_start_differences),
         "max_raw_end_difference_ticks": max(raw_end_differences),
-        "movement_bound_ticks": MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS,
+        "movement_bound_ticks": max(
+            (int(model["movement_bound_ticks"]) for model in models),
+            default=MAX_SOURCE_ALIGNMENT_MOVEMENT_TICKS,
+        ),
         "sample_pairs": sample_pairs,
     }
 
