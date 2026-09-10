@@ -479,7 +479,7 @@ def build_performance_midi(
         "channel": channels[0] + 1,
         "channels": [channel_value + 1 for channel_value in channels],
         "voice_lane_count": len(lane_notes),
-        "voice_lane_policy": "same_pitch_interval_coloring_lossless_midi_tracks",
+        "voice_lane_policy": "same_pitch_interval_and_retrigger_onset_identity_lossless_midi_tracks",
         "lane_assignment": {
             "schema_version": "1.0",
             "reuse_condition": "same_pitch_previous_end_tick_strictly_less_than_next_start_tick",

@@ -218,7 +218,7 @@ def test_more_than_four_same_pitch_lanes_use_lossless_midi_tracks() -> None:
     midi_bytes, metadata = build_performance_midi(events, analysis, instrument_group="piano")
     midi, _messages_list = _messages(midi_bytes)
     assert metadata["voice_lane_count"] == 16
-    assert metadata["voice_lane_policy"] == "same_pitch_interval_coloring_lossless_midi_tracks"
+    assert metadata["voice_lane_policy"] == "same_pitch_interval_and_retrigger_onset_identity_lossless_midi_tracks"
     assert metadata["preferred_voice_lanes_per_staff"] == 4
     assert [item["midi_track_index"] for item in metadata["notes"]] == list(range(1, 17))
     assert metadata["channels"][15] == metadata["channels"][0]
