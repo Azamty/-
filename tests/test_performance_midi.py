@@ -162,6 +162,53 @@ def test_same_pitch_overlaps_use_independent_midi_lanes_without_losing_identity(
         assert all(right[0] >= left[1] for left, right in zip(spans, spans[1:]))
 
 
+def test_same_pitch_adjacent_retriggers_use_distinct_lossless_lanes() -> None:
+    analysis = _analysis(beat_times=[0.0, 0.5, 1.0, 1.5, 2.0])
+    events = [
+        NoteEvent(start_sec=0.0, end_sec=0.5, midi=60, source="first"),
+        NoteEvent(start_sec=0.5, end_sec=1.0, midi=60, source="adjacent"),
+        NoteEvent(start_sec=1.5, end_sec=2.0, midi=60, source="reused"),
+    ]
+
+    midi_bytes, metadata = build_performance_midi(events, analysis, instrument_group="piano")
+    midi, _messages_list = _messages(midi_bytes)
+
+    assert metadata["voice_lane_count"] == 2
+    assert metadata["lane_assignment"] == {
+        "schema_version": "1.0",
+        "reuse_condition": "same_pitch_previous_end_tick_strictly_less_than_next_start_tick",
+        "adjacent_retrigger_split_count": 1,
+        "adjacent_retrigger_source_indices": [1],
+    }
+    assert [item["midi_lane"] for item in metadata["notes"]] == [0, 1, 0]
+    assert [item["midi_lane_reason"] for item in metadata["notes"]] == [
+        "primary_lane",
+        "adjacent_retrigger",
+        "reused_lane",
+    ]
+    assert [item["midi_channel"] for item in metadata["notes"]] == [1, 2, 1]
+    assert [item["start_tick"] for item in metadata["notes"]] == [0, 480, 1440]
+    assert [item["end_tick"] for item in metadata["notes"]] == [480, 960, 1920]
+    assert len(midi.tracks) == 3  # conductor plus one track per lossless lane
+
+    timeline: list[tuple[int, int, int, int, int]] = []
+    for track_index, track in enumerate(midi.tracks[1:], start=1):
+        absolute_tick = 0
+        open_notes: dict[tuple[int, int], list[int]] = {}
+        for message in track:
+            absolute_tick += message.time
+            key = (message.channel, message.note) if message.type in {"note_on", "note_off"} else None
+            if message.type == "note_on" and message.velocity > 0:
+                open_notes.setdefault(key, []).append(absolute_tick)
+            elif key is not None and (message.type == "note_off" or message.velocity == 0):
+                timeline.append((track_index, message.channel, message.note, open_notes[key].pop(0), absolute_tick))
+    assert sorted((pitch, start, end) for _track, _channel, pitch, start, end in timeline) == [
+        (60, 0, 480),
+        (60, 480, 960),
+        (60, 1440, 1920),
+    ]
+
+
 def test_more_than_four_same_pitch_lanes_use_lossless_midi_tracks() -> None:
     analysis = _analysis(beat_times=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
     events = [

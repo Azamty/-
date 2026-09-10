@@ -260,18 +260,20 @@ def _assign_midi_voice_lanes(
     *,
     max_lanes: int | None = None,
 ) -> list[list[dict[str, Any]]]:
-    """Partition notes so a channel/pitch pair never has overlapping spans.
+    """Partition notes so a channel/pitch pair keeps every onset identifiable.
 
     MIDI permits overlapping notes with the same pitch on one channel, but
     importers are free to pair the note-off with the wrong note-on.  Keep the
-    normal single-track representation for ordinary chords and adjacent
-    retriggers.  Only a genuine same-pitch interval overlap gets another lane.
-    The greedy interval coloring is minimal for this constraint.  When
-    ``max_lanes`` is ``None`` (the production path), each additional lane is a
-    separate MIDI track so note-on/off identity remains lossless even when a
-    source has more than four simultaneous same-pitch intervals.  A finite
-    limit is retained for callers that want an explicit resource guard; it
-    always fails before dropping or merging source notes.
+    normal single-track representation for ordinary chords.  A same-pitch
+    retrigger whose previous note ends at the next note's start gets another
+    lane as well: MuseScore can otherwise interpret an exact boundary as one
+    sustained note and lose an onset.  A genuine same-pitch interval overlap
+    also gets another lane.  The greedy coloring is minimal for these
+    constraints.  When ``max_lanes`` is ``None`` (the production path), each
+    additional lane is a separate MIDI track so note-on/off identity remains
+    lossless even when a source has more than four same-pitch intervals.  A
+    finite limit is retained for callers that want an explicit resource guard;
+    it always fails before dropping or merging source notes.
     """
 
     if max_lanes is not None and max_lanes <= 0:
@@ -281,11 +283,12 @@ def _assign_midi_voice_lanes(
     for note in sorted(notes, key=lambda value: (int(value["start_tick"]), int(value["end_tick"]), int(value["index"]))):
         pitch = int(note["midi"])
         start_tick = int(note["start_tick"])
+        existing_ends = [int(ends[pitch]) for ends in pitch_ends if pitch in ends]
         lane_index = next(
             (
                 index
                 for index, ends in enumerate(pitch_ends)
-                if int(ends.get(pitch, 0)) <= start_tick
+                if pitch not in ends or int(ends[pitch]) < start_tick
             ),
             None,
         )
@@ -302,6 +305,15 @@ def _assign_midi_voice_lanes(
             pitch_ends.append({})
         copied = dict(note)
         copied["midi_lane"] = lane_index
+        if not existing_ends:
+            copied["midi_lane_reason"] = "primary_lane"
+        elif not any(end < start_tick for end in existing_ends):
+            if any(end == start_tick for end in existing_ends):
+                copied["midi_lane_reason"] = "adjacent_retrigger"
+            else:
+                copied["midi_lane_reason"] = "overlap"
+        else:
+            copied["midi_lane_reason"] = "reused_lane"
         lanes[lane_index].append(copied)
         pitch_ends[lane_index][pitch] = max(
             int(pitch_ends[lane_index].get(pitch, 0)),
@@ -444,6 +456,12 @@ def build_performance_midi(
             )
         )
     channels = [_midi_lane_channel(index, is_drum=is_drum) for index in range(len(lane_notes))]
+    adjacent_retrigger_indices = [
+        int(item["source_index"])
+        for lane in lane_notes
+        for item in lane
+        if item.get("midi_lane_reason") == "adjacent_retrigger"
+    ]
     metadata: dict[str, Any] = {
         "schema_version": PERFORMANCE_SCHEMA_VERSION,
         "artifact_kind": "performance_midi",
@@ -462,6 +480,12 @@ def build_performance_midi(
         "channels": [channel_value + 1 for channel_value in channels],
         "voice_lane_count": len(lane_notes),
         "voice_lane_policy": "same_pitch_interval_coloring_lossless_midi_tracks",
+        "lane_assignment": {
+            "schema_version": "1.0",
+            "reuse_condition": "same_pitch_previous_end_tick_strictly_less_than_next_start_tick",
+            "adjacent_retrigger_split_count": len(adjacent_retrigger_indices),
+            "adjacent_retrigger_source_indices": adjacent_retrigger_indices,
+        },
         "preferred_voice_lanes_per_staff": PREFERRED_MIDI_VOICE_LANES_PER_STAFF,
         "track_channel_reuse_policy": "channels may repeat after 15 melodic lanes because each lane has an independent MIDI track",
         "source": "unquantized_note_events",
