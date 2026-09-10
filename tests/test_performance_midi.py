@@ -207,7 +207,8 @@ def test_variable_tempo_map_round_trips_note_seconds_with_tick_rounding() -> Non
     )
     midi, messages = _messages(midi_bytes)
     tempos = metadata["tempo_points"]
-    assert [item["bpm"] for item in tempos[:4]] == [120.0, 80.0, 120.0, 120.0]
+    assert [item["bpm"] for item in tempos] == [120.0, 80.0, 120.0]
+    assert len(tempos) == 3
     assert any(message.type == "set_tempo" and message.time > 0 for message in messages)
     origin = float(metadata["score_origin_audio_sec"])
     parsed_note_starts = [
@@ -222,6 +223,17 @@ def test_variable_tempo_map_round_trips_note_seconds_with_tick_rounding() -> Non
         origin + _parsed_midi_tick_to_seconds(midi, tick)
         for tick in parsed_note_starts
     ] == pytest.approx([event.start_sec for event in events], abs=0.006)
+
+
+def test_constant_local_tempo_map_is_compacted_to_one_segment() -> None:
+    analysis = _analysis(beat_times=[0.0, 0.5, 1.0, 1.5, 2.0])
+    _midi_bytes, metadata = build_performance_midi(
+        [NoteEvent(start_sec=0.25, end_sec=0.75, midi=60)],
+        analysis,
+        instrument_group="piano",
+    )
+    assert len(metadata["tempo_points"]) == 1
+    assert metadata["tempo_points"][0]["tick"] == 0
 
 
 def test_score_origin_preserves_downbeat_phase_and_records_pickup() -> None:

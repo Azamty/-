@@ -18,13 +18,17 @@ import copy
 import hashlib
 import json
 import math
+import os
 import shutil
 import statistics
 import sys
 import time
+import xml.etree.ElementTree as ET
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+import mido
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -32,7 +36,14 @@ if str(ROOT) not in sys.path:
 
 from backend.jianpu_score.quantize import _build_beat_mapper  # noqa: E402
 from backend.jianpu_score.high_accuracy import resolve_notation_python  # noqa: E402
-from backend.jianpu_score.musicxml_standardize import standardize_musicxml  # noqa: E402
+from backend.jianpu_score.musicxml_standardize import (  # noqa: E402
+    _estimate_source_alignment,
+    _logical_pitch_units,
+    _source_notes,
+    _worker_raw_events,
+    run_musicxml_worker,
+    standardize_musicxml,
+)
 from backend.jianpu_score.render import render_score  # noqa: E402
 from backend.jianpu_score.svg_long import merge_svg_pages  # noqa: E402
 from backend.jianpu_score.quantize import jianpu_serialization_diagnostics  # noqa: E402
@@ -108,7 +119,13 @@ def _reference_grid(annotation: Mapping[str, Any], raw: Mapping[str, Any]) -> di
     meter = str(annotation.get("time_signature") or "4/4")
     raw_duration = float((raw.get("analysis") or {}).get("duration_sec") or 0.0)
     duration = max(raw_duration, times[-1], 0.1)
-    bpm = 60.0 / median_interval
+    annotation_bpm = annotation.get("tempo_bpm")
+    try:
+        bpm = float(annotation_bpm) if annotation_bpm is not None else 60.0 / median_interval
+    except (TypeError, ValueError):
+        bpm = 60.0 / median_interval
+    if not math.isfinite(bpm) or bpm <= 0:
+        bpm = 60.0 / median_interval
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "reference_grid_downstream_oracle",
@@ -138,6 +155,7 @@ def _reference_grid(annotation: Mapping[str, Any], raw: Mapping[str, Any]) -> di
             "reference_annotation_policy": annotation.get("annotation_policy"),
             "reference_beat_count": len(beats),
             "reference_downbeat_count": len(downbeats),
+            "reference_tempo_bpm": bpm,
         },
         "warnings": [],
     }
@@ -224,6 +242,227 @@ def _diagnostic_artifacts(service_output: Path) -> list[dict[str, Any]]:
             }
         )
     return artifacts
+
+
+def _midi_tempo_points(path: Path) -> list[dict[str, Any]]:
+    """Read the tempo events that actually reached MuseScore's MIDI input."""
+
+    midi = mido.MidiFile(os.fspath(path))
+    points: list[dict[str, Any]] = []
+    for track_index, track in enumerate(midi.tracks):
+        absolute_tick = 0
+        for message in track:
+            absolute_tick += int(message.time)
+            if message.type != "set_tempo":
+                continue
+            points.append(
+                {
+                    "track_index": track_index,
+                    "tick_480": absolute_tick,
+                    "bpm": float(mido.tempo2bpm(message.tempo)),
+                    "microseconds_per_beat": int(message.tempo),
+                }
+            )
+    return sorted(points, key=lambda item: (int(item["tick_480"]), int(item["track_index"])))
+
+
+def _xml_import_shape(path: Path) -> dict[str, Any]:
+    """Extract the imported score origin facts without changing MusicXML."""
+
+    tree = ET.parse(path)
+    root = tree.getroot()
+
+    def tag(element: ET.Element) -> str:
+        return element.tag.rsplit("}", 1)[-1]
+
+    parts = [element for element in root if tag(element) == "part"]
+    first_part = parts[0] if parts else None
+    measures = [element for element in first_part or [] if tag(element) == "measure"]
+    first_measure = measures[0] if measures else None
+    meter: str | None = None
+    if first_measure is not None:
+        for attributes in first_measure:
+            if tag(attributes) != "attributes":
+                continue
+            time = next((child for child in attributes if tag(child) == "time"), None)
+            if time is not None:
+                beats = next((child.text for child in time if tag(child) == "beats"), None)
+                beat_type = next((child.text for child in time if tag(child) == "beat-type"), None)
+                if beats and beat_type:
+                    meter = f"{beats}/{beat_type}"
+                break
+    return {
+        "part_count": len(parts),
+        "first_measure_number": first_measure.attrib.get("number") if first_measure is not None else None,
+        "first_measure_implicit": (first_measure.attrib.get("implicit") if first_measure is not None else None),
+        "first_measure_meter": meter,
+        "measure_count": len(measures),
+    }
+
+
+def _alignment_diagnostics(
+    *,
+    case: Mapping[str, Any],
+    case_output: Path,
+    performance_path: Path,
+    oracle_grid: Mapping[str, Any],
+    cause: BaseException,
+) -> dict[str, Any]:
+    """Explain strict source-tempo/score-origin failures without relaxing them."""
+
+    service_output = case_output / "service_output"
+    performance_name = performance_path.name
+    metadata_name = performance_name.replace(".performance.mid", ".performance.metadata.json")
+    metadata_path = performance_path.with_name(metadata_name)
+    xml_candidates = sorted(service_output.glob(f"{case['id']}.*.notated.musicxml"))
+    diagnostic: dict[str, Any] = {
+        "schema_version": "reference_grid_alignment_diagnostic_v1",
+        "case_id": str(case["id"]),
+        "reference_time_signature": oracle_grid.get("time_signature"),
+        "strict_failure": str(cause),
+        "strict_failure_stage": getattr(cause, "stage", None),
+        "performance_metadata": str(metadata_path.relative_to(case_output)).replace("\\", "/"),
+        "performance_midi": str(performance_path.relative_to(case_output)).replace("\\", "/"),
+        "musicxml": str(xml_candidates[0].relative_to(case_output)).replace("\\", "/") if xml_candidates else None,
+    }
+    if not metadata_path.is_file() or not xml_candidates:
+        diagnostic.update(
+            {
+                "diagnosis": "insufficient_artifacts_for_source_score_probe",
+                "conclusion": "The strict failure is preserved, but the generated artifacts do not permit a source-tempo/origin comparison.",
+            }
+        )
+        return diagnostic
+    try:
+        metadata = _load(metadata_path)
+        xml_path = xml_candidates[0]
+        worker_payload = run_musicxml_worker(xml_path, notation_python=resolve_notation_python(), timeout_sec=180)
+        raw_events, worker_diagnostics = _worker_raw_events(worker_payload)
+        source_notes = _source_notes(metadata)
+        _hints, alignment = _estimate_source_alignment(raw_events, source_notes)
+        units = _logical_pitch_units(raw_events)
+        pitched_events = [event for event in raw_events if event.pitches]
+        first_source = min(source_notes, key=lambda item: (int(item["start_tick"]), int(item["source_index"]))) if source_notes else None
+        first_unit = min(units, key=lambda item: (int(item.start_tick), int(item.unit_id))) if units else None
+        last_source = max(source_notes, key=lambda item: (int(item["end_tick"]), int(item["source_index"]))) if source_notes else None
+        last_unit = max(units, key=lambda item: (int(item.end_tick), int(item.unit_id))) if units else None
+        models = [item for item in alignment.get("models", []) if isinstance(item, Mapping)]
+        diagnostic.update(
+            {
+                "source_time_signature": metadata.get("time_signature"),
+                "source_score_origin": metadata.get("score_origin"),
+                "source_score_origin_audio_sec": metadata.get("score_origin_audio_sec"),
+                "source_tempo_points_metadata": metadata.get("tempo_points", []),
+                "source_tempo_points_midi": _midi_tempo_points(performance_path),
+                "musicxml_import_shape": _xml_import_shape(xml_path),
+                "musicxml_worker_highest_time_quarter": worker_payload.highest_time_quarter,
+                "musicxml_worker_event_count": len(raw_events),
+                "musicxml_worker_diagnostics": worker_diagnostics,
+                "musicxml_first_pitched_event": {
+                    "start_tick_48": int(min(pitched_events, key=lambda event: event.start_tick).start_tick),
+                    "end_tick_48": int(min(pitched_events, key=lambda event: event.start_tick).end_tick),
+                    "pitches": list(min(pitched_events, key=lambda event: event.start_tick).pitches),
+                }
+                if pitched_events
+                else None,
+                "source_first_note": first_source,
+                "source_last_note": last_source,
+                "musicxml_first_logical_pitch_unit": {
+                    "unit_id": int(first_unit.unit_id),
+                    "pitch": int(first_unit.pitch),
+                    "start_tick_48": int(first_unit.start_tick),
+                    "end_tick_48": int(first_unit.end_tick),
+                }
+                if first_unit is not None
+                else None,
+                "musicxml_last_logical_pitch_unit": {
+                    "unit_id": int(last_unit.unit_id),
+                    "pitch": int(last_unit.pitch),
+                    "start_tick_48": int(last_unit.start_tick),
+                    "end_tick_48": int(last_unit.end_tick),
+                }
+                if last_unit is not None
+                else None,
+                "source_to_musicxml_alignment_probe": alignment,
+                "alignment_models": models,
+            }
+        )
+        if first_source is not None and first_unit is not None:
+            diagnostic["first_note_coordinate_difference_ticks_48"] = {
+                "start": int(first_unit.start_tick) - int(first_source["start_tick"]),
+                "end": int(first_unit.end_tick) - int(first_source["end_tick"]),
+            }
+        if last_source is not None and last_unit is not None:
+            diagnostic["last_note_coordinate_difference_ticks_48"] = {
+                "start": int(last_unit.start_tick) - int(last_source["start_tick"]),
+                "end": int(last_unit.end_tick) - int(last_source["end_tick"]),
+            }
+        reference_meter = str(oracle_grid.get("time_signature") or "")
+        source_meter = str(metadata.get("time_signature") or "")
+        imported_meter = str((diagnostic.get("musicxml_import_shape") or {}).get("first_measure_meter") or "")
+        reason = str(alignment.get("reason") or "")
+        midi_tempos = diagnostic.get("source_tempo_points_midi") or []
+        metadata_tempos = diagnostic.get("source_tempo_points_metadata") or []
+        diagnostic["source_tempo_origin_probe"] = {
+            "metadata_point_count": len(metadata_tempos),
+            "midi_point_count": len(midi_tempos),
+            "metadata_tick_zero_present": any(int(item.get("tick", -1)) == 0 for item in metadata_tempos if isinstance(item, Mapping)),
+            "midi_tick_zero_present": any(int(item.get("tick_480", -1)) == 0 for item in midi_tempos if isinstance(item, Mapping)),
+            "first_metadata_point": metadata_tempos[0] if metadata_tempos else None,
+            "first_midi_point": midi_tempos[0] if midi_tempos else None,
+            "declared_score_origin": metadata.get("score_origin"),
+            "first_source_note_tick_48": int(first_source["start_tick"]) if first_source is not None else None,
+            "first_musicxml_note_tick_48": int(first_unit.start_tick) if first_unit is not None else None,
+            "source_tempo_tick_conversion": "tick_480 / 10 = nominal score tick_48 before any proven source-to-score model",
+        }
+        if source_meter != reference_meter:
+            diagnosis = "oracle_grid_meter_not_propagated_to_performance_metadata"
+            conclusion = (
+                f"The performance metadata still declares {source_meter or 'no meter'} while the oracle grid declares {reference_meter}; "
+                "this is an oracle input propagation defect, so source-tempo/score-origin correspondence is not a valid production comparison."
+            )
+        elif imported_meter != reference_meter:
+            diagnosis = "musescore_import_meter_inference_mismatch"
+            conclusion = (
+                f"The performance MIDI and metadata carry {reference_meter} from tick zero, but MuseScore MusicXML imports {imported_meter or 'no meter'} in its first measure. "
+                "That changes the score bar/origin interpretation before normalization, so the source tempo points cannot be proven against the imported Score origin or first-note sequence; this is a MuseScore import mismatch, not a missing oracle grid field."
+            )
+        elif "mapped production tempo lies before" in str(cause):
+            diagnosis = "production_standardizer_tempo_origin_rejection"
+            conclusion = (
+                "The oracle meter and performance metadata agree, but the standardizer maps a source tempo before the imported Score origin. "
+                "This is a production source-tempo/score-origin reconciliation failure; the fail-closed rejection must remain until a universal proof is available."
+            )
+        elif reason in {
+            "source_and_musicxml_pitch_counts_differ",
+            "source_and_musicxml_pitch_sets_differ",
+            "provisional_alignment_not_unique_same_pitch_timing",
+            "provisional_alignment_global_order_reversed",
+            "source_alignment_movement_exceeds_bound",
+            "source_midi_lane_alignment_residual_exceeds_bound",
+            "alignment_residual_exceeds_bound",
+        }:
+            diagnosis = "musescore_import_or_score_coordinate_mismatch"
+            conclusion = (
+                f"The oracle meter is propagated ({reference_meter}), but MuseScore MusicXML produces a non-identity source-to-score relation ({reason}). "
+                "The exact source tempo points cannot be proven against the imported Score origin/first-note sequence; this is downstream importer/normalizer evidence, not a missing beat-grid field."
+            )
+        else:
+            diagnosis = "production_source_to_score_alignment_rejected"
+            conclusion = (
+                f"The oracle meter is propagated ({reference_meter}), but the strict source-to-score proof is rejected as {reason or 'unspecified'}. "
+                "No broad alignment relaxation is justified by this diagnostic."
+            )
+        diagnostic.update({"diagnosis": diagnosis, "conclusion": conclusion})
+    except Exception as exc:
+        diagnostic.update(
+            {
+                "diagnosis": "alignment_probe_failed",
+                "probe_error": f"{type(exc).__name__}: {exc}",
+                "conclusion": "The strict failure remains fail-closed because the source-tempo/score-origin probe itself did not complete.",
+            }
+        )
+    return diagnostic
 
 
 def _diagnostic_standardize_fallback(
@@ -355,6 +594,12 @@ def _case_record(
     oracle_grid = _reference_grid(annotation, raw)
     oracle_raw = copy.deepcopy(raw)
     oracle_raw["beat_grid"] = oracle_grid
+    # The v3 raw analysis may carry a BeatNet meter candidate that differs
+    # from the exact annotation.  ``_analysis_and_events_from_raw`` gives the
+    # analysis payload precedence over beat_grid, so an oracle substitution
+    # must update both fields or it would still run the old meter/origin.
+    oracle_raw.setdefault("analysis", {})["time_signature"] = oracle_grid["time_signature"]
+    oracle_raw["analysis"]["bpm"] = oracle_grid["tempo"]["selected_bpm"]
     oracle_raw.setdefault("analysis", {})["metadata"] = dict((oracle_raw.get("analysis") or {}).get("metadata") or {})
     oracle_raw["analysis"]["metadata"]["beat_grid_oracle"] = True
     case_output = output_root / case_id
@@ -423,7 +668,32 @@ def _case_record(
     metrics_performance = _metric_bundle(reference_notes, performance_notes)
     metrics_final = _metric_bundle(reference_notes, final_notes)
     notation_delta = _metric_bundle(performance_notes, final_notes)
-    service_manifest = _load(case_output / "service_output" / "manifest.json")
+    alignment_diagnostics_rel: str | None = None
+    if bool(fallback_info.get("used")):
+        alignment_diagnostics = _alignment_diagnostics(
+            case=case,
+            case_output=case_output,
+            performance_path=performance_path,
+            oracle_grid=oracle_grid,
+            cause=RuntimeError(str(fallback_info.get("cause") or "strict standardization failed")),
+        )
+        alignment_diagnostics_path = case_output / "alignment_diagnostics.json"
+        _write_json(alignment_diagnostics_path, alignment_diagnostics)
+        alignment_diagnostics_rel = str(alignment_diagnostics_path.relative_to(output_root)).replace("\\", "/")
+        fallback_info = {**fallback_info, "diagnosis": alignment_diagnostics.get("diagnosis"), "alignment_diagnostics": alignment_diagnostics_rel}
+    result_payload["artifacts"] = _diagnostic_artifacts(service_output)
+    # A diagnostic fallback deliberately leaves the strict failed manifest in
+    # place for auditability and writes a separate manifest.oracle.json.  The
+    # root manifest/result must reference the manifest that describes the
+    # artifact set being scored; embedding the failed strict payload here
+    # makes a completed diagnostic look like a failed service run.
+    service_manifest_rel = str(result_payload.get("manifest") or "service_output/manifest.json").replace("\\", "/")
+    service_manifest_path = case_output / service_manifest_rel
+    if not service_manifest_path.is_file():
+        raise FileNotFoundError(f"service result manifest is missing: {service_manifest_path}")
+    service_manifest = _load(service_manifest_path)
+    result_payload = dict(result_payload)
+    result_payload["manifest"] = service_manifest_rel
     root_manifest = {
         "schema_version": "1.1",
         "status": "success",
@@ -439,7 +709,9 @@ def _case_record(
         "final_midi": final_rel,
         "diagnostic_tempo_fallback": fallback_info,
         "result": result_payload,
-        "service_manifest": service_manifest,
+        "service_manifest": service_manifest_rel,
+        "service_manifest_payload": service_manifest,
+        "alignment_diagnostics": alignment_diagnostics_rel,
     }
     _write_json(case_output / "manifest.json", root_manifest)
     _write_json(case_output / "metrics.json", {
@@ -465,7 +737,8 @@ def _case_record(
         "artifacts": {
             "performance_midi": str(performance_path.relative_to(output_root)),
             "score_midi": str(final_path.relative_to(output_root)),
-            "service_manifest": str((case_output / "service_output" / "manifest.json").relative_to(output_root)),
+            "service_manifest": str(service_manifest_path.relative_to(output_root)).replace("\\", "/"),
+            "alignment_diagnostics": alignment_diagnostics_rel,
         },
         "continuous_mapping": metrics_continuous,
         "performance_mapping": metrics_performance,
@@ -476,15 +749,33 @@ def _case_record(
     }
 
 
-def _aggregate(cases: Sequence[Mapping[str, Any]], baseline_report: Mapping[str, Any]) -> dict[str, Any]:
-    successful = [item for item in cases if item.get("status") == "success"]
-    baseline_gate = (baseline_report.get("accuracy_gate") or {}) if isinstance(baseline_report, Mapping) else {}
-    baseline_rhythm = baseline_gate.get("baseline_mean_rhythm_error_quarter")
-    if baseline_rhythm is None:
-        baseline_rhythm = _mean([
-            _metric_value((item.get("baseline") or {}).get("metrics") or {}, "rhythm_error", "mean_fixed_total_assignment_rhythm_error_quarter")
-            for item in successful
-        ])
+def _fallback_used(item: Mapping[str, Any]) -> bool:
+    fallback = item.get("diagnostic_tempo_fallback")
+    return isinstance(fallback, Mapping) and bool(fallback.get("used"))
+
+
+def _baseline_metrics(item: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = item.get("baseline") or {}
+    if not isinstance(value, Mapping):
+        return {}
+    nested = value.get("metrics")
+    return nested if isinstance(nested, Mapping) else value
+
+
+def _group_summary(items: Sequence[Mapping[str, Any]], *, label: str, gate_status: str) -> dict[str, Any]:
+    """Aggregate one auditable evaluation population.
+
+    The strict group is the only population that can support a production
+    gate.  Fallback and all-diagnostic populations are still useful for
+    attribution, but their metrics must never be presented as a strict
+    production result.
+    """
+
+    successful = [item for item in items if item.get("status") == "success"]
+    baseline_rhythm = _mean([
+        _metric_value(_baseline_metrics(item), "rhythm_error", "mean_fixed_total_assignment_rhythm_error_quarter")
+        for item in successful
+    ])
     final_rhythm = _mean([
         _metric_value(item.get("final_score") or {}, "rhythm_error", "mean_fixed_total_assignment_rhythm_error_quarter")
         for item in successful
@@ -501,16 +792,14 @@ def _aggregate(cases: Sequence[Mapping[str, Any]], baseline_report: Mapping[str,
         _metric_value(item.get("notation_delta_performance_to_final") or {}, "rhythm_error", "mean_fixed_total_assignment_rhythm_error_quarter")
         for item in successful
     ])
-    final_pitch = _mean([
-        _metric_value(item.get("final_score") or {}, "pitch_f1", "f1") for item in successful
-    ])
-    final_chord = _mean([
-        _metric_value(item.get("final_score") or {}, "chord_retention", "retention") for item in successful
-    ])
+    final_pitch = _mean([_metric_value(item.get("final_score") or {}, "pitch_f1", "f1") for item in successful])
+    final_chord = _mean([_metric_value(item.get("final_score") or {}, "chord_retention", "retention") for item in successful])
+    target_met = bool(final_rhythm is not None and baseline_rhythm is not None and final_rhythm <= baseline_rhythm * 0.8)
     return {
-        "case_count": len(cases),
+        "label": label,
+        "case_count": len(items),
         "successful_count": len(successful),
-        "failed_count": len(cases) - len(successful),
+        "failed_count": len(items) - len(successful),
         "baseline_mean_fixed_total_rhythm": baseline_rhythm,
         "continuous_mapping_mean_fixed_total_rhythm": mapping_continuous,
         "performance_mapping_mean_fixed_total_rhythm": mapping_performance,
@@ -522,8 +811,50 @@ def _aggregate(cases: Sequence[Mapping[str, Any]], baseline_report: Mapping[str,
         "performance_mapping_improvement_vs_baseline_percent": _improvement_percent(baseline_rhythm, mapping_performance),
         "final_score_improvement_vs_baseline_percent": _improvement_percent(baseline_rhythm, final_rhythm),
         "rhythm_20_percent_target": baseline_rhythm * 0.8 if baseline_rhythm is not None else None,
-        "rhythm_20_percent_target_met": bool(final_rhythm is not None and baseline_rhythm is not None and final_rhythm <= baseline_rhythm * 0.8),
-        "reference_grid_sufficient_for_rhythm_target": bool(final_rhythm is not None and baseline_rhythm is not None and final_rhythm <= baseline_rhythm * 0.8),
+        "rhythm_20_percent_target_met": target_met,
+        "gate_status": gate_status,
+        "gate_eligible": gate_status == "strict_complete" and len(items) > 0 and len(successful) == len(items),
+    }
+
+
+def _aggregate(cases: Sequence[Mapping[str, Any]], baseline_report: Mapping[str, Any]) -> dict[str, Any]:
+    # Keep the old top-level metric names for consumers of v1, while making
+    # the population used for each metric explicit and preventing a fallback
+    # success from silently becoming a production gate result.
+    strict = [item for item in cases if item.get("status") == "success" and not _fallback_used(item)]
+    fallback = [item for item in cases if item.get("status") == "success" and _fallback_used(item)]
+    all_diagnostic = list(cases)
+    groups = {
+        "strict_production_compatible": _group_summary(strict, label="strict_production_compatible", gate_status="strict_incomplete"),
+        "diagnostic_tempo_fallback": _group_summary(fallback, label="diagnostic_tempo_fallback", gate_status="diagnostic_only"),
+        "all_diagnostic": _group_summary(all_diagnostic, label="all_diagnostic", gate_status="provisional"),
+    }
+    all_summary = groups["all_diagnostic"]
+    strict_summary = groups["strict_production_compatible"]
+    fallback_summary = groups["diagnostic_tempo_fallback"]
+    # A non-empty fallback population makes the strict gate incomplete even
+    # when all diagnostic outputs happen to clear the numerical threshold.
+    return {
+        **all_summary,
+        "groups": groups,
+        "strict_production_compatible_count": len(strict),
+        "diagnostic_tempo_fallback_count": len(fallback),
+        "all_diagnostic_count": len(all_diagnostic),
+        "strict_gate_status": "incomplete",
+        "all_diagnostic_gate_status": "provisional",
+        "fallback_gate_status": "diagnostic_only",
+        "strict_gate_eligible": False,
+        "reference_grid_sufficient_for_rhythm_target": None,
+        "reference_grid_sufficiency_status": "provisional_only_strict_population_incomplete",
+        "reference_grid_sufficiency_reason": (
+            f"{len(fallback)} of {len(cases)} cases required diagnostic tempo fallback; "
+            "the all-diagnostic threshold cannot establish production sufficiency."
+        ),
+        # Explicit aliases make the separate populations easy to consume from
+        # JSON without requiring callers to understand the compatibility keys.
+        "strict_production_compatible": strict_summary,
+        "diagnostic_tempo_fallback": fallback_summary,
+        "all_diagnostic": all_summary,
     }
 
 
@@ -552,7 +883,7 @@ def _by_category(cases: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _write_markdown(report: Mapping[str, Any], path: Path) -> None:
+def _write_markdown_legacy_v1(report: Mapping[str, Any], path: Path) -> None:
     summary = report["summary"]
     lines = [
         "# Reference-grid downstream oracle v1",
@@ -612,6 +943,196 @@ def _write_markdown(report: Mapping[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _write_markdown(report: Mapping[str, Any], path: Path) -> None:
+    """Write a report that keeps strict and diagnostic populations separate."""
+
+    summary = report["summary"]
+    groups = summary.get("groups") or {}
+
+    def fmt(value: Any, digits: int = 6) -> str:
+        if value is None:
+            return "-"
+        try:
+            return f"{float(value):.{digits}f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    lines = [
+        "# Reference-grid downstream oracle v1",
+        "",
+        "This offline diagnostic keeps the production-v3 model recognition events immutable and substitutes only exact reference beat/downbeat annotations before running the complete downstream chain.",
+        "",
+        f"- Strict production-compatible cases: **{summary['strict_production_compatible_count']}/{summary['all_diagnostic_count']}**.",
+        f"- Diagnostic tempo-fallback cases: **{summary['diagnostic_tempo_fallback_count']}/{summary['all_diagnostic_count']}**.",
+        f"- All diagnostic cases: **{summary['successful_count']}/{summary['case_count']} succeeded**; failures: **{summary['failed_count']}**.",
+        f"- Strict gate: **{summary['strict_gate_status']}**; all-diagnostic gate: **{summary['all_diagnostic_gate_status']}**.",
+        f"- All-diagnostic 20% rhythm target: **{str(summary['rhythm_20_percent_target_met']).lower()} (provisional)**.",
+        f"- Reference beat grid sufficiency: **{summary['reference_grid_sufficiency_status']}**.",
+        f"- Reason: {summary['reference_grid_sufficiency_reason']}",
+        "",
+        "## Population comparison",
+        "",
+        "| population | n | status | baseline rhythm | final rhythm | improvement | final pitch F1 | final chord retention | target |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---|",
+    ]
+    for key in ("strict_production_compatible", "diagnostic_tempo_fallback", "all_diagnostic"):
+        values = groups.get(key) or {}
+        target = values.get("rhythm_20_percent_target_met")
+        target_text = f"{str(target).lower()} (provisional)" if key == "all_diagnostic" else str(target).lower()
+        lines.append(
+            f"| {key} | {values.get('case_count', 0)} | {values.get('gate_status', '-')} | "
+            f"{fmt(values.get('baseline_mean_fixed_total_rhythm'))} | {fmt(values.get('final_score_mean_fixed_total_rhythm'))} | "
+            f"{fmt(values.get('final_score_improvement_vs_baseline_percent'), 3)}% | "
+            f"{fmt(values.get('final_score_mean_pitch_f1'))} | {fmt(values.get('final_score_mean_chord_retention'))} | {target_text} |"
+        )
+    lines += [
+        "",
+        "## All-diagnostic stage attribution",
+        "",
+        "| stage | fixed-total rhythm | improvement vs baseline |",
+        "|---|---:|---:|",
+        f"| baseline | {fmt(summary['baseline_mean_fixed_total_rhythm'])} | - |",
+        f"| continuous seconds-to-beats mapping | {fmt(summary['continuous_mapping_mean_fixed_total_rhythm'])} | {fmt(summary['continuous_mapping_improvement_vs_baseline_percent'], 3)}% |",
+        f"| 480 PPQ performance MIDI | {fmt(summary['performance_mapping_mean_fixed_total_rhythm'])} | {fmt(summary['performance_mapping_improvement_vs_baseline_percent'], 3)}% |",
+        f"| final Score/MIDI/SVG chain | {fmt(summary['final_score_mean_fixed_total_rhythm'])} | {fmt(summary['final_score_improvement_vs_baseline_percent'], 3)}% |",
+        f"| performance-to-final notation delta | {fmt(summary['notation_delta_mean_fixed_total_rhythm'])} | - |",
+        f"| final pitch F1 | {fmt(summary['final_score_mean_pitch_f1'])} | - |",
+        f"| final chord retention | {fmt(summary['final_score_mean_chord_retention'])} | - |",
+        "",
+        "## By category",
+        "",
+        "| category | n | performance rhythm | final rhythm | final pitch F1 | final chord retention |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for category, values in report["by_category"].items():
+        lines.append(
+            f"| {category} | {values['count']} | {fmt(values.get('performance_mapping_mean_fixed_total_rhythm'))} | {fmt(values.get('final_score_mean_fixed_total_rhythm'))} | {fmt(values.get('final_score_mean_pitch_f1'))} | {fmt(values.get('final_score_mean_chord_retention'))} |"
+        )
+    lines += [
+        "",
+        "## Per case",
+        "",
+        "| case | category | route | performance rhythm | final rhythm | notation delta | pitch F1 | chord retention |",
+        "|---|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for item in report["cases"]:
+        if item.get("status") != "success":
+            lines.append(f"| {item['id']} | {item.get('category')} | failed | failed | failed | failed | failed | failed |")
+            continue
+        values = {
+            key: _metric_value(item.get(key) or {}, "rhythm_error", "mean_fixed_total_assignment_rhythm_error_quarter")
+            for key in ("performance_mapping", "final_score", "notation_delta_performance_to_final")
+        }
+        pitch = _metric_value(item["final_score"], "pitch_f1", "f1")
+        chord = _metric_value(item["final_score"], "chord_retention", "retention")
+        route = "fallback" if _fallback_used(item) else "strict"
+        lines.append(
+            f"| {item['id']} | {item.get('category')} | {route} | {fmt(values['performance_mapping'])} | {fmt(values['final_score'])} | {fmt(values['notation_delta_performance_to_final'])} | {fmt(pitch)} | {fmt(chord)} |"
+        )
+    lines += [
+        "",
+        "The continuous mapping row is computed from the immutable recognized events before 480-PPQ rounding. The performance row includes that rounding and tempo-map MIDI encoding. The notation delta compares the performance MIDI with the final score MIDI after MuseScore import, MusicXML normalization, jianpu serialization, and LilyPond rendering.",
+        "The fallback population is scored only after standardizing MuseScore MusicXML without source performance metadata. Each original failed strict manifest remains alongside manifest.oracle.json. Fallback rows are diagnostic attribution, not strict production evidence.",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _repair_existing_case_manifest(output_root: Path, record: Mapping[str, Any]) -> dict[str, Any]:
+    """Repair v1 reused records so fallback manifests remain auditable.
+
+    ``--allow-existing`` is intentionally resumable.  Older partial oracle
+    runs embedded the failed strict manifest in their root manifest; repair
+    that metadata before reusing the case instead of forcing an expensive
+    MuseScore rerun.
+    """
+
+    repaired = dict(record)
+    case_id = str(record.get("id"))
+    case_output = output_root / case_id
+    root_path = case_output / "manifest.json"
+    if not root_path.is_file():
+        return repaired
+    try:
+        root_manifest = _load(root_path)
+    except (OSError, ValueError, TypeError):
+        return repaired
+    fallback = record.get("diagnostic_tempo_fallback")
+    fallback_used = isinstance(fallback, Mapping) and bool(fallback.get("used"))
+    if fallback_used:
+        oracle_rel = str(fallback.get("oracle_service_manifest") or "service_output/manifest.oracle.json").replace("\\", "/")
+        service_rel = oracle_rel if (case_output / oracle_rel).is_file() else "service_output/manifest.json"
+    else:
+        result = root_manifest.get("result") if isinstance(root_manifest, Mapping) else {}
+        result_rel = result.get("manifest") if isinstance(result, Mapping) else None
+        service_rel = str(result_rel or "service_output/manifest.json").replace("\\", "/")
+        if not (case_output / service_rel).is_file():
+            service_rel = "service_output/manifest.json"
+    service_path = case_output / service_rel
+    if not service_path.is_file():
+        return repaired
+    service_payload = _load(service_path)
+    root_manifest["service_manifest"] = service_rel
+    root_manifest["service_manifest_payload"] = service_payload
+    if isinstance(root_manifest.get("result"), Mapping):
+        root_manifest["result"] = {**root_manifest["result"], "manifest": service_rel}
+    _write_json(root_path, root_manifest)
+    artifacts = dict(repaired.get("artifacts") or {})
+    artifacts["service_manifest"] = str(service_path.relative_to(output_root)).replace("\\", "/")
+    repaired["artifacts"] = artifacts
+    return repaired
+
+
+def _refresh_existing_alignment_diagnostic(output_root: Path, record: Mapping[str, Any]) -> dict[str, Any]:
+    """Fill diagnostics for fallback records created before the probe helper."""
+
+    repaired = dict(record)
+    fallback = record.get("diagnostic_tempo_fallback")
+    if not isinstance(fallback, Mapping) or not bool(fallback.get("used")):
+        return repaired
+    case_id = str(record.get("id"))
+    case_output = output_root / case_id
+    existing_rel = str(fallback.get("alignment_diagnostics") or "").replace("\\", "/")
+    existing_path = output_root / existing_rel if existing_rel else None
+    if existing_path is not None and existing_path.is_file():
+        try:
+            existing_payload = _load(existing_path)
+        except (OSError, ValueError, TypeError):
+            existing_payload = {}
+        if (
+            isinstance(existing_payload, Mapping)
+            and "source_to_musicxml_alignment_probe" in existing_payload
+            and "source_tempo_origin_probe" in existing_payload
+        ):
+            return repaired
+    artifacts = record.get("artifacts") or {}
+    performance_rel = str(artifacts.get("performance_midi") or "").replace("\\", "/")
+    performance_path = output_root / performance_rel
+    grid_path = case_output / "raw" / "beat_grid.json"
+    if not performance_path.is_file() or not grid_path.is_file():
+        return repaired
+    diagnostic = _alignment_diagnostics(
+        case={"id": case_id},
+        case_output=case_output,
+        performance_path=performance_path,
+        oracle_grid=_load(grid_path),
+        cause=RuntimeError(str(fallback.get("cause") or "strict standardization failed")),
+    )
+    diagnostic_path = case_output / "alignment_diagnostics.json"
+    _write_json(diagnostic_path, diagnostic)
+    diagnostic_rel = str(diagnostic_path.relative_to(output_root)).replace("\\", "/")
+    repaired["diagnostic_tempo_fallback"] = {**fallback, "diagnosis": diagnostic.get("diagnosis"), "alignment_diagnostics": diagnostic_rel}
+    repaired_artifacts = dict(artifacts)
+    repaired_artifacts["alignment_diagnostics"] = diagnostic_rel
+    repaired["artifacts"] = repaired_artifacts
+    root_path = case_output / "manifest.json"
+    if root_path.is_file():
+        root_manifest = _load(root_path)
+        root_manifest["alignment_diagnostics"] = diagnostic_rel
+        _write_json(root_path, root_manifest)
+    return repaired
+
+
 def run(batch_root: Path, output_root: Path, *, allow_existing: bool = False) -> dict[str, Any]:
     batch_root = batch_root.resolve()
     output_root = output_root.resolve()
@@ -648,7 +1169,8 @@ def run(batch_root: Path, output_root: Path, *, allow_existing: bool = False) ->
     for case in cases:
         case_id = str(case.get("id"))
         if case_id in existing_records and (output_root / case_id / "manifest.json").is_file():
-            records.append(dict(existing_records[case_id]))
+            reused = _repair_existing_case_manifest(output_root, existing_records[case_id])
+            records.append(_refresh_existing_alignment_diagnostic(output_root, reused))
             print(json.dumps({"case": case_id, "status": "reused"}, ensure_ascii=False), flush=True)
             continue
         try:

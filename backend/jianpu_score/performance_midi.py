@@ -181,7 +181,19 @@ def _tempo_points(mapper: Any) -> list[tuple[int, int, float]]:
         if tick <= 0:
             continue
         points[tick] = (tempo, bpm)
-    return [(tick, value[0], value[1]) for tick, value in sorted(points.items())]
+    # A local beat grid emits one candidate tempo per interval.  Consecutive
+    # intervals that quantize to the same MIDI tempo are semantically one
+    # tempo segment; retaining every duplicate needlessly asks MusicXML
+    # source alignment to prove a mapping for redundant events.  Collapse
+    # only adjacent equal encoded tempos, preserving every actual change and
+    # the original tick of each change.
+    compact: list[tuple[int, int, float]] = []
+    for tick, value in sorted(points.items()):
+        point = (tick, value[0], value[1])
+        if compact and point[1] == compact[-1][1]:
+            continue
+        compact.append(point)
+    return compact
 
 
 def _tick_to_seconds(tick: int, tempo_points: Sequence[tuple[int, int, float]]) -> float:
