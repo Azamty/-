@@ -2,7 +2,9 @@
 
 This sample consumes an existing Score JSON. It does not run recognition,
 MuseScore, or jianpu-ly. The high and low display bands share one Score tick
-axis; display-only MIDI 60 grouping never rewrites source staff or voice data.
+axis. The 4/8-bar previews use source staff 1/2 as their two display rows;
+the full-song experimental pages use display-only MIDI 60 pitch grouping.
+Neither mode rewrites source staff or voice data.
 """
 
 from __future__ import annotations
@@ -459,7 +461,8 @@ def page_svg(
     score_key = str(score.get("key") or "C")
     jianpu_key = RELATIVE_MAJOR.get(score_key, score_key)
     bpm = round(float(score.get("bpm", 0))) if score.get("bpm") is not None else ""
-    text(canvas, 28, 80, f"1={jianpu_key}  ·  {score.get('time_signature', '4/4')}  ·  ♩={bpm}", **{"class": "legend"})
+    tempo_note = "此预览未逐处标注" if label else "此页未逐处标注"
+    text(canvas, 28, 80, f"1={jianpu_key}  ·  {score.get('time_signature', '4/4')}  ·  起始♩≈{bpm}（原数据含速度变化，{tempo_note}）", **{"class": "legend"})
     text(canvas, xmap.width - 32, 80, "数字=音高  下方短线=时值  红色曲线=延音", **{"class": "legend", "text-anchor": "end"})
     for region, panel_y, baseline, region_class in (
         ("高音区", HIGH_PANEL, HIGH_Y, "region"),
@@ -682,6 +685,12 @@ def manifest(
             occurrence_index += 1
     source_note_records = sorted(source_notes, key=lambda item: (item["voice_index"], item["event_index"], item["pitch"], item["occurrence_index"]))
     rendered_note_records = sorted(copy.deepcopy(notes), key=lambda item: (item["voice_index"], item["event_index"], item["pitch"], item["occurrence_index"]))
+    tempo_events = [
+        {"start_tick": int(item["start_tick"]), "bpm": float(item["bpm"])}
+        for item in (score.get("tempo_events") or [])
+        if isinstance(item, dict) and item.get("start_tick") is not None and item.get("bpm") is not None
+    ]
+    first_four_tempo_events = [item for item in tempo_events if item["start_tick"] < 4 * MEASURE_TICKS]
     return {
         "schema_version": "luv-letter-layout-v1",
         "purpose": "Display-only deterministic SVG layout for one frozen Score.",
@@ -695,10 +704,19 @@ def manifest(
             "source_commit": source_commit(),
         },
         "policy": {
-            "display_regions": {"低音区": "MIDI <= 60", "高音区": "MIDI >= 61"},
+            "display_regions": {
+                "preview-4/8": "source staff 1 -> 高音区; source staff 2 -> 低音区",
+                "full_experimental_pages": {"低音区": "MIDI <= 60", "高音区": "MIDI >= 61"},
+            },
             "shared_time_axis": "Both display bands use Score start_tick and duration_tick.",
             "source_metadata": "Source staff/voice is retained per occurrence; display region is presentation-only.",
-            "duration_and_ties": "Each pitch occurrence gets its own duration line; ties are paired by source voice and pitch without chord merging.",
+            "duration_and_ties": "A source chord shares one duration mark at the bottom of its vertical stack; octave points remain per pitch. Complete chord ties may use one outer arc; partial ties remain per pitch.",
+            "tempo": {
+                "initial_bpm": tempo_events[0]["bpm"] if tempo_events else score.get("bpm"),
+                "initial_source": "score.tempo_events[0] at start_tick 0",
+                "first_four_bars_events": first_four_tempo_events,
+                "preview_header": "Shows rounded initial BPM only; tempo changes are not drawn at each event.",
+            },
         },
         "summary": {
             "key": score.get("key"),
@@ -731,12 +749,13 @@ def write_readme(path: Path, data: dict[str, Any]) -> None:
     path.write_text(
         f"""# Luv Letter layout-v1
 
-此目录是冻结 Score 的确定性数字简谱排版样本。只改变 SVG 显示，不重跑模型、MuseScore 或 jianpu-ly，不修错音和节奏。两条显示带共用 Score tick 横轴；固定 MIDI 60 边界仅用于显示分区。
+此目录是冻结 Score 的确定性数字简谱排版样本。只改变 SVG 显示，不重跑模型、MuseScore 或 jianpu-ly，不修错音和节奏。两条显示带共用 Score tick 横轴；前 4/8 小节预览按原 staff 1/2 显示为高音区/低音区，整曲实验分页和长图才使用固定 MIDI 60 边界分区。
 
-- 高音区：MIDI >= 61；低音区：MIDI <= 60。
-- 同起音 pitch 在同一 x 垂直叠放；数字使用 {data['summary'].get('key', 'Score key')} 的简谱级数，撇号/逗号表示八度。
-- 下划线和延音线按每个 pitch occurrence 独立绘制；红色曲线表示 tie。精确 start/duration/tie 在 layout-manifest.json 和 SVG 悬停说明中保留。
-- 第一小节全休止以 0 显示，首休止没有从时间轴删除。原 staff/voice 仅作为来源元数据保留，不把显示区称为左右手。
+- 前 4/8 小节预览：source staff 1 -> 高音区，source staff 2 -> 低音区；整曲实验分页：MIDI >= 61 -> 高音区，MIDI <= 60 -> 低音区。原 staff/voice 会保留在 manifest 和悬停说明中。
+- 同起音 pitch 在同一 x 垂直叠放；数字使用 {data['summary'].get('key', 'Score key')} 的简谱级数，八度用数字上方/下方的圆点表示。
+- 同一 Score 和弦事件共享其垂直叠放最下方的一组时值线或增时短线；各 pitch 的八度圆点仍分别绘制。完整和弦延音可合并为一条外层红色曲线，部分延音仍按 pitch 绘制。精确 start/duration/tie 在 layout-manifest.json 和 SVG 悬停说明中保留。
+- 第一小节全休止以 0 和相应时值线显示，首休止没有从时间轴删除。不把显示区称为左右手。
+- 初始 tempo 来自冻结 Score 的 `tempo_events[0]`：tick 0 为 85.714285714 BPM，页头显示四舍五入的“起始♩≈86”。前 4 小节确有 86/81/83 等速度变化；预览没有逐处标注这些变化。
 
 Score voices={summary['score_voice_count']}，events（含 rest）={summary['source_event_count']}，pitch occurrences={summary['note_occurrence_count']}，chord events={summary['chord_event_count']}，分页={summary['rendered_page_count']}。
 
@@ -757,8 +776,21 @@ def write_index(path: Path, score: dict[str, Any], data: dict[str, Any]) -> None
     for info in data["pages"]:
         name = f"luv-letter-layout-{info['page']:03d}.svg"
         cards.append(f'<article><h3>第 {info["page"]} 页 · 小节 {info["measure_start"]}–{info["measure_end"]}</h3><a href="{name}"><img loading="lazy" src="{name}" alt="小节 {info["measure_start"]} 到 {info["measure_end"]}"></a><p>{info["start_tick"]}–{info["end_tick"]} ticks</p></article>')
+    notice = (
+        "<b>本次审查范围：前 4 小节。</b>"
+        "下方整曲分页/长图是实验输出，尚未逐页审查。"
+        "此目录不重跑模型、MuseScore 或 jianpu-ly，不解决错音/节奏；"
+        "前 4/8 小节预览按 source staff 1/2 显示为高音区/低音区，"
+        "整曲实验分页/长图使用 MIDI 60 仅作高低音区显示；原 staff/voice 保留。"
+    )
+    details = (
+        "数字用上方/下方圆点表示八度；同一 Score 和弦事件共享一组时值线，"
+        "完整和弦延音可用一条外层曲线表示，精确事件仍在 manifest 和 SVG 悬停说明中。"
+        "初始 tempo 来自 score.tempo_events[0]（tick 0 = 85.714285714 BPM），"
+        "页头显示起始♩≈86；前 4 小节含 86/81/83 等速度变化，预览未逐处标注。"
+    )
     path.write_text(
-        f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(score.get('title', 'Luv Letter'))} layout-v1</title><style>body{{margin:0;background:#eef3f6;color:#172c40;font-family:system-ui,'Microsoft YaHei',sans-serif}}main{{max-width:1500px;margin:auto;padding:28px}}.notice,article,.preview{{background:#fff;border-radius:9px;padding:14px;box-shadow:0 2px 10px #cfd9df}}.notice{{border-left:4px solid #2c739f}}.links a{{display:inline-block;margin:10px 10px 10px 0;padding:8px 12px;border-radius:6px;background:#1f5f8b;color:#fff;text-decoration:none}}.preview img{{width:100%;height:auto;border:1px solid #d8e2e8}}.pages{{display:grid;grid-template-columns:repeat(auto-fit,minmax(460px,1fr));gap:22px}}article img{{width:100%;height:auto;border:1px solid #d8e2e8}}article h3{{font-size:15px;margin:2px 0 8px}}article p{{font-size:12px;color:#587087}}</style></head><body><main><h1>{esc(score.get('title', 'Luv Letter'))} · 排版样本</h1><div class="notice"><b>本次审查范围：前 4 小节。</b>下方整曲分页/长图是实验输出，尚未逐页审查。此目录不重跑模型、MuseScore 或 jianpu-ly，不解决错音/节奏；两区共用 tick 横轴，按 MIDI 60 仅作高低音区显示；原 staff/voice 保留。</div><p class="links"><a href="preview-4-bars.svg">前 4 小节预览</a><a href="preview-8-bars.svg">前 8 小节预览</a><a href="luv-letter-layout.long.svg">整曲长图 SVG（实验）</a><a href="score.mid">原 score.mid</a><a href="layout-manifest.json">事件 manifest</a><a href="README.md">说明</a></p><section class="preview"><h2>已审查预览 · 前 4 小节</h2><img src="preview-4-bars.svg" alt="前 4 小节预览"></section><h2>整曲实验分页（未逐页审查）</h2><section class="pages">{''.join(cards)}</section></main></body></html>""",
+        f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(score.get('title', 'Luv Letter'))} layout-v1</title><style>body{{margin:0;background:#eef3f6;color:#172c40;font-family:system-ui,'Microsoft YaHei',sans-serif}}main{{max-width:1500px;margin:auto;padding:28px}}.notice,article,.preview{{background:#fff;border-radius:9px;padding:14px;box-shadow:0 2px 10px #cfd9df}}.notice{{border-left:4px solid #2c739f}}.links a{{display:inline-block;margin:10px 10px 10px 0;padding:8px 12px;border-radius:6px;background:#1f5f8b;color:#fff;text-decoration:none}}.preview img{{width:100%;height:auto;border:1px solid #d8e2e8}}.pages{{display:grid;grid-template-columns:repeat(auto-fit,minmax(460px,1fr));gap:22px}}article img{{width:100%;height:auto;border:1px solid #d8e2e8}}article h3{{font-size:15px;margin:2px 0 8px}}article p{{font-size:12px;color:#587087}}</style></head><body><main><h1>{esc(score.get('title', 'Luv Letter'))} · 排版样本</h1><div class="notice">{notice}</div><p class="details">{details}</p><p class="links"><a href="preview-4-bars.svg">前 4 小节预览</a><a href="preview-8-bars.svg">前 8 小节预览</a><a href="luv-letter-layout.long.svg">整曲长图 SVG（实验）</a><a href="score.mid">原 score.mid</a><a href="layout-manifest.json">事件 manifest</a><a href="README.md">说明</a></p><section class="preview"><h2>本次审查预览 · 前 4 小节</h2><img src="preview-4-bars.svg" alt="前 4 小节预览"></section><h2>整曲实验分页（未逐页审查）</h2><section class="pages">{''.join(cards)}</section></main></body></html>""",
         encoding="utf-8",
     )
 
