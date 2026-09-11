@@ -91,6 +91,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _archive_matches(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size == ARCHIVE_BYTES and _sha256(path).upper() == ARCHIVE_SHA256
+
+
 def _file_record(path: Path, *, relative_to: Path | None = None) -> dict[str, Any]:
     return {
         "path": path.relative_to(relative_to).as_posix() if relative_to else str(path.resolve()),
@@ -354,7 +358,7 @@ def prepare_archive(
     archive = archive.resolve()
     if not archive.is_file():
         raise FileNotFoundError(archive)
-    if archive.stat().st_size != ARCHIVE_BYTES or _sha256(archive).upper() != ARCHIVE_SHA256:
+    if not _archive_matches(archive):
         raise ValueError("ASAP v1.1 archive size or SHA-256 mismatch")
     output_root = output_root.resolve()
     if output_root.exists() and any(output_root.iterdir()) and not overwrite:
@@ -490,15 +494,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     archive = args.archive.resolve()
-    if args.download and not archive.is_file():
+    if args.download and not _archive_matches(archive):
         archive.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=archive.parent, suffix=".download", delete=False) as handle:
             temporary = Path(handle.name)
         try:
             urllib.request.urlretrieve(ARCHIVE_URL, temporary)
+            if not _archive_matches(temporary):
+                raise ValueError("downloaded ASAP v1.1 archive size or SHA-256 mismatch")
             temporary.replace(archive)
         finally:
             temporary.unlink(missing_ok=True)
+    elif archive.is_file() and not _archive_matches(archive):
+        raise ValueError("cached ASAP v1.1 archive size or SHA-256 mismatch; rerun with --download")
     manifest = prepare_archive(archive, output_root=args.output_root, overwrite=args.overwrite)
     print(json.dumps({"output_root": str(args.output_root.resolve()), "cases": [item["id"] for item in manifest["cases"]]}, ensure_ascii=False))
     return 0

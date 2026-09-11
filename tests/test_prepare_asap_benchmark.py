@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -149,6 +150,65 @@ def test_archive_member_traversal_is_rejected(tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(asap, "ARCHIVE_SHA256", asap._sha256(archive).upper())
     with pytest.raises(ValueError, match="unsafe archive member"):
         asap.prepare_archive(archive, output_root=tmp_path / "output", selection_plan=())
+
+
+def test_download_rejects_bad_payload_without_overwriting_existing_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "asap.zip"
+    archive.write_bytes(b"known-good-old-cache")
+    monkeypatch.setattr(asap, "ARCHIVE_BYTES", len(b"new-valid-archive"))
+    monkeypatch.setattr(asap, "ARCHIVE_SHA256", hashlib.sha256(b"new-valid-archive").hexdigest().upper())
+
+    def bad_download(_url: str, target: Path) -> None:
+        Path(target).write_bytes(b"corrupt-download")
+
+    monkeypatch.setattr(asap.urllib.request, "urlretrieve", bad_download)
+    with pytest.raises(ValueError, match="downloaded ASAP v1.1 archive"):
+        asap.main(["--archive", str(archive), "--download", "--output-root", str(tmp_path / "output")])
+    assert archive.read_bytes() == b"known-good-old-cache"
+    assert not list(tmp_path.glob("*.download"))
+
+
+def test_download_repairs_existing_bad_cache_only_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "asap.zip"
+    archive.write_bytes(b"bad-old-cache")
+    valid = b"new-valid-archive"
+    monkeypatch.setattr(asap, "ARCHIVE_BYTES", len(valid))
+    monkeypatch.setattr(asap, "ARCHIVE_SHA256", hashlib.sha256(valid).hexdigest().upper())
+    prepared: list[Path] = []
+
+    def good_download(_url: str, target: Path) -> None:
+        Path(target).write_bytes(valid)
+
+    def fake_prepare(
+        path: Path, *, output_root: Path, overwrite: bool, selection_plan=asap.SELECTION_PLAN
+    ) -> dict[str, object]:
+        prepared.append(path)
+        assert path.read_bytes() == valid
+        return {"cases": []}
+
+    monkeypatch.setattr(asap.urllib.request, "urlretrieve", good_download)
+    monkeypatch.setattr(asap, "prepare_archive", fake_prepare)
+    assert asap.main(["--archive", str(archive), "--download", "--output-root", str(tmp_path / "output")]) == 0
+    assert archive.read_bytes() == valid
+    assert prepared == [archive]
+    assert not list(tmp_path.glob("*.download"))
+
+
+def test_corrupt_existing_cache_without_download_fails_explicitly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "asap.zip"
+    archive.write_bytes(b"bad-cache")
+    valid = b"new-valid-archive"
+    monkeypatch.setattr(asap, "ARCHIVE_BYTES", len(valid))
+    monkeypatch.setattr(asap, "ARCHIVE_SHA256", hashlib.sha256(valid).hexdigest().upper())
+    with pytest.raises(ValueError, match="cached ASAP v1.1 archive.*--download"):
+        asap.main(["--archive", str(archive), "--output-root", str(tmp_path / "output")])
+    assert archive.read_bytes() == b"bad-cache"
 
 
 def test_prepare_rejects_wrong_archive_hash(tmp_path: Path) -> None:
