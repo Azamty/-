@@ -473,6 +473,93 @@ def test_midi_lane_singleton_reuses_unique_shared_affine_model() -> None:
     assert hints[3]["musicxml_unit_id"] == 3
 
 
+def test_midi_lane_two_anchors_reuses_unique_shared_affine_model() -> None:
+    events = [
+        _parted_timed_event("lane1-60", 60, 0, 24, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-62", 62, 480, 528, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-64", 64, 960, 1008, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event(
+            "lane2-65",
+            65,
+            1200,
+            1248,
+            part_id="Piano, lane two",
+            part_group="Piano, lane two",
+            staff=1,
+        ),
+        _parted_timed_event(
+            "lane2-67",
+            67,
+            1440,
+            1488,
+            part_id="Piano, lane two",
+            part_group="Piano, lane two",
+            staff=1,
+        ),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 960, 1056),
+        _timed_source(2, 64, 1920, 2016),
+        _timed_source(3, 65, 2400, 2496),
+        _timed_source(4, 67, 2880, 2976),
+    ]
+    for source in sources:
+        source["midi_lane"] = 0 if source["source_index"] < 3 else 1
+        source["midi_track_name"] = "lane one" if source["midi_lane"] == 0 else "lane two"
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert audit["applied"] is True
+    assert audit["one_to_one"] is True
+    short_model = next(model for model in audit["models"] if model["lane"] == 1)
+    assert short_model["method"] == "midi_lane_shared_affine_alignment"
+    assert short_model["pair_count"] == 2
+    assert short_model["shared_anchor_lane"] == 0
+    assert short_model["shared_anchor_pair_count"] == 3
+    assert hints[3]["scale"] == pytest.approx(0.5)
+    assert hints[4]["scale"] == pytest.approx(0.5)
+    assert hints[3]["start_residual_ticks"] == pytest.approx(0)
+    assert hints[4]["end_residual_ticks"] == pytest.approx(0)
+
+
+def test_midi_lane_short_partition_rejects_multiple_distinct_shared_models() -> None:
+    events = [
+        _parted_timed_event("lane1-60", 60, 0, 24, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-62", 62, 480, 528, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-64", 64, 960, 1008, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane2-65", 65, 5, 53, part_id="P2", part_group="Piano, lane two", staff=1),
+        _parted_timed_event("lane2-67", 67, 485, 533, part_id="P2", part_group="Piano, lane two", staff=1),
+        _parted_timed_event("lane2-69", 69, 965, 1013, part_id="P2", part_group="Piano, lane two", staff=1),
+        _parted_timed_event("lane3-71", 71, 1000, 1024, part_id="P3", part_group="Piano, lane three", staff=1),
+        _parted_timed_event("lane3-73", 73, 1240, 1264, part_id="P3", part_group="Piano, lane three", staff=1),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 960, 1056),
+        _timed_source(2, 64, 1920, 2016),
+        _timed_source(3, 65, 0, 48),
+        _timed_source(4, 67, 480, 528),
+        _timed_source(5, 69, 960, 1008),
+        _timed_source(6, 71, 2000, 2048),
+        _timed_source(7, 73, 2480, 2528),
+    ]
+    for source in sources:
+        lane = 0 if source["source_index"] < 3 else 1 if source["source_index"] < 6 else 2
+        source["midi_lane"] = lane
+        source["midi_track_name"] = {0: "lane one", 1: "lane two", 2: "lane three"}[lane]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert hints == {}
+    assert audit["applied"] is False
+    assert audit["reason"] == "source_midi_lane_alignment_ambiguous_shared_models"
+    assert audit["lane"] == 2
+    assert audit["pair_count"] == 2
+    assert audit["shared_model_count"] == 2
+    assert audit["shared_model_lanes"] == [0, 1]
+
+
 def test_midi_lane_singleton_shared_model_keeps_duration_residual_fail_closed() -> None:
     events = [
         _parted_timed_event("lane1-60", 60, 0, 48, part_id="P1", part_group="P1", staff=1),

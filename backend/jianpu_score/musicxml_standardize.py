@@ -2173,37 +2173,58 @@ def _track_identity_alignment(
                 "pair_count": len(candidate_pairs),
             }
         )
+
+    def distinct_shared_models(lane: int) -> list[dict[str, Any]]:
+        candidates = [
+            candidate
+            for candidate in shared_affine_models
+            if int(candidate["lane"]) != int(lane)
+        ]
+        distinct: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if not any(
+                abs(float(candidate["scale"]) - float(previous["scale"])) <= 1e-9
+                and abs(float(candidate["offset"]) - float(previous["offset"])) <= 0.5
+                for previous in distinct
+            ):
+                distinct.append(candidate)
+        return distinct
+
     for partition in partitions:
         pairs = list(partition["pairs"])
         if len(pairs) >= MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
             scale, offset = _fit_source_alignment_line(pairs)
             method = "midi_lane_affine_alignment"
-        elif len(pairs) == 1:
-            source, unit = pairs[0]
-            shared_candidates = [
-                candidate
-                for candidate in shared_affine_models
-                if int(candidate["lane"]) != int(partition["lane"])
-            ]
-            distinct_shared_models: list[dict[str, Any]] = []
-            for candidate in shared_candidates:
-                if not any(
-                    abs(float(candidate["scale"]) - float(previous["scale"])) <= 1e-9
-                    and abs(float(candidate["offset"]) - float(previous["offset"])) <= 0.5
-                    for previous in distinct_shared_models
-                ):
-                    distinct_shared_models.append(candidate)
-            if len(distinct_shared_models) == 1:
-                shared = distinct_shared_models[0]
+        elif 1 <= len(pairs) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
+            distinct_shared = distinct_shared_models(int(partition["lane"]))
+            if len(distinct_shared) == 1:
+                shared = distinct_shared[0]
                 scale = float(shared["scale"])
                 offset = float(shared["offset"])
                 method = "midi_lane_shared_affine_alignment"
                 shared_anchor_lane = int(shared["lane"])
-            else:
+            elif len(pairs) == 1 and not distinct_shared:
+                source, unit = pairs[0]
                 scale = 1.0
                 offset = float(unit.start_tick - int(source["start_tick"]))
                 method = "midi_lane_singleton_offset_alignment"
                 shared_anchor_lane = None
+            else:
+                if len(distinct_shared) > 1:
+                    return fail(
+                        "source_midi_lane_alignment_ambiguous_shared_models",
+                        lane=partition["lane"],
+                        pair_count=len(pairs),
+                        shared_model_count=len(distinct_shared),
+                        shared_model_lanes=[int(candidate["lane"]) for candidate in distinct_shared],
+                    )
+                return fail(
+                    "source_midi_lane_alignment_has_insufficient_anchors",
+                    lane=partition["lane"],
+                    pair_count=len(pairs),
+                    minimum_model_points=MIN_SOURCE_ALIGNMENT_MODEL_POINTS,
+                    shared_model_count=0,
+                )
         else:
             return fail(
                 "source_midi_lane_alignment_has_insufficient_anchors",
