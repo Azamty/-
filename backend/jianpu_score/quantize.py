@@ -93,44 +93,258 @@ def _voice_name(event: NoteEvent, layer_index: int) -> str:
 
 
 def _melody_event_score(event: NoteEvent) -> float:
-    """Score one candidate for the dynamic-programming melody path."""
+    """Return a neutral emission score for one melody candidate.
 
-    confidence = confidence_value(event.confidence)
-    duration_bonus = min(event.duration_sec / 0.5, 2.0) * 0.35
-    register = max(0.0, min(1.0, (event.midi - 36) / 48.0))
-    return 1.45 * confidence + duration_bonus + 0.25 * register
+    This fallback is kept for callers that inspect the old private helper.
+    The selector below supplies the onset-relative features used in the real
+    path.  In particular, an absent confidence is neutral: MuScriptor's
+    playback_default metadata is not a confidence signal.
+    """
+
+    confidence = 0.65 * confidence_value(event.confidence) if event.confidence is not None else 0.0
+    duration = min(event.duration_sec / 0.5, 1.0) * 0.35
+    return confidence + duration
 
 
-def _melody_transition_score(previous: NoteEvent, current: NoteEvent) -> float:
+MELODY_SELECTOR_VERSION = "onset-dp-v1"
+MELODY_ONSET_TOLERANCE_SEC = 0.012
+
+
+@dataclass(frozen=True)
+class MelodyPathResult:
+    """Selected NoteEvents plus JSON-safe evidence for the chosen path."""
+
+    selected: tuple[NoteEvent, ...]
+    audit: dict[str, Any]
+
+
+def _melody_transition_details(previous: NoteEvent, current: NoteEvent) -> dict[str, float | int | bool]:
+    """Score a transition without requiring the earlier note to have ended."""
+
     pitch_jump = abs(current.midi - previous.midi)
-    duration_ratio = abs(math.log((current.duration_sec + 1e-3) / (previous.duration_sec + 1e-3)))
-    gap = max(0.0, current.start_sec - previous.end_sec)
-    return 0.55 - 0.055 * min(pitch_jump, 24) - 0.08 * min(duration_ratio, 4.0) - 0.04 * min(gap, 2.0)
+    onset_gap = max(0.0, current.start_sec - previous.start_sec)
+    overlap_sec = max(0.0, previous.end_sec - current.start_sec)
+    overlap_ratio = overlap_sec / max(previous.duration_sec, 1e-3)
+    overlap_penalty = 0.72 * min(overlap_ratio, 1.0)
+    same_pitch = current.midi == previous.midi
+    if same_pitch:
+        overlap_penalty *= 0.45
+    continuity_bonus = 0.16 if onset_gap <= 0.75 else 0.0
+    same_stem_bonus = 0.06 if previous.stem_id and previous.stem_id == current.stem_id else 0.0
+    gap_penalty = 0.025 * min(max(onset_gap - 0.9, 0.0), 3.0)
+    pitch_penalty = 0.018 * min(pitch_jump, 24)
+    score = continuity_bonus + same_stem_bonus - overlap_penalty - gap_penalty - pitch_penalty
+    return {
+        "score": score,
+        "pitch_jump": pitch_jump,
+        "onset_gap_sec": onset_gap,
+        "overlap_sec": overlap_sec,
+        "overlap_ratio": overlap_ratio,
+        "same_pitch": same_pitch,
+        "same_stem": bool(same_stem_bonus),
+    }
+
+
+def _melody_candidate_features(
+    event: NoteEvent,
+    *,
+    group_rank: int,
+    group_size: int,
+    local_onset_density: int,
+    pitch_median: float,
+    pitch_half_range: float,
+) -> dict[str, float | int | bool]:
+    """Build an auditable emission score without using playback metadata."""
+
+    confidence_observed = event.confidence is not None
+    confidence_term = 0.65 * confidence_value(event.confidence) if confidence_observed else 0.0
+    duration = event.duration_sec
+    duration_support = 0.45 * min(duration / 0.5, 1.0)
+    short_note_penalty = 0.65 * max(0.0, 0.22 - duration) / 0.22
+    long_note_penalty = 0.22 * min(max(duration - 0.8, 0.0) / 1.2, 1.0)
+    register_position = max(-1.0, min(1.0, (event.midi - pitch_median) / pitch_half_range))
+    register_term = 0.22 * register_position
+    rank_fraction = (group_size - group_rank) / max(group_size, 1)
+    onset_rank_term = 0.10 * rank_fraction
+    density_penalty = 0.08 * min(max(local_onset_density - 3, 0), 5)
+    score = (
+        0.15
+        + confidence_term
+        + duration_support
+        + register_term
+        + onset_rank_term
+        - short_note_penalty
+        - long_note_penalty
+        - density_penalty
+    )
+    return {
+        "emission_score": score,
+        "confidence_observed": confidence_observed,
+        "duration_sec": duration,
+        "duration_support": duration_support,
+        "short_note_penalty": short_note_penalty,
+        "long_note_penalty": long_note_penalty,
+        "register_position": register_position,
+        "register_term": register_term,
+        "onset_rank": group_rank,
+        "onset_group_size": group_size,
+        "onset_rank_term": onset_rank_term,
+        "local_onset_density": local_onset_density,
+        "density_penalty": density_penalty,
+    }
+
+
+def select_melody_path(
+    events: Iterable[NoteEvent],
+    *,
+    onset_tolerance_sec: float = MELODY_ONSET_TOLERANCE_SEC,
+) -> MelodyPathResult:
+    """Choose one auditable melody path from polyphonic NoteEvents.
+
+    Notes are grouped only when their starts are within the small onset
+    tolerance, so a real later onset remains eligible.  Dynamic programming
+    may skip an onset group; a transition from an earlier note to a later one
+    is scored even when their sounding intervals overlap.  This is what keeps
+    a held accompaniment note from blocking a genuine re-onset while still
+    allowing a short overlapping ornament to be skipped.
+    """
+
+    materialized = list(events)
+    if not materialized:
+        return MelodyPathResult(
+            selected=(),
+            audit={
+                "selector_version": MELODY_SELECTOR_VERSION,
+                "candidate_count": 0,
+                "onset_group_count": 0,
+                "selected_count": 0,
+                "selected_input_indices": [],
+                "skipped_group_ids": [],
+                "total_score": 0.0,
+                "confidence_policy": "missing confidence is neutral; metadata.playback_default is ignored",
+            },
+        )
+    tolerance = max(0.0, float(onset_tolerance_sec))
+    indexed = sorted(
+        enumerate(materialized),
+        key=lambda item: (item[1].start_sec, -item[1].midi, item[1].end_sec, item[0]),
+    )
+    groups: list[list[tuple[int, NoteEvent]]] = []
+    group_starts: list[float] = []
+    for input_index, event in indexed:
+        if not groups or event.start_sec - group_starts[-1] > tolerance:
+            groups.append([])
+            group_starts.append(event.start_sec)
+        groups[-1].append((input_index, event))
+    for group in groups:
+        group.sort(key=lambda item: (-item[1].midi, item[1].end_sec, item[0]))
+    onset_starts = tuple(group_starts)
+    pitches = sorted(event.midi for event in materialized)
+    middle = len(pitches) // 2
+    pitch_median = float(pitches[middle]) if len(pitches) % 2 else (pitches[middle - 1] + pitches[middle]) / 2.0
+    pitch_half_range = max(12.0, (max(pitches) - min(pitches)) / 2.0)
+    candidates: list[dict[str, Any]] = []
+    for group_id, group in enumerate(groups):
+        left = bisect_right(onset_starts, group_starts[group_id] - 0.5)
+        right = bisect_right(onset_starts, group_starts[group_id] + 0.5)
+        local_density = max(0, right - left - 1)
+        for group_rank, (input_index, event) in enumerate(group, start=1):
+            feature = _melody_candidate_features(
+                event,
+                group_rank=group_rank,
+                group_size=len(group),
+                local_onset_density=local_density,
+                pitch_median=pitch_median,
+                pitch_half_range=pitch_half_range,
+            )
+            candidates.append(
+                {
+                    "candidate_index": len(candidates),
+                    "input_index": input_index,
+                    "onset_group_id": group_id,
+                    "start_sec": event.start_sec,
+                    "end_sec": event.end_sec,
+                    "midi": event.midi,
+                    "stem_id": event.stem_id,
+                    **feature,
+                }
+            )
+
+    count = len(candidates)
+    best_scores = [float(item["emission_score"]) for item in candidates]
+    predecessors: list[int | None] = [None] * count
+    for current_index, current in enumerate(candidates):
+        for previous_index in range(current_index):
+            previous = candidates[previous_index]
+            if previous["onset_group_id"] == current["onset_group_id"]:
+                continue
+            details = _melody_transition_details(
+                materialized[int(previous["input_index"])],
+                materialized[int(current["input_index"])],
+            )
+            candidate_score = best_scores[previous_index] + float(details["score"]) + float(current["emission_score"])
+            if candidate_score > best_scores[current_index] + 1e-9:
+                best_scores[current_index] = candidate_score
+                predecessors[current_index] = previous_index
+    last_index = max(range(count), key=lambda index: (best_scores[index], candidates[index]["start_sec"], -index))
+    selected_indices: list[int] = []
+    while last_index is not None:
+        selected_indices.append(last_index)
+        last_index = predecessors[last_index]
+    selected_indices.reverse()
+    selected_candidate_set = set(selected_indices)
+    selected_events = tuple(materialized[int(candidates[index]["input_index"])] for index in selected_indices)
+    selected_group_ids = {int(candidates[index]["onset_group_id"]) for index in selected_indices}
+    transitions: list[dict[str, Any]] = []
+    for previous_index, current_index in zip(selected_indices, selected_indices[1:]):
+        details = _melody_transition_details(
+            materialized[int(candidates[previous_index]["input_index"])],
+            materialized[int(candidates[current_index]["input_index"])],
+        )
+        transitions.append(
+            {
+                "from_candidate_index": previous_index,
+                "to_candidate_index": current_index,
+                **details,
+            }
+        )
+    for index, item in enumerate(candidates):
+        item["selected"] = index in selected_candidate_set
+        item["best_path_score"] = best_scores[index]
+        item["predecessor_candidate_index"] = predecessors[index]
+    groups_audit = [
+        {
+            "group_id": group_id,
+            "start_sec": group_starts[group_id],
+            "candidate_indices": [item["candidate_index"] for item in candidates if item["onset_group_id"] == group_id],
+            "selected_candidate_index": next(
+                (item["candidate_index"] for item in candidates if item["onset_group_id"] == group_id and item["selected"]),
+                None,
+            ),
+        }
+        for group_id in range(len(groups))
+    ]
+    audit = {
+        "selector_version": MELODY_SELECTOR_VERSION,
+        "onset_tolerance_sec": tolerance,
+        "candidate_count": count,
+        "onset_group_count": len(groups),
+        "selected_count": len(selected_events),
+        "selected_input_indices": [int(candidates[index]["input_index"]) for index in selected_indices],
+        "skipped_group_ids": [group_id for group_id in range(len(groups)) if group_id not in selected_group_ids],
+        "total_score": best_scores[selected_indices[-1]] if selected_indices else 0.0,
+        "confidence_policy": "missing confidence is neutral; metadata.playback_default is ignored",
+        "candidates": candidates,
+        "onset_groups": groups_audit,
+        "transitions": transitions,
+    }
+    return MelodyPathResult(selected=selected_events, audit=audit)
 
 
 def _select_melody_path(ordered: list[NoteEvent]) -> list[NoteEvent]:
-    """Choose a coherent non-overlapping candidate path with interval DP."""
+    """Backward-compatible list wrapper around the auditable selector."""
 
-    if not ordered:
-        return []
-    count = len(ordered)
-    best_scores = [_melody_event_score(event) for event in ordered]
-    predecessors: list[int | None] = [None] * count
-    for current_index, current in enumerate(ordered):
-        for previous_index in range(current_index):
-            previous = ordered[previous_index]
-            if previous.end_sec > current.start_sec + 1e-4:
-                continue
-            candidate = best_scores[previous_index] + _melody_transition_score(previous, current) + _melody_event_score(current)
-            if candidate > best_scores[current_index]:
-                best_scores[current_index] = candidate
-                predecessors[current_index] = previous_index
-    last_index = max(range(count), key=best_scores.__getitem__)
-    path: list[NoteEvent] = []
-    while last_index is not None:
-        path.append(ordered[last_index])
-        last_index = predecessors[last_index]
-    return list(reversed(path))
+    return list(select_melody_path(ordered).selected)
 
 
 def select_voice_events(events: Iterable[NoteEvent], mode: str = "polyphonic") -> list[NoteEvent]:
