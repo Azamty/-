@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from fastapi.testclient import TestClient
 
+from backend.app import create_app
 from backend.jianpu_score.domain import MusicAnalysis, NoteEvent
 from backend.jianpu_score.high_accuracy import (
     resolve_musescore,
@@ -452,6 +454,37 @@ def test_main_melody_is_attempted_from_selected_tracks_when_one_part_fails(
     assert result["summary"]["main_melody_score_artifact_ids"]
     assert any(item["kind"] == "main_melody_selection" for item in result["artifacts"])
     assert any(call["instrument_id"] == "main-melody" for call in FakeHighAccuracyService.calls)
+
+
+def test_all_parts_fail_but_main_melody_succeeds_and_v2_score_api_is_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    app = create_app(jobs_root=tmp_path / "jobs")
+    manager = app.state.jobs
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path, two_tracks=True)
+    FakeHighAccuracyService.failures = set(ids)
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
+
+    manager.select_v2(job_id, ids, merge_main_melody=True)
+    manager._run_job(job_id)
+
+    result = manager._read(job_id)
+    assert result["status"] == "completed"
+    assert result["v2"]["score_refusal"] is None
+    assert result["summary"]["successful_pitched_track_ids"] == []
+    assert {item["track_id"] for item in result["v2"]["track_failures"]} >= set(ids)
+    assert result["summary"]["main_melody_score_artifact_ids"]
+
+    selection_artifact = next(item for item in result["artifacts"] if item["kind"] == "main_melody_selection")
+    selection_path, _ = manager.artifact_path(job_id, selection_artifact["artifact_id"])
+    selection_audit = json.loads(selection_path.read_text(encoding="utf-8"))
+    assert set(selection_audit["selected_track_ids"]) == set(ids)
+
+    with TestClient(app) as client:
+        response = client.get(f"/api/v2/jobs/{job_id}/score")
+    assert response.status_code == 200
 
 
 def test_all_parts_and_main_melody_failure_remains_explicit(

@@ -1,21 +1,23 @@
-# 主旋律选择 v1 分支说明
+# 主旋律候选 v1（诊断阶段）
 
-本分支从 `08bf188` 创建：`codex/melody-accuracy-v1`。它只改主旋律候选选择的后端实验，保留原始 recognition、全和声音符和旧高精度产物；不重跑 MuScriptor、BeatNet 或 MuseScore，也不把诊断结果称为完整简谱验收。
+本分支只改 V2 已有的“主旋律合并”候选选择。它读取已经冻结的 raw recognition 音符，保留原始音符和各乐器分谱；没有重跑识别、MuseScore 或高精度整曲链路，也没有改原音高和起止时间。源样本基线为 `08bf188`，本说明对应的工作日期为 2026-09-12。
 
-## 阶段 1：selector
+## 当前运行策略
 
-`backend/jianpu_score/quantize.py` 增加 `onset-dp-v1`。它先按小的起音容差形成候选组，再用动态规划选择一条单音路径。候选和转移都写入 audit：缺失 confidence 保持中性，`metadata.playback_default` 不参与评分；重叠尾音用软惩罚处理，跳过的起音组也会记录。旧 `select_voice_events(..., mode="polyphonic")` 行为保持不变。
+`backend/jianpu_score/quantize.py` 已恢复旧的默认量化选择器。它不再承担这次 V2 主旋律实验，避免拒绝的动态规划实验影响其它人声或 V1 路径。
 
-## 阶段 2：V2 合并入口
+V2 的 `_select_main_melody_notes` 以原有规则作为基线：按 `round(start_sec, 5)` 分组，每个起音保留最高音。当前唯一启用的改变是：较低起音同时被前一个高音覆盖、又和前高音结束附近的另一高音重叠，并且该恢复音是接近但不同的高音时，较低音会被记为疑似伴奏插入而跳过。规则使用当地起音间隔，不使用固定秒数门槛。同起音的“较低长音替代短高音”仍保留为待审查问题，不进入运行时，避免长停顿后的正常高音重起被误改。
 
-V2 的 `merge_main_melody=true` 现在从用户选中的全部有音高轨构造候选，即使某个独立乐器分谱转换失败，也会独立尝试主旋律。`main-melody.selection.json` 保存 source index、候选 emission、跳过的 onset 组和转移分数；原始 recognition、全和声 notes、独立分谱失败 manifest 都继续保留。
+每次选择写入 `main-melody.selection.json`。审计包含源索引、基线索引、最终索引、保留/跳过理由和所选轨道 ID。缺失 `confidence`、`velocity` 以及 `metadata.playback_default` 都不作为显著性或力度证据；这些值在 MuScriptor 原始输入中不能代表真实演奏力度。
 
-若独立分谱全部失败但主旋律成功，任务保持 completed、`score_refusal=null`，并在 `track_failures` 留下分谱失败；若主旋律也失败，仍返回显式 `all_pitched_tracks_failed`。此阶段不增加网页引擎开关。
+主旋律尝试独立于单个分谱的成功状态。已选择的有音高轨都可以进入候选，即使某个分谱服务失败；失败记录仍保留在 `track_failures`。当全部独立分谱失败但主旋律产物成功时，任务仍为 `completed`，并通过 V2 `/score` 返回可用产物；若主旋律本身也失败，任务仍明确报告 `all_pitched_tracks_failed`。
 
-两阶段均可以单独回退到父分支：
+## 验证范围
 
-```text
-git switch codex/high-accuracy-transcription
-```
+`tests/test_main_melody_hold_filter.py` 覆盖了持续高音中的低音插入、真实下行句、八度交替、恰好结束后的低音再起音、120 BPM 十六分音符，以及带持续跨轨伴奏的低音句。测试验证的是候选规则的保守行为，不把任意选择称作录音真值。
 
-阶段提交分开保留，便于逐段比较旧的 onset 最高音策略、新 selector 和最终产物；回退后旧 V2 合并行为恢复。
+拒绝的全局动态规划实现保留在历史提交 `5b980de`，根代理另存为 `codex/melody-dp-experiment`；`057ce18` 的运行时接线也已在本分支被恢复为上述保守策略。该实验不能作为准确率结论。
+
+## 试听与诊断产物
+
+诊断脚本会在不重跑模型的前提下导出旧基线和新候选的 45 秒 MIDI、事件 JSON，以及只表达音高顺序的 SVG/PNG 对照图。它们用于审查候选删留，不能当作已经完成节拍量化的正式简谱。生成后的文件会同时记录输入 recognition 哈希、各产物哈希和旧/新序列差异。

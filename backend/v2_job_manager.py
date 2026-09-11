@@ -37,7 +37,7 @@ from .jianpu_score.models.demucs import (
     normalize_demucs_model,
     separate_htdemucs,
 )
-from .jianpu_score.quantize import NoNotesError, select_melody_path
+from .jianpu_score.quantize import NoNotesError
 from .jianpu_score.render import (
     natural_svg_sort_key,
     render_score,  # noqa: F401 - legacy monkeypatch/import surface
@@ -1521,7 +1521,7 @@ class V2JobService:
                     selection_path,
                     artifact_id=main_melody_selection_artifact_id,
                     kind="main_melody_selection",
-                    label="主旋律候选与动态规划审计",
+                    label="主旋律候选与保守过滤审计",
                     media_type="application/json",
                     stem_id="main-melody",
                 )
@@ -1855,36 +1855,114 @@ class V2JobService:
     def _select_main_melody_notes(
         notes: Sequence[Mapping[str, Any]], selected_ids: set[str]
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Select a conservative monophonic melody candidate from raw notes.
+
+        V2 historically selected the highest note at each rounded onset.  That
+        remains the baseline because the recognition output has no reliable
+        confidence or velocity signal.  We only deviate with two auditable
+        piece of relative timing evidence: a lower onset fully inside a held
+        upper note can be skipped when an adjacent, nearby upper recovery
+        makes it look like an accompaniment insert.
+        These are candidate heuristics, not a claim of musical ground truth.
+        """
         pitched = [
             note
             for note in notes
             if str(note.get("track_id")) in selected_ids and not bool(note.get("is_drum"))
         ]
-        selector_events: list[NoteEvent] = []
-        source_notes: list[dict[str, Any]] = []
-        for source_index, note in enumerate(pitched):
-            metadata = dict(note.get("metadata") or {})
-            metadata.update(
-                {
-                    "melody_source_index": source_index,
-                    "track_id": str(note.get("track_id")),
-                    "instrument_group": str(note.get("instrument_group", "unknown")),
-                }
-            )
-            raw_confidence = note.get("confidence")
-            confidence = None if raw_confidence is None else float(raw_confidence)
-            selector_events.append(
-                NoteEvent(
-                    start_sec=float(note["start_sec"]),
-                    end_sec=float(note["end_sec"]),
-                    midi=int(note["pitch"]),
-                    confidence=confidence,
-                    source="muscriptor-main-melody-candidate",
-                    velocity=int(note["velocity"]) if note.get("velocity") not in {None, 0} else None,
-                    stem_id=str(note.get("track_id")),
-                    metadata=metadata,
+        indexed = list(enumerate(pitched))
+        grouped: dict[float, list[int]] = {}
+        for source_index, note in indexed:
+            grouped.setdefault(round(float(note["start_sec"]), 5), []).append(source_index)
+        onset_keys = sorted(grouped)
+        for key in onset_keys:
+            grouped[key].sort(
+                key=lambda index: (
+                    -int(pitched[index]["pitch"]),
+                    float(pitched[index]["end_sec"]),
+                    index,
                 )
             )
+        baseline_indices = [grouped[key][0] for key in onset_keys]
+
+        def local_ioi(group_index: int) -> float:
+            distances: list[float] = []
+            if group_index > 0:
+                distances.append(onset_keys[group_index] - onset_keys[group_index - 1])
+            if group_index + 1 < len(onset_keys):
+                distances.append(onset_keys[group_index + 1] - onset_keys[group_index])
+            positive = sorted(value for value in distances if value > 1e-5)
+            if not positive:
+                return 0.0
+            return positive[len(positive) // 2]
+
+        # Start with the historical highest-at-onset path.  V2 deliberately
+        # does not replace a same-onset high note with a lower long note yet:
+        # a long preceding silence can make a normal re-entry look short when
+        # local timing is sparse.  Keep that unresolved ambiguity auditable
+        # rather than changing the frozen high-note prefix.
+        candidate_indices = list(baseline_indices)
+        decisions: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        kept_indices: list[int] = []
+        for group_index, current_index in enumerate(candidate_indices):
+            current = pitched[current_index]
+            if kept_indices:
+                previous_index = kept_indices[-1]
+                previous = pitched[previous_index]
+                next_index = candidate_indices[group_index + 1] if group_index + 1 < len(candidate_indices) else None
+                next_note = pitched[next_index] if next_index is not None else None
+                ioi = local_ioi(group_index)
+                overlap = float(previous["end_sec"]) - float(current["start_sec"])
+                recovery_near_end = bool(
+                    next_note is not None
+                    and float(next_note["start_sec"]) >= float(previous["end_sec"]) - max(ioi * 0.3, 1e-4)
+                    and float(next_note["start_sec"]) <= float(previous["end_sec"]) + max(ioi * 0.3, 1e-4)
+                )
+                previous_pitch = int(previous["pitch"])
+                current_pitch = int(current["pitch"])
+                next_pitch = int(next_note["pitch"]) if next_note is not None else None
+                is_held_lower_insert = bool(
+                    overlap > 1e-4
+                    and current_pitch <= previous_pitch - 7
+                    and next_note is not None
+                    and next_pitch != previous_pitch
+                    and 0 < previous_pitch - next_pitch <= 5
+                    and next_pitch - current_pitch >= 7
+                    and float(current["end_sec"]) > float(next_note["start_sec"]) + 1e-4
+                    and recovery_near_end
+                )
+                if is_held_lower_insert:
+                    skipped_item = {
+                        "source_index": current_index,
+                        "pitch": current_pitch,
+                        "start_sec": float(current["start_sec"]),
+                        "end_sec": float(current["end_sec"]),
+                        "previous_source_index": previous_index,
+                        "previous_pitch": previous_pitch,
+                        "next_source_index": next_index,
+                        "next_pitch": next_pitch,
+                        "overlap_sec": overlap,
+                        "reason": "held_high_recovery_lower_insert",
+                    }
+                    skipped.append(skipped_item)
+                    decisions.append({**skipped_item, "action": "skip"})
+                    continue
+            kept_indices.append(current_index)
+            decisions.append(
+                {
+                    "source_index": current_index,
+                    "pitch": int(current["pitch"]),
+                    "start_sec": float(current["start_sec"]),
+                    "end_sec": float(current["end_sec"]),
+                    "action": "keep",
+                    "reason": "highest_at_onset_baseline",
+                }
+            )
+
+        source_notes: list[dict[str, Any]] = []
+        for source_index, note in enumerate(pitched):
+            raw_confidence = note.get("confidence")
             source_notes.append(
                 {
                     "source_index": source_index,
@@ -1896,19 +1974,52 @@ class V2JobService:
                     "confidence_observed": raw_confidence is not None,
                 }
             )
-        result = select_melody_path(selector_events)
-        selected_indices = [int(index) for index in result.audit.get("selected_input_indices", [])]
-        selected = [pitched[index] for index in selected_indices]
+        selected: list[dict[str, Any]] = []
+        derived_notes: list[dict[str, Any]] = []
+        for position, source_index in enumerate(kept_indices):
+            source_note = pitched[source_index]
+            derived_note = dict(source_note)
+            source_start = float(source_note["start_sec"])
+            source_end = float(source_note["end_sec"])
+            next_start = (
+                float(pitched[kept_indices[position + 1]]["start_sec"])
+                if position + 1 < len(kept_indices)
+                else None
+            )
+            derived_end = min(source_end, next_start) if next_start is not None and next_start < source_end else source_end
+            derived_note["end_sec"] = derived_end
+            selected.append(derived_note)
+            derived_notes.append(
+                {
+                    "source_index": source_index,
+                    "source_start_sec": source_start,
+                    "source_end_sec": source_end,
+                    "derived_start_sec": source_start,
+                    "derived_end_sec": derived_end,
+                    "clipped_to_next_onset": derived_end != source_end,
+                    "next_selected_source_index": kept_indices[position + 1] if position + 1 < len(kept_indices) else None,
+                }
+            )
         audit = {
             "schema_version": "v2-main-melody-selection-v1",
-            "selector_version": result.audit.get("selector_version"),
+            "selector_version": "conservative-hold-v1",
             "selected_track_ids": sorted(selected_ids),
             "source_note_count": len(pitched),
+            "baseline_count": len(baseline_indices),
             "selected_note_count": len(selected),
             "source_notes": source_notes,
-            "selector": result.audit,
-            "selected_source_indices": selected_indices,
-            "selected_notes": [source_notes[index] for index in selected_indices],
+            "baseline_source_indices": baseline_indices,
+            "selected_source_indices": kept_indices,
+            "selected_notes": [source_notes[index] for index in kept_indices],
+            "derived_notes": derived_notes,
+            "skipped": skipped,
+            "decisions": decisions,
+            "policy": {
+                "baseline": "highest pitch per round(start_sec, 5) onset, preserving the historical V2 path",
+                "held_insert": "skip a lower onset only when it overlaps the held previous upper note, overlaps the following recovery, and the recovery is a nearby but distinct upper pitch",
+                "confidence": "missing confidence is neutral; metadata.playback_default and velocity are not evidence",
+                "status": "heuristic candidate inference; not musical ground truth",
+            },
         }
         return selected, audit
 
