@@ -12,7 +12,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
+import signal
 import subprocess
 import wave
 from bisect import bisect_right
@@ -56,6 +58,8 @@ CHANNELS = 2
 SAMPLE_WIDTH_BYTES = 2
 GAIN = 0.2
 TAIL_SEC = 0.25
+DEFAULT_RENDER_TIMEOUT_SEC = 180.0
+VERSION_CHECK_TIMEOUT_SEC = 30.0
 EVENT_RE = re.compile(r"event_post_(noteon|noteoff)\s+\d+\s+(\d+)(?:\s+(\d+))?")
 
 
@@ -303,6 +307,97 @@ def trim_wave(source: Path, destination: Path, target_frames: int) -> dict[str, 
     }
 
 
+def _text_output(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _close_process_pipes(process: subprocess.Popen[str]) -> None:
+    for name in ("stdout", "stderr"):
+        stream = getattr(process, name, None)
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> dict[str, Any]:
+    """Terminate FluidSynth and descendants without a second pipe deadlock."""
+
+    details: dict[str, Any] = {
+        "pid": int(getattr(process, "pid", 0) or 0),
+        "method": "already_exited",
+        "taskkill_return_code": None,
+        "taskkill_timeout": False,
+        "waited": False,
+        "wait_timeout": False,
+    }
+    if process.poll() is not None:
+        return details
+    if os.name == "nt":
+        details["method"] = "taskkill_tree_force"
+        try:
+            result = subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+            details["taskkill_return_code"] = int(result.returncode)
+        except subprocess.TimeoutExpired:
+            details["taskkill_timeout"] = True
+    else:
+        details["method"] = "process_group_sigkill"
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+    try:
+        process.wait(timeout=5)
+        details["waited"] = True
+    except subprocess.TimeoutExpired:
+        details["wait_timeout"] = True
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=1)
+            details["waited"] = True
+        except subprocess.TimeoutExpired:
+            pass
+    details["return_code"] = process.poll()
+    return details
+
+
+def _partial_artifact(path: Path) -> dict[str, Any]:
+    info: dict[str, Any] = {"path": str(path), "exists": path.is_file()}
+    if not info["exists"]:
+        return info
+    try:
+        info["bytes"] = int(path.stat().st_size)
+        info["sha256"] = sha256(path)
+    except OSError as error:
+        info["error"] = str(error)
+    return info
+
+
+def _run_succeeded(result: Mapping[str, Any]) -> bool:
+    return (
+        result.get("return_code") == 0
+        and result.get("timeout") is False
+        and result.get("exists") is True
+    )
+
+
 def _run_fluid_synth(
     executable: Path,
     soundfont: Path,
@@ -311,6 +406,8 @@ def _run_fluid_synth(
     *,
     timeout_sec: float,
 ) -> dict[str, Any]:
+    if not math.isfinite(float(timeout_sec)) or float(timeout_sec) <= 0:
+        raise ValueError("FluidSynth timeout_sec must be a finite number greater than zero")
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [
         str(executable),
@@ -336,33 +433,44 @@ def _run_fluid_synth(
         str(soundfont),
         str(source),
     ]
+    creationflags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) if os.name == "nt" else 0
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+        start_new_session=os.name != "nt",
+    )
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_sec,
-            check=False,
-        )
+        stdout, stderr = process.communicate(timeout=float(timeout_sec))
     except subprocess.TimeoutExpired as error:
+        termination = _terminate_process_tree(process)
+        stdout = _text_output(getattr(error, "stdout", None))
+        stderr = _text_output(getattr(error, "stderr", None))
+        partial_artifact = _partial_artifact(destination)
         return {
             "command": command,
             "return_code": None,
             "timeout": True,
-            "stdout": str(error.stdout or "")[-6000:],
-            "stderr": str(error.stderr or "")[-6000:],
-            "exists": destination.is_file(),
-            "event_dump": parse_event_dump(str(error.stdout or "")),
+            "stdout": stdout[-6000:],
+            "stderr": stderr[-6000:],
+            "exists": partial_artifact["exists"],
+            "partial_artifact": partial_artifact,
+            "termination": termination,
+            "event_dump": parse_event_dump(stdout),
         }
-    stdout = completed.stdout or ""
+    finally:
+        _close_process_pipes(process)
+    stdout = stdout or ""
     return {
         "command": command,
-        "return_code": int(completed.returncode),
+        "return_code": int(process.returncode),
         "timeout": False,
         "stdout": stdout[-6000:],
-        "stderr": (completed.stderr or "")[-6000:],
+        "stderr": (stderr or "")[-6000:],
         "exists": destination.is_file(),
         "event_dump": parse_event_dump(stdout),
     }
@@ -406,7 +514,7 @@ def renderer_metadata(*, executable: Path = DEFAULT_EXECUTABLE, soundfont: Path 
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=30,
+        timeout=VERSION_CHECK_TIMEOUT_SEC,
         check=False,
     )
     version_text = (version.stdout or version.stderr).strip()
@@ -442,13 +550,15 @@ def render_midi(
     manifest_path: Path | None = None,
     executable: Path = DEFAULT_EXECUTABLE,
     soundfont: Path = DEFAULT_SOUNDFONT,
-    timeout_sec: float = 180.0,
+    timeout_sec: float = DEFAULT_RENDER_TIMEOUT_SEC,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Render one source MIDI twice and publish one verified PCM16 WAV."""
 
     source_midi = source_midi.resolve()
     destination = destination.resolve()
+    if not math.isfinite(float(timeout_sec)) or float(timeout_sec) <= 0:
+        raise ValueError("FluidSynth timeout_sec must be a finite number greater than zero")
     if not source_midi.is_file():
         raise FileNotFoundError(source_midi)
     if destination.exists() and not overwrite:
@@ -471,9 +581,39 @@ def render_midi(
     trim_a = work_root / "render-a.wav"
     trim_b = work_root / "render-b.wav"
     run_a = _run_fluid_synth(executable.resolve(), soundfont.resolve(), source_midi, raw_a, timeout_sec=timeout_sec)
-    run_b = _run_fluid_synth(executable.resolve(), soundfont.resolve(), source_midi, raw_b, timeout_sec=timeout_sec)
-    if run_a["return_code"] != 0 or run_b["return_code"] != 0 or not run_a["exists"] or not run_b["exists"]:
-        raise RuntimeError(f"FluidSynth render failed: run_a={run_a}, run_b={run_b}")
+    if _run_succeeded(run_a):
+        run_b = _run_fluid_synth(executable.resolve(), soundfont.resolve(), source_midi, raw_b, timeout_sec=timeout_sec)
+    else:
+        run_b = {
+            "command": [],
+            "return_code": None,
+            "timeout": False,
+            "skipped": True,
+            "skip_reason": "run_a_failed",
+            "stdout": "",
+            "stderr": "",
+            "exists": False,
+            "event_dump": {},
+        }
+    if not _run_succeeded(run_a) or not _run_succeeded(run_b):
+        failure_path = work_root / "render_failure.json"
+        failure = {
+            "schema_version": "1.0",
+            "failure": {
+                "stage": "fluidsynth_render",
+                "timeout_sec": float(timeout_sec),
+                "source_midi": str(source_midi),
+                "destination": str(destination),
+                "renderer": renderer,
+                "runs": {"run_a": run_a, "run_b": run_b},
+                "partial_artifacts": {
+                    "run_a": _partial_artifact(raw_a),
+                    "run_b": _partial_artifact(raw_b),
+                },
+            },
+        }
+        failure_path.write_text(json.dumps(failure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        raise RuntimeError(f"FluidSynth render failed; diagnostics preserved at {failure_path}: {failure['failure']['runs']}")
     trim_info_a = trim_wave(raw_a, trim_a, target_frames)
     trim_info_b = trim_wave(raw_b, trim_b, target_frames)
     audio_a = _audio_format(trim_a)

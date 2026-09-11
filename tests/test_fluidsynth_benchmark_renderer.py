@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
+import subprocess
 
 import mido
 import pytest
@@ -73,6 +75,108 @@ def test_trim_wave_pads_to_declared_fixed_boundary(tmp_path: Path) -> None:
     assert info["final_frames"] == 5
     with renderer.wave.open(str(destination), "rb") as output:
         assert output.readframes(5) == b"\x01\x02\x03\x04" * 2 + b"\x00" * 12
+
+
+def test_fluid_synth_timeout_terminates_tree_and_preserves_partial_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mid"
+    destination = tmp_path / "partial.wav"
+    source.write_bytes(b"midi")
+    destination.write_bytes(b"partial")
+
+    class FakeProcess:
+        pid = 4321
+        returncode = None
+
+        def __init__(self) -> None:
+            self.stdout = io.StringIO()
+            self.stderr = io.StringIO()
+
+        def communicate(self, *, timeout: float) -> tuple[str, str]:
+            assert timeout == 0.25
+            raise subprocess.TimeoutExpired(
+                ["fluidsynth"], timeout, output="partial stdout", stderr="partial stderr"
+            )
+
+        def poll(self) -> None:
+            return None
+
+    process = FakeProcess()
+    popen_calls: list[dict[str, object]] = []
+    terminated: list[FakeProcess] = []
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        popen_calls.append({"command": command, **kwargs})
+        return process
+
+    def fake_terminate(value: FakeProcess) -> dict[str, object]:
+        terminated.append(value)
+        return {"pid": value.pid, "method": "taskkill_tree_force", "waited": True}
+
+    monkeypatch.setattr(renderer.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(renderer, "_terminate_process_tree", fake_terminate)
+
+    result = renderer._run_fluid_synth(
+        tmp_path / "fluidsynth.exe",
+        tmp_path / "MS Basic.sf3",
+        source,
+        destination,
+        timeout_sec=0.25,
+    )
+
+    assert result["timeout"] is True
+    assert result["return_code"] is None
+    assert result["stdout"] == "partial stdout"
+    assert result["stderr"] == "partial stderr"
+    assert result["partial_artifact"] == {
+        "path": str(destination),
+        "exists": True,
+        "bytes": 7,
+        "sha256": renderer.sha256(destination),
+    }
+    assert result["termination"] == {"pid": 4321, "method": "taskkill_tree_force", "waited": True}
+    assert terminated == [process]
+    assert popen_calls[0]["command"][-1] == str(source)
+    assert process.stdout.closed is True
+    assert process.stderr.closed is True
+
+
+def test_render_failure_writes_timeout_diagnostics_and_skips_second_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mid"
+    output = tmp_path / "source.wav"
+    manifest_path = tmp_path / "source.render_manifest.json"
+    _write_source_midi(source)
+    monkeypatch.setattr(renderer, "renderer_metadata", lambda **_kwargs: {"renderer_version": "test"})
+    calls: list[Path] = []
+
+    def fake_run(_executable: Path, _soundfont: Path, _source: Path, destination: Path, *, timeout_sec: float) -> dict[str, object]:
+        calls.append(destination)
+        return {
+            "command": ["fake-fluidsynth"],
+            "return_code": None,
+            "timeout": True,
+            "stdout": "partial stdout",
+            "stderr": "partial stderr",
+            "exists": False,
+            "event_dump": {},
+            "partial_artifact": {"path": str(destination), "exists": False},
+            "termination": {"method": "taskkill_tree_force"},
+        }
+
+    monkeypatch.setattr(renderer, "_run_fluid_synth", fake_run)
+
+    with pytest.raises(RuntimeError, match="diagnostics preserved"):
+        renderer.render_midi(source, output, manifest_path=manifest_path, timeout_sec=1.0)
+
+    assert len(calls) == 1
+    diagnostic_path = tmp_path / ".source.fluidsynth-verification" / "render_failure.json"
+    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert diagnostic["failure"]["runs"]["run_a"]["timeout"] is True
+    assert diagnostic["failure"]["runs"]["run_b"]["skipped"] is True
+    assert diagnostic["failure"]["partial_artifacts"]["run_a"]["exists"] is False
 
 
 @pytest.mark.skipif(
