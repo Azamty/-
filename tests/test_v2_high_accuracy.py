@@ -483,7 +483,10 @@ def test_all_parts_fail_but_main_melody_succeeds_and_v2_score_api_is_available(
     assert set(selection_audit["selected_track_ids"]) == set(ids)
 
     with TestClient(app) as client:
+        status_response = client.get(f"/api/v2/jobs/{job_id}")
         response = client.get(f"/api/v2/jobs/{job_id}/score")
+    assert status_response.status_code == 200
+    assert status_response.json()["score_available"] is True
     assert response.status_code == 200
 
 
