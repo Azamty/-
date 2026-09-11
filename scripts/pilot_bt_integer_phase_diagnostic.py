@@ -39,13 +39,13 @@ from scripts.pilot_beatnet_observable_refinement import (  # noqa: E402
 
 
 BT_ROOT = ROOT / ".artifacts" / "review" / "beat-transformer-official-pilot-v1"
+RECOGNITION_ROOT = ROOT / ".artifacts" / "review" / "production-acceptance-v4-origin-fix"
 DEFAULT_INPUT_MANIFEST = BT_ROOT / "frozen-input-manifest.json"
 DEFAULT_RAW_DIR = BT_ROOT / "raw"
-DEFAULT_OUTPUT = ROOT / ".artifacts" / "review" / "beat-transformer-integer-phase-pilot-v1"
+DEFAULT_OUTPUT = ROOT / ".artifacts" / "review" / "beat-transformer-integer-phase-pilot-v2"
 DEFAULT_EVALUATION = BT_ROOT / "evaluation.json"
+FEATURE_HELPER_PATH = ROOT / "scripts" / "pilot_beatnet_observable_refinement.py"
 
-PERIOD_BY_CASE: dict[str, int] = {"special-6-8": 3}
-DEFAULT_PERIOD = 4
 PHASE_WEIGHTS: dict[str, float] = {
     "onset_contrast": 0.40,
     "low_frequency_contrast": 0.25,
@@ -56,7 +56,7 @@ MIN_COMPLETE_BARS = 3
 CROP_MIN_COMPLETE_BARS = 2
 MIN_MARGIN = 0.10
 TOLERANCE_SEC = 0.07
-SCHEMA_VERSION = "bt_integer_phase_diagnostic_v1"
+SCHEMA_VERSION = "bt_integer_phase_diagnostic_v2"
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -86,6 +86,29 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 def _as_float_list(values: Iterable[Any]) -> list[float]:
     return [float(value) for value in values]
+
+
+def _beat_output_invariant(
+    frozen_values: Sequence[float], frozen_sha256: str, actual_values: Sequence[float]
+) -> dict[str, Any]:
+    """Compare actual output against the separately frozen input manifest."""
+
+    frozen = [float(value) for value in frozen_values]
+    actual = [float(value) for value in actual_values]
+    actual_sha256 = _sha256_bytes(np.asarray(actual, dtype=np.float64).tobytes())
+    values_equal = actual == frozen
+    count_equal = len(actual) == len(frozen)
+    hash_equal = actual_sha256 == str(frozen_sha256)
+    return {
+        "frozen_input_sha256": str(frozen_sha256),
+        "actual_output_sha256": actual_sha256,
+        "frozen_input_count": len(frozen),
+        "actual_output_count": len(actual),
+        "float_values_equal_to_frozen_input": values_equal,
+        "count_equal_to_frozen_input": count_equal,
+        "hash_equal_to_frozen_input": hash_equal,
+        "invariant_passed": values_equal and count_equal and hash_equal,
+    }
 
 
 def _clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
@@ -132,6 +155,18 @@ def _bar_span(starts: Sequence[int], period: int, length: int) -> list[int]:
     return list(range(first, last))
 
 
+def _bar_time_window(starts: Sequence[int], period: int, beats: Sequence[float]) -> tuple[float, float] | None:
+    """Return the half-open time window covered by complete bars."""
+
+    if not starts:
+        return None
+    first = int(starts[0])
+    end_index = int(starts[-1]) + int(period)
+    if first < 0 or end_index >= len(beats):
+        return None
+    return float(beats[first]), float(beats[end_index])
+
+
 def _phase_record(
     *,
     phase: int,
@@ -153,10 +188,16 @@ def _phase_record(
     selected = list(starts)
     interval = _median_interval(beats)
     accents = [float(onset_values[index]) + 0.5 * float(low_values[index]) for index in starts]
+    time_window = _bar_time_window(starts, period, beats)
+    bass_in_window = (
+        [float(onset) for onset in bass_onsets if time_window[0] <= float(onset) < time_window[1]]
+        if time_window is not None
+        else []
+    )
     components = {
         "onset_contrast": _local_contrast(onset_values, selected, span),
         "low_frequency_contrast": _local_contrast(low_values, selected, span),
-        "bass_alignment": _bass_alignment([beats[index] for index in starts], bass_onsets, interval),
+        "bass_alignment": _bass_alignment([beats[index] for index in starts], bass_in_window, interval),
         "bar_stability": max(0.0, 1.0 - statistics.pstdev(accents)) if len(accents) > 1 else 0.5,
     }
     score = sum(PHASE_WEIGHTS[key] * float(components[key]) for key in PHASE_WEIGHTS)
@@ -165,6 +206,8 @@ def _phase_record(
         "complete_bar_count": len(starts_all),
         "scored_bar_count": len(starts),
         "bar_start_indices": [int(index) for index in starts],
+        "bar_time_window_sec": list(time_window) if time_window is not None else None,
+        "bass_onset_count_in_window": len(bass_in_window),
         "components": {key: float(value) for key, value in components.items()},
         "score_higher_is_better": float(score),
     }
@@ -213,12 +256,13 @@ def _crop_equivariance_check(
     original_phase: int,
     selected_phase: int,
 ) -> dict[str, Any]:
-    """Check phase covariance after removing a leading beat.
+    """Check index-phase covariance after deleting the first beat.
 
-    A leading crop translates a phase by ``-crop_start`` modulo the fixed
-    period.  The crop gate is deliberately weaker on the short fixtures (two
-    complete bars) because the full decision still requires three; it prevents
-    the check from being vacuous for the 13-beat cases.
+    This deliberately does not claim robustness to a real PCM crop. A leading
+    index deletion translates a phase by ``-crop_start`` modulo the fixed
+    period. The check is weaker on short fixtures (two complete bars) because
+    the full decision still requires three; it prevents the check from being
+    vacuous for the 13-beat cases.
     """
 
     crop_start = 1
@@ -261,7 +305,7 @@ def _select_integer_phase(
     low_values: Sequence[float],
     bass_onsets: Sequence[float],
     period: int,
-    original_phase: int,
+    original_phase: int | None,
     minimum_complete_bars: int = MIN_COMPLETE_BARS,
     check_crop: bool = True,
 ) -> dict[str, Any]:
@@ -290,7 +334,11 @@ def _select_integer_phase(
     for record in eligible:
         phase = int(record["phase_index"])
         bars = _complete_bar_starts(len(beats), period, phase)
-        half_size = max(1, math.ceil(len(bars) / 2))
+        # Use disjoint end sets. With three bars this scores bar 0 against
+        # bar 2 and intentionally leaves the middle bar out of both halves.
+        half_size = len(bars) // 2
+        if half_size < 1:
+            continue
         half_records["first"].append(
             _phase_record(
                 phase=phase,
@@ -310,7 +358,7 @@ def _select_integer_phase(
                 low_values=low_values,
                 bass_onsets=bass_onsets,
                 period=period,
-                bar_numbers=list(range(max(0, len(bars) - half_size), len(bars))),
+                bar_numbers=list(range(len(bars) - half_size, len(bars))),
             )
         )
     first_winner, first_top, first_second = _unique_winner(half_records["first"])
@@ -335,7 +383,7 @@ def _select_integer_phase(
         reason = "first_last_half_winner_disagreement"
 
     crop = {"available": False, "passed": None, "reason": "not_run"}
-    if proposed_phase is not None and check_crop:
+    if proposed_phase is not None and check_crop and original_phase is not None:
         crop = _crop_equivariance_check(
             beats=beats,
             onset_values=onset_values,
@@ -350,7 +398,7 @@ def _select_integer_phase(
             reason = "crop_equivariance_failed"
 
     if proposed_phase is None:
-        selected_phase = int(original_phase)
+        selected_phase = int(original_phase) if original_phase is not None else None
         decision = "abstain"
     elif int(proposed_phase) == int(original_phase):
         selected_phase = int(proposed_phase)
@@ -361,7 +409,7 @@ def _select_integer_phase(
 
     return {
         "period_beats": int(period),
-        "original_phase_index": int(original_phase),
+        "original_phase_index": int(original_phase) if original_phase is not None else None,
         "selected_phase_index": selected_phase,
         "proposed_phase_index": proposed_phase,
         "decision": decision,
@@ -381,28 +429,119 @@ def _select_integer_phase(
             "last_score": last_top,
             "last_runner_up_score": last_second,
         },
+        "half_phase_records": half_records,
         "crop_equivariance": crop,
     }
 
 
-def _raw_case(raw_path: Path, case_id: str, period: int) -> dict[str, Any]:
+def _derive_joint_period(downbeats: np.ndarray, case_id: str) -> dict[str, Any]:
+    """Derive and strictly validate the period from joint DBN positions."""
+
+    if downbeats.ndim != 2 or downbeats.shape[1] < 2:
+        raise ValueError(f"unexpected joint DBN position schema for {case_id}")
+    raw_positions = np.asarray(downbeats[:, 1], dtype=float)
+    rounded = np.rint(raw_positions).astype(int)
+    if np.any(~np.isfinite(raw_positions)) or np.any(raw_positions != rounded) or np.any(rounded < 1):
+        raise ValueError(f"joint DBN positions are not positive integers for {case_id}")
+    maximum = int(np.max(rounded))
+    candidates: list[int] = []
+    for period in range(2, max(12, maximum) + 1):
+        expected = ((int(rounded[0]) - 1 + np.arange(len(rounded))) % period) + 1
+        if np.array_equal(expected, rounded):
+            candidates.append(period)
+    if len(candidates) != 1:
+        raise ValueError(f"joint DBN positions do not identify one period for {case_id}: {rounded.tolist()}")
+    return {
+        "period_beats": int(candidates[0]),
+        "position_values": rounded.tolist(),
+        "candidate_periods": candidates,
+        "validation": "exact contiguous cyclic position sequence",
+    }
+
+
+def _map_joint_downbeats_to_beat_phase(
+    beats: np.ndarray, downbeats: np.ndarray, period: int, case_id: str
+) -> dict[str, Any]:
+    """Map joint DBN downbeat times to beat-event indices by nearest time.
+
+    The phase is the mode of mapped ``nearest_index % period`` values. This is
+    intentionally independent of the joint event row number, which may differ
+    from the Beat Transformer beat-event array length.
+    """
+
+    positions = np.rint(np.asarray(downbeats[:, 1], dtype=float)).astype(int)
+    downbeat_rows = np.flatnonzero(positions == 1)
+    intervals = np.diff(beats)
+    intervals = intervals[intervals > 0]
+    median_interval = float(np.median(intervals)) if len(intervals) else 0.5
+    max_allowed = max(0.5 * median_interval, 0.08)
+    mapped: list[dict[str, Any]] = []
+    unmapped: list[dict[str, Any]] = []
+    phase_votes: dict[int, list[float]] = {phase: [] for phase in range(period)}
+    for row in downbeat_rows:
+        time_sec = float(downbeats[row, 0])
+        nearest = int(np.argmin(np.abs(beats - time_sec)))
+        deviation = abs(float(beats[nearest]) - time_sec)
+        record = {
+            "joint_row_index": int(row),
+            "joint_time_sec": time_sec,
+            "nearest_beat_index": nearest,
+            "nearest_beat_time_sec": float(beats[nearest]),
+            "deviation_sec": float(deviation),
+        }
+        if deviation <= max_allowed:
+            record["phase_index"] = int(nearest % period)
+            mapped.append(record)
+            phase_votes[int(nearest % period)].append(float(deviation))
+        else:
+            unmapped.append(record)
+    ranked = sorted(
+        ((phase, deviations) for phase, deviations in phase_votes.items() if deviations),
+        key=lambda item: (-len(item[1]), float(np.median(item[1])), int(item[0])),
+    )
+    phase = int(ranked[0][0]) if ranked else None
+    chosen_deviations = ranked[0][1] if ranked else []
+    return {
+        "case_id": case_id,
+        "rule": "nearest beat-event index for each position-1 joint time, then mode of index modulo derived period; ties median deviation then lower phase",
+        "position_one_joint_row_count": int(len(downbeat_rows)),
+        "mapped_count": int(len(mapped)),
+        "unmapped_count": int(len(unmapped)),
+        "mapping_threshold_sec": float(max_allowed),
+        "median_beat_interval_sec": median_interval,
+        "mapped": mapped,
+        "unmapped": unmapped,
+        "phase_votes": {str(phase_index): [float(value) for value in deviations] for phase_index, deviations in phase_votes.items()},
+        "phase_index": phase,
+        "phase_vote_count": len(chosen_deviations),
+        "phase_consistency": (len(chosen_deviations) / len(mapped)) if mapped else 0.0,
+        "mapped_deviation_mean_sec": float(np.mean(chosen_deviations)) if chosen_deviations else None,
+        "mapped_deviation_max_sec": float(np.max(chosen_deviations)) if chosen_deviations else None,
+        "phase_mapping_available": bool(phase is not None),
+    }
+
+
+def _raw_case(raw_path: Path, case_id: str) -> dict[str, Any]:
     with np.load(raw_path, allow_pickle=False) as raw:
         beats = np.asarray(raw["beat_events"], dtype=np.float64).copy()
         downbeats = np.asarray(raw["downbeat_events"], dtype=np.float64).copy()
     if beats.ndim != 1 or downbeats.ndim != 2 or downbeats.shape[1] < 2:
         raise ValueError(f"unexpected Beat Transformer raw schema for {case_id}")
-    positions = downbeats[:, 1]
-    downbeat_rows = np.flatnonzero(np.isclose(positions, 1.0, rtol=0.0, atol=1e-9))
+    period_info = _derive_joint_period(downbeats, case_id)
+    mapping = _map_joint_downbeats_to_beat_phase(beats, downbeats, int(period_info["period_beats"]), case_id)
+    positions = np.rint(downbeats[:, 1]).astype(int)
+    downbeat_rows = np.flatnonzero(positions == 1)
     if len(downbeat_rows) == 0:
         raise ValueError(f"raw DBN output has no position-1 row for {case_id}")
-    original_phase = int(downbeat_rows[0] % period)
     return {
         "case_id": case_id,
-        "period_beats": int(period),
+        "period_beats": int(period_info["period_beats"]),
+        "period_derivation": period_info,
         "beat_events": beats,
         "downbeat_events": downbeats,
         "original_downbeat_times": [float(downbeats[index, 0]) for index in downbeat_rows],
-        "original_phase_index": original_phase,
+        "original_phase_index": mapping["phase_index"],
+        "joint_to_beat_mapping": mapping,
         "beat_event_count": int(len(beats)),
         "downbeat_event_count": int(len(downbeats)),
         "beat_events_sha256": _sha256_bytes(beats.tobytes()),
@@ -410,8 +549,75 @@ def _raw_case(raw_path: Path, case_id: str, period: int) -> dict[str, Any]:
     }
 
 
+def _extract_bass_onsets(recognition_path: Path, audio_path: Path) -> dict[str, Any]:
+    """Read only raw note fields needed for bass onset evidence.
+
+    The recognition artifact also contains beat grids and other derived data.
+    They are deliberately not accessed here.  Chord notes at the same onset
+    are collapsed to one six-decimal onset, matching the existing onset-group
+    contract.
+    """
+
+    if not recognition_path.is_file():
+        return {
+            "available": False,
+            "reason": "missing_recognition",
+            "path": str(recognition_path),
+            "sha256": None,
+            "audio_path_in_recognition": None,
+            "audio_path_matches_frozen_input": None,
+            "raw_note_count": 0,
+            "bass_candidate_count": 0,
+            "bass_onsets": [],
+            "used_fields": ["start_sec", "midi", "instrument_group", "voice_id", "is_drum"],
+        }
+    raw_bytes = recognition_path.read_bytes()
+    payload = json.loads(raw_bytes.decode("utf-8"))
+    notes = payload.get("notes", [])
+    if not isinstance(notes, list):
+        raise ValueError(f"recognition notes must be a list: {recognition_path}")
+    candidates: list[float] = []
+    for note in notes:
+        if not isinstance(note, Mapping) or bool(note.get("is_drum")):
+            continue
+        try:
+            onset = float(note["start_sec"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        midi_value: int | None
+        try:
+            midi_value = int(note["midi"])
+        except (KeyError, TypeError, ValueError):
+            midi_value = None
+        instrument_group = str(note.get("instrument_group") or "").lower()
+        voice_id = str(note.get("voice_id") or "").lower()
+        explicit_bass = "bass" in instrument_group or "bass" in voice_id
+        low_non_drum = midi_value is not None and midi_value < 48
+        if explicit_bass or low_non_drum:
+            candidates.append(round(onset, 6))
+    bass_onsets = sorted(set(candidates))
+    provenance = payload.get("provenance")
+    audio_in_recognition = provenance.get("source_audio") if isinstance(provenance, Mapping) else None
+    return {
+        "available": True,
+        "reason": "raw_note_fields_only",
+        "path": str(recognition_path),
+        "sha256": _sha256_bytes(raw_bytes),
+        "audio_path_in_recognition": str(audio_in_recognition) if audio_in_recognition else None,
+        "audio_path_matches_frozen_input": (
+            Path(str(audio_in_recognition)).resolve() == audio_path.resolve() if audio_in_recognition else None
+        ),
+        "raw_note_count": len(notes),
+        "bass_candidate_count": len(candidates),
+        "bass_onset_count": len(bass_onsets),
+        "bass_onsets": bass_onsets,
+        "used_fields": ["start_sec", "midi", "instrument_group", "voice_id", "is_drum"],
+        "deduplication": "sorted unique round(start_sec, 6), including chord/onset collapse",
+    }
+
+
 def _input_case_manifest(
-    case: Mapping[str, Any], raw_dir: Path, period: int
+    case: Mapping[str, Any], raw_dir: Path, raw_freeze_cases: Mapping[str, Mapping[str, Any]], recognition_root: Path
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     case_id = str(case["id"])
     audio_path = Path(str(case["path"]))
@@ -419,7 +625,17 @@ def _input_case_manifest(
     raw_json_path = raw_dir / f"{case_id}.json"
     if not audio_path.is_file() or not raw_path.is_file() or not raw_json_path.is_file():
         raise FileNotFoundError(f"missing frozen input/raw for {case_id}")
-    raw = _raw_case(raw_path, case_id, period)
+    if _sha256(audio_path) != str(case.get("sha256")) or _sha256(audio_path) != str(case.get("registry_sha256")):
+        raise ValueError(f"frozen input audio hash mismatch for {case_id}")
+    expected_raw = raw_freeze_cases.get(case_id)
+    if expected_raw is None:
+        raise ValueError(f"raw freeze manifest has no case {case_id}")
+    actual_raw_sha = _sha256(raw_path)
+    actual_metadata_sha = _sha256(raw_json_path)
+    if actual_raw_sha != str(expected_raw.get("npz_sha256")) or actual_metadata_sha != str(expected_raw.get("metadata_sha256")):
+        raise ValueError(f"upstream raw freeze hash mismatch for {case_id}")
+    raw = _raw_case(raw_path, case_id)
+    recognition = _extract_bass_onsets(recognition_root / case_id / "raw" / "recognition.json", audio_path)
     manifest = {
         "id": case_id,
         "category": str(case.get("category", "unknown")),
@@ -428,16 +644,26 @@ def _input_case_manifest(
         "audio_sha256": _sha256(audio_path),
         "raw_npz_path": str(raw_path),
         "raw_npz_bytes": raw_path.stat().st_size,
-        "raw_npz_sha256": _sha256(raw_path),
+        "raw_npz_sha256": actual_raw_sha,
         "raw_metadata_path": str(raw_json_path),
         "raw_metadata_bytes": raw_json_path.stat().st_size,
-        "raw_metadata_sha256": _sha256(raw_json_path),
-        "period_beats": int(period),
+        "raw_metadata_sha256": actual_metadata_sha,
+        "period_beats": int(raw["period_beats"]),
+        "period_derivation": raw["period_derivation"],
         "beat_event_count": raw["beat_event_count"],
         "downbeat_event_count": raw["downbeat_event_count"],
         "beat_events_sha256": raw["beat_events_sha256"],
         "downbeat_events_sha256": raw["downbeat_events_sha256"],
         "original_phase_index": raw["original_phase_index"],
+        "joint_to_beat_mapping": raw["joint_to_beat_mapping"],
+        "beat_event_values": [float(value) for value in raw["beat_events"]],
+        "recognition": recognition,
+        "upstream_expected_hashes": {
+            "audio_sha256": str(case.get("sha256")),
+            "audio_registry_sha256": str(case.get("registry_sha256")),
+            "raw_npz_sha256": str(expected_raw.get("npz_sha256")),
+            "raw_metadata_sha256": str(expected_raw.get("metadata_sha256")),
+        },
     }
     return manifest, raw
 
@@ -478,13 +704,24 @@ def _annotation_times(path: Path) -> tuple[list[float], list[float]]:
     return beats, downbeats
 
 
-def _candidate_downbeats(raw: Mapping[str, Any], decision: Mapping[str, Any]) -> list[float]:
-    if decision["decision"] in {"abstain", "keep_original"}:
-        return [float(value) for value in raw["original_downbeat_times"]]
-    period = int(decision["period_beats"])
-    phase = int(decision["selected_phase_index"])
-    beats = np.asarray(raw["beat_events"], dtype=np.float64)
-    return [float(value) for value in beats[phase::period]]
+def _candidate_downbeats(raw: Mapping[str, Any], decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the actual output grid and record its source explicitly."""
+
+    if decision["decision"] != "changed":
+        values = [float(value) for value in raw["original_downbeat_times"]]
+        source = "joint_dbn_downbeat_events"
+    else:
+        period = int(decision["period_beats"])
+        phase = int(decision["selected_phase_index"])
+        beats = np.asarray(raw["beat_events"], dtype=np.float64)
+        values = [float(value) for value in beats[phase::period]]
+        source = "beat_events_integer_phase_slice"
+    return {
+        "times": values,
+        "source": source,
+        "count": len(values),
+        "sha256": _sha256_bytes(np.asarray(values, dtype=np.float64).tobytes()),
+    }
 
 
 def _score_development(
@@ -506,8 +743,11 @@ def _score_development(
         reference_beats, reference_downbeats = _annotation_times(annotation_path)
         raw = raw_cases[case_id]
         decision = decisions[case_id]
+        frozen_beat_values = [float(value) for value in input_case["beat_event_values"]]
         predicted_beats = [float(value) for value in raw["beat_events"]]
-        predicted_downbeats = _candidate_downbeats(raw, decision)
+        beat_output = _beat_output_invariant(frozen_beat_values, str(input_case["beat_events_sha256"]), predicted_beats)
+        output_grid = _candidate_downbeats(raw, decision)
+        predicted_downbeats = output_grid["times"]
         original_downbeats = [float(value) for value in raw["original_downbeat_times"]]
         original_beat_metric = _reference_f1(reference_beats, predicted_beats)
         original_downbeat_metric = _reference_f1(reference_downbeats, original_downbeats)
@@ -526,9 +766,13 @@ def _score_development(
                 "candidate": {
                     "downbeat": candidate_downbeat_metric,
                     "predicted_downbeat_times": predicted_downbeats,
+                    "output_grid": output_grid,
+                    "output_source_is_phase_changed_candidate": output_grid["source"] == "beat_events_integer_phase_slice",
                 },
-                "beat_preserved": predicted_beats == [float(value) for value in raw["beat_events"]],
-                "beat_count_preserved": len(predicted_beats) == int(raw["beat_event_count"]),
+                "beat_preserved": bool(beat_output["invariant_passed"]),
+                "beat_count_preserved": bool(beat_output["count_equal_to_frozen_input"]),
+                "beat_output": beat_output,
+                "joint_vs_beat_grid": raw["joint_to_beat_mapping"],
                 "decision": decision["decision"],
             }
         )
@@ -580,7 +824,11 @@ def _artifact_manifest(output_root: Path) -> dict[str, Any]:
             continue
         files.append({"path": str(path.relative_to(output_root)).replace("\\", "/"), "bytes": path.stat().st_size, "sha256": _sha256(path)})
     tracked_sources: list[dict[str, Any]] = []
-    for source in (ROOT / "scripts" / "pilot_bt_integer_phase_diagnostic.py", ROOT / "tests" / "test_pilot_bt_integer_phase_diagnostic.py"):
+    for source in (
+        ROOT / "scripts" / "pilot_bt_integer_phase_diagnostic.py",
+        ROOT / "tests" / "test_pilot_bt_integer_phase_diagnostic.py",
+        FEATURE_HELPER_PATH,
+    ):
         if source.is_file():
             tracked_sources.append({"path": str(source.relative_to(ROOT)).replace("\\", "/"), "bytes": source.stat().st_size, "sha256": _sha256(source)})
     return {
@@ -601,33 +849,49 @@ def run(
     output_root.mkdir(parents=True, exist_ok=True)
     input_source = _load_json(input_manifest_path)
     source_cases = list(input_source["cases"])
+    raw_freeze_path = BT_ROOT / "raw-freeze-manifest.json"
+    raw_freeze_source = _load_json(raw_freeze_path)
+    raw_freeze_cases = {str(item["id"]): item for item in raw_freeze_source["files"]}
+    feature_helper_sha256 = _sha256(FEATURE_HELPER_PATH)
     preregistration = {
         "schema_version": SCHEMA_VERSION,
         "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "status": "frozen_before_annotation_access",
+        "status": "audit_correction_v2_frozen_before_annotation_access",
+        "audit_correction": {
+            "corrects_v1": True,
+            "v1_artifact_is_audio_only_and_omitted_available_recognition": True,
+            "v1_labels_are_already_seen": True,
+            "weights_and_gate_unchanged": True,
+        },
         "selection": {
             "case_ids": [str(case["id"]) for case in source_cases],
             "source": str(input_manifest_path),
             "source_sha256": _sha256(input_manifest_path),
             "raw_dir": str(raw_dir),
+            "recognition_root": str(RECOGNITION_ROOT),
+            "raw_freeze_manifest": str(raw_freeze_path),
+            "raw_freeze_manifest_sha256": _sha256(raw_freeze_path),
         },
         "phase_policy": {
-            "period_beats": "4 for seven fixed cases; 3 for special-6-8",
+            "period_beats": "derived from each joint DBN position sequence and exact-cycle validated",
             "enumeration": "integer phases 0..period-1 only",
             "weights": PHASE_WEIGHTS,
             "minimum_complete_bars": MIN_COMPLETE_BARS,
             "first_last_half_same_winner": True,
+            "half_bar_sets": "disjoint first floor(n/2) and last floor(n/2) complete bars; middle bars omitted when odd",
             "winner_margin_at_least": MIN_MARGIN,
-            "crop_equivariance": "leading one-beat crop; crop-only check may use two complete bars on short fixtures",
+            "crop_equivariance": "delete one leading beat index; this is index-phase covariance, not PCM-crop robustness",
         },
         "forbidden_searches": ["beat_time", "beat_count", "tempo", "offset_sec", "meter", "segment_phase", "velocity", "drum", "chroma", "oracle", "reference_labels"],
         "observable_sources": {
             "audio": "raw frozen WAV clips",
             "beat_events": "Beat Transformer official raw NPZ, unchanged",
-            "downbeat_period": "fixed prior from official joint DBN output and preregistration",
-            "muscriptor_game_notes": "unavailable for these eight raw artifacts; no bass renormalization",
-            "bass_alignment": "zero component when no raw model bass onsets are supplied",
+            "downbeat_period": "derived and exact-cycle validated from each joint DBN position sequence",
+            "joint_downbeat_phase": "nearest beat-event index mapping of position-1 joint times, phase mode with deviation report",
+            "muscriptor_game_notes": "raw recognition start_sec/midi/instrument_group/voice_id/is_drum only",
+            "bass_alignment": "explicit bass instrument or non-drum midi<48; chord/onset de-duplicated; missing stays zero without reweighting",
         },
+        "feature_helper_source": {"path": str(FEATURE_HELPER_PATH), "sha256": feature_helper_sha256},
         "post_hoc_labels": "opened only after raw-decision-freeze.json is written",
     }
     _write_json(output_root / "preregistration.json", preregistration)
@@ -636,8 +900,7 @@ def run(
     raw_cases: dict[str, dict[str, Any]] = {}
     for case in source_cases:
         case_id = str(case["id"])
-        period = int(PERIOD_BY_CASE.get(case_id, DEFAULT_PERIOD))
-        manifest, raw = _input_case_manifest(case, raw_dir, period)
+        manifest, raw = _input_case_manifest(case, raw_dir, raw_freeze_cases, RECOGNITION_ROOT)
         input_cases.append(manifest)
         raw_cases[case_id] = raw
     input_manifest = {
@@ -646,8 +909,10 @@ def run(
         "source_manifest_path": str(input_manifest_path),
         "source_manifest_sha256": _sha256(input_manifest_path),
         "raw_directory": str(raw_dir),
-        "raw_freeze_source": str(BT_ROOT / "raw-freeze-manifest.json"),
-        "raw_freeze_source_sha256": _sha256(BT_ROOT / "raw-freeze-manifest.json"),
+        "raw_freeze_source": str(raw_freeze_path),
+        "raw_freeze_source_sha256": _sha256(raw_freeze_path),
+        "upstream_hash_validation": "source frozen-input manifest and upstream raw-freeze manifest expected hashes verified before feature extraction",
+        "feature_helper_source": {"path": str(FEATURE_HELPER_PATH), "sha256": feature_helper_sha256},
         "cases": input_cases,
     }
     _write_json(output_root / "input-manifest.json", input_manifest)
@@ -661,39 +926,42 @@ def run(
         beats = [float(value) for value in raw["beat_events"]]
         onset_values = _sample_envelope(features["onset"], beats)
         low_values = _sample_envelope(features["low_onset"], beats)
-        bass_onsets: list[float] = []
+        bass_onsets = list(input_case["recognition"].get("bass_onsets", []))
         decision = _select_integer_phase(
             beats=beats,
             onset_values=onset_values,
             low_values=low_values,
             bass_onsets=bass_onsets,
             period=int(input_case["period_beats"]),
-            original_phase=int(raw["original_phase_index"]),
+            original_phase=(int(raw["original_phase_index"]) if raw["original_phase_index"] is not None else None),
         )
+        frozen_beat_values = [float(value) for value in input_case["beat_event_values"]]
+        actual_beat_values = [float(value) for value in raw["beat_events"]]
+        beat_output = _beat_output_invariant(frozen_beat_values, str(input_case["beat_events_sha256"]), actual_beat_values)
+        phase_output = _candidate_downbeats(raw, decision)
         decision = {
             **decision,
             "audio_observations": {
                 "duration_sec": float(features["duration_sec"]),
                 "onset_sample_count": len(onset_values),
                 "low_frequency_sample_count": len(low_values),
-                "bass_onsets_available": False,
-                "bass_onset_count": 0,
+                "bass_onsets_available": bool(input_case["recognition"].get("bass_onsets")),
+                "bass_onset_count": len(bass_onsets),
+                "bass_recognition": input_case["recognition"],
                 "bass_reweighted": False,
                 "velocity_used": False,
                 "drum_used": False,
                 "chroma_used": False,
             },
-            "beat_output": {
-                "input_count": len(beats),
-                "output_count": len(beats),
-                "input_sha256": raw["beat_events_sha256"],
-                "output_sha256": _sha256_bytes(np.asarray(beats, dtype=np.float64).tobytes()),
-                "float_values_unchanged": True,
-            },
+            "beat_output": beat_output,
+            "phase_output_contract": phase_output,
+            "joint_to_beat_mapping": raw["joint_to_beat_mapping"],
             "raw_sources": {
                 "raw_npz_sha256": input_case["raw_npz_sha256"],
                 "raw_metadata_sha256": input_case["raw_metadata_sha256"],
                 "audio_sha256": input_case["audio_sha256"],
+                "recognition_sha256": input_case["recognition"].get("sha256"),
+                "feature_helper_sha256": feature_helper_sha256,
             },
         }
         decisions[case_id] = decision
@@ -705,6 +973,8 @@ def run(
                 "decision_sha256": _sha256_bytes(_canonical_bytes(decision)),
                 "beat_count": len(beats),
                 "beat_events_sha256": raw["beat_events_sha256"],
+                "recognition_sha256": input_case["recognition"].get("sha256"),
+                "feature_helper_sha256": feature_helper_sha256,
             }
         )
 
@@ -715,6 +985,8 @@ def run(
         "preregistration_sha256": _sha256(output_root / "preregistration.json"),
         "input_manifest_sha256": _sha256(output_root / "input-manifest.json"),
         "source_raw_freeze_manifest_sha256": _sha256(BT_ROOT / "raw-freeze-manifest.json"),
+        "feature_helper_source": {"path": str(FEATURE_HELPER_PATH), "sha256": feature_helper_sha256},
+        "upstream_hash_validation": input_manifest["upstream_hash_validation"],
         "case_count": len(raw_case_records),
         "cases": raw_case_records,
         "decisions": decisions,
@@ -730,6 +1002,7 @@ def run(
         raw_cases=raw_cases,
         decisions=decisions,
     )
+    evaluation["raw_decision_freeze_sha256"] = _sha256(output_root / "raw-decision-freeze.json")
     _write_json(output_root / "evaluation.json", evaluation)
 
     decision = evaluation["decision"]
