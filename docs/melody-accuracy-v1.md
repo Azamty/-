@@ -37,11 +37,11 @@ V2 的 `_select_main_melody_notes` 以原有规则作为基线：按 `round(star
 | `codex/melody-dp-experiment`（`5b980de`） | 被拒绝的全局 DP 试验 | 不推荐；会损坏开头前缀并漏掉快速旋律 |
 | `codex/melody-accuracy-v1`（当前） | 保守主旋律候选和独立成功状态 | 推荐试弹，仍是候选诊断阶段，不宣称最准确 |
 
-切换前先保存工作树，并停止正在运行的服务，避免不同分支共用旧进程或输出目录：
+当前只有 `.artifacts` 这类未跟踪的样本产物时，通常可以直接切换分支；先停止正在运行的服务，避免不同分支共用旧进程或输出目录。若确有 tracked 修改，再只暂存 tracked 文件：
 
 ```text
 git status --short
-git stash push -u -m "before melody branch switch"   # 只有存在未提交改动时执行
+git stash push -m "before melody branch switch"       # 不带 -u，只在有 tracked 修改时执行
 # 停止当前 backend/frontend 服务
 git switch codex/melody-accuracy-v1
 # 按项目平时的命令重新启动服务
@@ -49,4 +49,4 @@ git status --short
 git stash list
 ```
 
-把 `codex/melody-accuracy-v1` 替换成上表中的目标分支即可。不要在切换流程中自动删除 stash；确认目标分支和工作树后，再由操作者手动决定是否 `git stash pop`。旧 raw、原 MIDI 和旧高精度产物不随切换覆盖。
+把 `codex/melody-accuracy-v1` 替换成上表中的目标分支即可。新写的未跟踪源码应先单独保存或提交；不要用 `git stash -u` 把它和样本产物一起移走。`.artifacts` 中生成的音频、谱面和模型产物保持原地，不加入 Git，也不要用 `git clean` 或 `git reset --hard` 清理。不要在切换流程中自动删除 stash；确认目标分支和工作树后，再由操作者手动决定是否 `git stash pop`。旧 raw、原 MIDI 和旧高精度产物不随切换覆盖。
