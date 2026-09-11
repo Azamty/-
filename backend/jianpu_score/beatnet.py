@@ -85,6 +85,7 @@ def analyze_with_beatnet(
     duration_sec: float | None = None,
     bpm_override: float | None = None,
     time_signature_override: str | None = None,
+    beat_unit_definition: str | None = None,
     source_onsets: Mapping[str, Sequence[float]] | Sequence[float] | None = None,
     model: int = 1,
     device: str = "cpu",
@@ -97,6 +98,7 @@ def analyze_with_beatnet(
         duration_sec=duration_sec,
         manual_bpm=bpm_override,
         manual_time_signature=time_signature_override,
+        beat_unit_definition=beat_unit_definition,
         source_onsets=source_onsets,
     )
     grid["beatnet"] = {

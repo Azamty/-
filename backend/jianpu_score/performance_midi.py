@@ -131,7 +131,9 @@ def _score_origin_audio_seconds(mapper: Any) -> float:
 
     if mapper.fixed or len(mapper.beat_times) < 2:
         return 0.0
-    raw_position = -float(mapper.shift_beats) / float(mapper.beat_scale or 1.0)
+    raw_position = -float(mapper.shift_beats) / float(
+        (mapper.beat_scale or 1.0) * (mapper.beat_duration_quarters or 1.0)
+    )
     times = mapper.beat_times
     if raw_position <= 0:
         interval = times[1] - times[0]
@@ -164,8 +166,12 @@ def _tempo_points(mapper: Any) -> list[tuple[int, int, float]]:
 
     raw: list[tuple[int, int, float]] = []
     for index, interval in enumerate(intervals):
-        bpm = _finite_positive(60.0 * scale / interval, label="tempo map BPM")
-        score_beat = index * scale + shift
+        beat_duration_quarters = float(mapper.beat_duration_quarters or 1.0)
+        bpm = _finite_positive(
+            60.0 * scale * beat_duration_quarters / interval,
+            label="tempo map BPM",
+        )
+        score_beat = index * scale * beat_duration_quarters + shift
         tick = round(score_beat * PERFORMANCE_TICKS_PER_QUARTER)
         raw.append((tick, round(mido.bpm2tempo(bpm)), bpm))
 
@@ -174,7 +180,11 @@ def _tempo_points(mapper: Any) -> list[tuple[int, int, float]]:
     # retain later points in the non-negative score timeline.  This matters
     # when the first detected downbeat is a later BeatNet beat: the interval
     # before that downbeat must not become the playback tempo at tick zero.
-    raw_origin_position = -shift / scale if scale else 0.0
+    raw_origin_position = (
+        -shift / (scale * float(mapper.beat_duration_quarters or 1.0))
+        if scale
+        else 0.0
+    )
     base_index = max(0, min(len(raw) - 1, math.floor(raw_origin_position)))
     points: dict[int, tuple[int, float]] = {0: (raw[base_index][1], raw[base_index][2])}
     for tick, tempo, bpm in raw:
@@ -513,6 +523,12 @@ def build_performance_midi(
         "score_origin_audio_sec": _score_origin_audio_seconds(mapper),
         "beat_scale": mapper.beat_scale,
         "beat_shift_beats": mapper.shift_beats,
+        "beat_unit": mapper.beat_unit,
+        "beat_unit_source": mapper.beat_unit_source,
+        "beat_unit_proven": mapper.beat_unit_proven,
+        "beat_duration_quarters": mapper.beat_duration_quarters,
+        "beats_per_bar": mapper.beats_per_bar,
+        "bar_duration_quarters": mapper.bar_duration_quarters,
         "manual_bpm_override": analysis.metadata.get("manual_bpm_override", False),
         "manual_time_signature_override": analysis.metadata.get("manual_time_signature_override", False),
         "beat_engine": analysis.metadata.get("beat_engine", "beatnet"),

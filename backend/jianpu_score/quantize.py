@@ -10,6 +10,7 @@ from fractions import Fraction
 from itertools import pairwise
 from typing import Any
 
+from .beat_grid import BeatGridError, beat_unit_from_grid, resolve_beat_unit
 from .domain import (
     MusicAnalysis,
     NoteEvent,
@@ -125,6 +126,12 @@ class _BeatMapper:
     fixed: bool
     shift_beats: float = 0.0
     beat_scale: float = 1.0
+    beat_duration_quarters: float = 1.0
+    beat_unit: str = "quarter"
+    beat_unit_source: str = "standard_meter_definition"
+    beat_unit_proven: bool = True
+    beats_per_bar: int = 4
+    bar_duration_quarters: float = 4.0
     score_origin: dict[str, Any] = field(default_factory=dict)
 
     def seconds_to_beat(self, seconds: float) -> float:
@@ -141,7 +148,7 @@ class _BeatMapper:
             left = right - 1
             fraction = (seconds - self.beat_times[left]) / (self.beat_times[right] - self.beat_times[left])
             position = left + fraction
-        return position * self.beat_scale + self.shift_beats
+        return position * self.beat_scale * self.beat_duration_quarters + self.shift_beats
 
 
 def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _BeatMapper:
@@ -149,6 +156,17 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
     beat_grid = analysis.metadata.get("beat_grid")
     mapping = beat_grid.get("mapping", {}) if isinstance(beat_grid, dict) else {}
     beat_scale = float(mapping.get("manual_bpm_scale", 1.0) or 1.0)
+    try:
+        beat_unit = (
+            beat_unit_from_grid(beat_grid, time_signature=analysis.time_signature, legacy_compat=True)
+            if isinstance(beat_grid, dict) and beat_grid
+            else resolve_beat_unit(analysis.time_signature, legacy_compat=True)
+        )
+    except (BeatGridError, ValueError) as exc:
+        raise ValueError(f"invalid beat-grid unit semantics: {exc}") from exc
+    beat_duration_quarters = float(beat_unit["beat_duration_quarters"])
+    beats_per_bar = int(beat_unit["beats_per_bar"])
+    bar_duration_quarters = float(beat_unit["bar_duration_quarters"])
     # A legacy hand-built MusicAnalysis marked manual_bpm has no BeatNet phase
     # map and must retain its historical fixed-grid behavior.  New BeatNet
     # analyses carry a beat_grid and keep the detected phase/local timing even
@@ -159,6 +177,12 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
             analysis.bpm,
             beat_times,
             True,
+            beat_duration_quarters=beat_duration_quarters,
+            beat_unit=str(beat_unit["beat_unit"]),
+            beat_unit_source=str(beat_unit["source"]),
+            beat_unit_proven=bool(beat_unit["proven"]),
+            beats_per_bar=beats_per_bar,
+            bar_duration_quarters=bar_duration_quarters,
             score_origin={
                 "strategy": "legacy_fixed_bpm",
                 "downbeat_status": "undetermined",
@@ -166,7 +190,18 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
                 "pickup_beats": 0.0,
             },
         )
-    unshifted = _BeatMapper(analysis.bpm, beat_times, False, beat_scale=beat_scale)
+    unshifted = _BeatMapper(
+        analysis.bpm,
+        beat_times,
+        False,
+        beat_scale=beat_scale,
+        beat_duration_quarters=beat_duration_quarters,
+        beat_unit=str(beat_unit["beat_unit"]),
+        beat_unit_source=str(beat_unit["source"]),
+        beat_unit_proven=bool(beat_unit["proven"]),
+        beats_per_bar=beats_per_bar,
+        bar_duration_quarters=bar_duration_quarters,
+    )
 
     if not isinstance(beat_grid, dict) or not beat_grid:
         # Keep the legacy non-BeatNet contract for hand-built analyses.  The
@@ -179,6 +214,12 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
             False,
             shift_beats=shift_beats,
             beat_scale=beat_scale,
+            beat_duration_quarters=beat_duration_quarters,
+            beat_unit=str(beat_unit["beat_unit"]),
+            beat_unit_source=str(beat_unit["source"]),
+            beat_unit_proven=bool(beat_unit["proven"]),
+            beats_per_bar=beats_per_bar,
+            bar_duration_quarters=bar_duration_quarters,
             score_origin={
                 "strategy": "legacy_audio_zero",
                 "downbeat_status": "undetermined",
@@ -220,6 +261,12 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
             False,
             shift_beats=0.0,
             beat_scale=beat_scale,
+            beat_duration_quarters=beat_duration_quarters,
+            beat_unit=str(beat_unit["beat_unit"]),
+            beat_unit_source=str(beat_unit["source"]),
+            beat_unit_proven=bool(beat_unit["proven"]),
+            beats_per_bar=beats_per_bar,
+            bar_duration_quarters=bar_duration_quarters,
             score_origin={
                 "strategy": "first_beat_fallback",
                 "downbeat_status": "undetermined",
@@ -231,13 +278,12 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
             },
         )
 
-    downbeat_raw_beat = first_downbeat_index * beat_scale
+    downbeat_raw_beat = first_downbeat_index * beat_scale * beat_duration_quarters
     earliest_event_sec = min((event.start_sec for event in events), default=0.0)
     has_pre_downbeat_note = (
         first_downbeat_sec is not None and earliest_event_sec < first_downbeat_sec - 1e-6
     )
-    numerator, denominator = _time_signature_values(analysis.time_signature)
-    bar_beats = numerator * 4.0 / denominator
+    bar_beats = bar_duration_quarters
     if has_pre_downbeat_note:
         # Keep a leading note on the non-negative score timeline while making
         # the detected downbeat land on the next complete measure boundary.
@@ -269,6 +315,12 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
         False,
         shift_beats=shift_beats,
         beat_scale=beat_scale,
+        beat_duration_quarters=beat_duration_quarters,
+        beat_unit=str(beat_unit["beat_unit"]),
+        beat_unit_source=str(beat_unit["source"]),
+        beat_unit_proven=bool(beat_unit["proven"]),
+        beats_per_bar=beats_per_bar,
+        bar_duration_quarters=bar_duration_quarters,
         score_origin=score_origin,
     )
 
@@ -327,13 +379,27 @@ def _tempo_events(analysis: MusicAnalysis, mapper: _BeatMapper, quarter_ticks: i
     median_interval = sorted(
         right - left for left, right in zip(mapper.beat_times, mapper.beat_times[1:])
     )[len(mapper.beat_times[1:]) // 2]
-    values: list[TempoEvent] = [TempoEvent(start_tick=0, bpm=60.0 * mapper.beat_scale / median_interval)]
+    values: list[TempoEvent] = [
+        TempoEvent(
+            start_tick=0,
+            bpm=60.0 * mapper.beat_scale * mapper.beat_duration_quarters / median_interval,
+        )
+    ]
     for index, (left, right) in enumerate(zip(mapper.beat_times, mapper.beat_times[1:])):
         interval = right - left
         if interval <= 0:
             continue
-        bpm = 60.0 * mapper.beat_scale / interval
-        tick = max(0, round((index * mapper.beat_scale + mapper.shift_beats) * quarter_ticks))
+        bpm = 60.0 * mapper.beat_scale * mapper.beat_duration_quarters / interval
+        tick = max(
+            0,
+            round(
+                (
+                    index * mapper.beat_scale * mapper.beat_duration_quarters
+                    + mapper.shift_beats
+                )
+                * quarter_ticks
+            ),
+        )
         # The first detected beat can be a pickup after audio zero.  Its
         # partial interval must not overwrite the median tempo at score tick
         # zero; later intervals still contribute their local tempo changes.
@@ -450,6 +516,12 @@ def quantize_events(
         "beat_times": list(analysis.beat_times),
         "beat_shift_beats": mapper.shift_beats,
         "beat_scale": mapper.beat_scale,
+        "beat_unit": mapper.beat_unit,
+        "beat_unit_source": mapper.beat_unit_source,
+        "beat_unit_proven": mapper.beat_unit_proven,
+        "beat_duration_quarters": mapper.beat_duration_quarters,
+        "beats_per_bar": mapper.beats_per_bar,
+        "bar_duration_quarters": mapper.bar_duration_quarters,
         "beat_grid": analysis.metadata.get("beat_grid"),
         "beat_offset_sec": analysis.beat_times[0] if analysis.beat_times else 0.0,
         "score_origin": mapper.score_origin,

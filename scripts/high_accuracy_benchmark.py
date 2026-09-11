@@ -21,6 +21,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import mido
 
+from backend.jianpu_score.beat_grid import BeatGridError, beat_unit_from_grid
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json"
 DEFAULT_OUTPUT = ROOT / "artifacts" / "review" / "high-accuracy-benchmark" / "latest.json"
@@ -272,6 +274,164 @@ def _read_time_points(path: Path | None, *, downbeats: bool = False) -> list[flo
     return values
 
 
+def _read_json_object(path: Path | None) -> Mapping[str, Any] | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _expected_time_signature(case: Mapping[str, Any]) -> str | None:
+    value = case.get("time_signature")
+    if isinstance(value, str) and value.strip():
+        return value
+    context = case.get("music_context_policy")
+    if isinstance(context, Mapping):
+        value = context.get("meter") or context.get("time_signature")
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def beat_unit_semantic_gate(
+    case: Mapping[str, Any],
+    beat_grid_path: Path | None,
+) -> dict[str, Any]:
+    """Check meter and pulse-unit semantics independently of timestamp F1."""
+
+    payload = _read_json_object(beat_grid_path)
+    if payload is None:
+        return {
+            "available": False,
+            "valid": None,
+            "expected_meter": _expected_time_signature(case),
+            "errors": ["predicted beat_grid artifact is unavailable"],
+            "warnings": [],
+        }
+    expected = _expected_time_signature(case)
+    grid = payload.get("beat_grid") if isinstance(payload.get("beat_grid"), Mapping) else payload
+    if not isinstance(grid, Mapping):
+        return {
+            "available": True,
+            "valid": False,
+            "expected_meter": expected,
+            "errors": ["predicted beat_grid payload is not an object"],
+            "warnings": [],
+        }
+    errors: list[str] = []
+    warnings: list[str] = []
+    raw_meter = grid.get("time_signature", "4/4")
+    if isinstance(raw_meter, Mapping):
+        selected_meter = raw_meter.get("selected", "4/4")
+    else:
+        selected_meter = raw_meter
+    try:
+        semantics = beat_unit_from_grid(
+            grid,
+            time_signature=str(selected_meter),
+            legacy_compat=True,
+        )
+        selected_meter = str(selected_meter)
+    except (BeatGridError, ValueError, TypeError) as exc:
+        return {
+            "available": True,
+            "valid": False,
+            "meter": None,
+            "expected_meter": expected,
+            "errors": [str(exc)],
+            "warnings": [],
+        }
+    if semantics.get("warning"):
+        warnings.append(str(semantics["warning"]))
+    if selected_meter == "6/8":
+        expected_positions = (
+            6
+            if semantics.get("beat_unit") == "eighth"
+            else 2
+            if semantics.get("beat_unit") == "dotted_quarter"
+            else None
+        )
+        state_positions = semantics.get("state_position_count")
+        if semantics.get("source") == "dbn_meter_state_definition":
+            if state_positions != expected_positions:
+                errors.append("DBN meter/state definition does not match the selected 6/8 pulse unit")
+        elif semantics.get("source") not in {"explicit_candidate_definition", "explicit_fixture_definition"}:
+            errors.append("6/8 beat unit source is not an explicit candidate/state definition")
+    if expected is not None:
+        try:
+            from backend.jianpu_score.domain import normalize_time_signature
+
+            expected_normalized = normalize_time_signature(expected)
+            selected_normalized = normalize_time_signature(selected_meter)
+        except ValueError as exc:
+            errors.append(f"expected time signature is invalid: {exc}")
+        else:
+            if expected_normalized != selected_normalized:
+                errors.append(
+                    f"selected meter {selected_normalized} does not match expected meter {expected_normalized}"
+                )
+            selected_meter = selected_normalized
+    mapping = grid.get("mapping") if isinstance(grid.get("mapping"), Mapping) else {}
+    raw_duration = grid.get("beat_duration_quarters", mapping.get("beat_duration_quarters"))
+    if raw_duration is not None:
+        try:
+            duration = float(raw_duration)
+            if not math.isfinite(duration):
+                raise ValueError("not finite")
+            if abs(duration - float(semantics["beat_duration_quarters"])) > 1e-9:
+                errors.append("beat_duration_quarters does not match explicit beat unit")
+        except (TypeError, ValueError):
+            errors.append("beat_duration_quarters must be a finite number")
+    raw_bar_duration = grid.get("bar_duration_quarters", mapping.get("bar_duration_quarters"))
+    if raw_bar_duration is not None:
+        try:
+            bar_duration = float(raw_bar_duration)
+            if not math.isfinite(bar_duration):
+                raise ValueError("not finite")
+            if abs(bar_duration - float(semantics["bar_duration_quarters"])) > 1e-9:
+                errors.append("bar_duration_quarters does not match meter and beat unit")
+        except (TypeError, ValueError):
+            errors.append("bar_duration_quarters must be a finite number")
+    bars = grid.get("bars")
+    if isinstance(bars, list):
+        for index, bar in enumerate(bars):
+            if not isinstance(bar, Mapping) or bar.get("duration_quarters") is None:
+                continue
+            try:
+                beat_count = int(bar.get("beat_count"))
+                duration = float(bar["duration_quarters"])
+                if not math.isfinite(duration):
+                    raise ValueError("not finite")
+            except (TypeError, ValueError):
+                errors.append(f"bars[{index}] has invalid quarter duration")
+                continue
+            expected_duration = beat_count * float(semantics["beat_duration_quarters"])
+            if abs(duration - expected_duration) > 1e-6:
+                errors.append(
+                    f"bars[{index}] duration {duration:g} does not equal "
+                    f"{beat_count} pulses × {semantics['beat_duration_quarters']:g} quarters"
+                )
+    if not semantics.get("proven"):
+        errors.append("beat unit is not proven by the beat_grid schema")
+    return {
+        "available": True,
+        "valid": not errors and bool(semantics.get("proven")),
+        "meter": selected_meter,
+        "expected_meter": expected,
+        "beat_unit": semantics.get("beat_unit"),
+        "beat_duration_quarters": semantics.get("beat_duration_quarters"),
+        "beats_per_bar": semantics.get("beats_per_bar"),
+        "bar_duration_quarters": semantics.get("bar_duration_quarters"),
+        "source": semantics.get("source"),
+        "proven": bool(semantics.get("proven")),
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
 def beat_f1(reference: Sequence[float], predicted: Sequence[float], *, tolerance_sec: float = 0.07) -> dict[str, Any]:
     used: set[int] = set()
     true_positive = 0
@@ -390,6 +550,7 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         "metrics": {"pitch_f1": None, "chord_retention": None, "rhythm_error": None, "beat_f1": None, "downbeat_f1": None},
         "beat_metrics_eligible": False,
         "beat_metrics_reason": None,
+        "beat_unit_semantic_gate": None,
         "notes": case.get("notes", ""),
     }
     if result_root is None:
@@ -414,6 +575,8 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         raw_model_output = raw_model_output if isinstance(raw_model_output, bool) else None
         effective_scope = _manifest_effective_scope(manifest, raw_model_output=raw_model_output)
         result["evaluation_scope"] = effective_scope
+        predicted_beat_path = _find_result_artifact(case_root, manifest, ("beat_grid.json",))
+        result["beat_unit_semantic_gate"] = beat_unit_semantic_gate(case, predicted_beat_path)
         if result["evaluation_policy"] != "reference_metrics" or not result["reference_midi_reliable"]:
             result.update({"status": "integrity_only", "reason": "此样本没有可用于准确率结论的可靠参考标注"})
             return result
@@ -458,7 +621,6 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         elif case.get("beat_annotation_independent") is not True:
             result["beat_metrics_reason"] = "case does not declare an independent beat annotation"
         if beat_eligible:
-            predicted_beat_path = _find_result_artifact(case_root, manifest, ("beat_grid.json",))
             result["metrics"]["beat_f1"] = beat_f1(_read_time_points(beat_path), _read_time_points(predicted_beat_path))
             result["metrics"]["downbeat_f1"] = beat_f1(_read_time_points(beat_path, downbeats=True), _read_time_points(predicted_beat_path, downbeats=True))
     except Exception as exc:  # benchmark must record a crash instead of hiding it
@@ -603,6 +765,20 @@ def assess_accuracy_claim(
         and _metric_f1(case, "downbeat_f1", "f1") is not None
         for case in reliable
     )
+    semantic_gate_cases = [
+        case
+        for case in reliable
+        if isinstance(case.get("beat_unit_semantic_gate"), Mapping)
+    ]
+    semantic_gate_failures = [
+        str(case.get("id"))
+        for case in semantic_gate_cases
+        if case["beat_unit_semantic_gate"].get("valid") is not True
+    ]
+    if semantic_gate_failures:
+        reasons.append(
+            "拍号/拍单位语义 gate 未通过：" + ", ".join(semantic_gate_failures)
+        )
     if require_beat_metrics:
         if minimum_beat_cases is not None and beat_case_count < minimum_beat_cases:
             reasons.append(f"独立 BeatNet 拍点/重拍指标只有 {beat_case_count}/{minimum_beat_cases} 个 case")
@@ -639,6 +815,8 @@ def assess_accuracy_claim(
         "require_beat_metrics": require_beat_metrics,
         "minimum_beat_cases": minimum_beat_cases,
         "beat_cases_with_metrics": beat_case_count,
+        "beat_unit_semantic_cases": len(semantic_gate_cases),
+        "beat_unit_semantic_failures": semantic_gate_failures,
         "new_reliable_count": len(reliable),
         "baseline_reliable_count": len(baseline_reliable),
         "new_reliable_total": len(new_by_id),

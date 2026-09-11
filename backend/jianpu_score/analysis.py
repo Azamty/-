@@ -245,6 +245,7 @@ def analyze_audio(
     bpm_override: float | None = None,
     key_override: str | None = None,
     time_signature_override: str | None = None,
+    beat_unit_definition: str | None = None,
     source_onsets: Mapping[str, Sequence[float]] | Sequence[float] | None = None,
     sample_rate: int = 22050,
 ) -> tuple[np.ndarray, MusicAnalysis]:
@@ -261,6 +262,7 @@ def analyze_audio(
         duration_sec=max(len(samples) / actual_rate, 1e-6),
         bpm_override=bpm_override,
         time_signature_override=time_signature_override,
+        beat_unit_definition=beat_unit_definition,
         source_onsets=source_onsets,
     )
     bpm = float(beat_grid["tempo"]["selected_bpm"])
@@ -300,6 +302,8 @@ def analyze_audio(
             "key_candidates": key_candidates,
             "time_signature_source": time_signature_source,
             "time_signature_candidates": meter_candidates,
+            "beat_unit_definition": beat_grid.get("beat_unit_definition"),
+            "beat_duration_quarters": beat_grid.get("beat_duration_quarters"),
             "manual_bpm_override": bpm_override is not None,
             "manual_time_signature_override": time_signature_override is not None,
         },

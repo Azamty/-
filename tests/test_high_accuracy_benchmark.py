@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import mido
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("high_accuracy_benchmark", ROOT / "scripts" / "high_accuracy_benchmark.py")
@@ -292,6 +293,85 @@ def test_downbeat_reader_does_not_treat_unmarked_beats_as_downbeats(tmp_path: Pa
     explicit = tmp_path / "explicit.json"
     explicit.write_text(json.dumps({"downbeats": [{"time_sec": 0.0}, {"time_sec": 2.0}]}), encoding="utf-8")
     assert benchmark._read_time_points(explicit, downbeats=True) == [0.0, 2.0]
+
+
+@pytest.mark.parametrize(
+    ("unit", "duration", "positions"),
+    [("eighth", 0.5, 6), ("dotted_quarter", 1.5, 2)],
+)
+def test_beat_unit_semantic_gate_accepts_explicit_six_eight_state(
+    tmp_path: Path,
+    unit: str,
+    duration: float,
+    positions: int,
+) -> None:
+    path = tmp_path / f"{unit}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.1",
+                "time_signature": {"selected": "6/8"},
+                "beat_unit_definition": unit,
+                "beat_unit_source": "dbn_meter_state_definition",
+                "beat_unit_proven": True,
+                "beat_duration_quarters": duration,
+                "beats_per_bar": positions,
+                "bar_duration_quarters": 3.0,
+                "dbn_position_count": positions,
+                "bars": [{"beat_count": positions, "duration_quarters": 3.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    gate = benchmark.beat_unit_semantic_gate(
+        {"music_context_policy": {"meter": "6/8"}},
+        path,
+    )
+    assert gate["valid"] is True
+    assert gate["errors"] == []
+
+
+def test_beat_unit_semantic_gate_rejects_legacy_six_eight_and_three_four_misreport(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "time_signature": {"selected": "6/8"},
+                "beats": [{"time_sec": 0.0, "downbeat": True}, {"time_sec": 0.5}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    gate = benchmark.beat_unit_semantic_gate(
+        {"music_context_policy": {"meter": "6/8"}},
+        legacy,
+    )
+    assert gate["valid"] is False
+    assert any("not proven" in error for error in gate["errors"])
+
+    misreported = tmp_path / "misreported.json"
+    misreported.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.1",
+                "time_signature": {"selected": "3/4"},
+                "beat_unit_definition": "quarter",
+                "beat_unit_source": "standard_meter_definition",
+                "beat_unit_proven": True,
+                "beat_duration_quarters": 1.0,
+                "beats_per_bar": 3,
+                "bar_duration_quarters": 3.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    mismatch = benchmark.beat_unit_semantic_gate(
+        {"music_context_policy": {"meter": "6/8"}},
+        misreported,
+    )
+    assert mismatch["valid"] is False
+    assert any("does not match expected meter" in error for error in mismatch["errors"])
 
 
 def test_evaluator_never_scans_neighbor_pipeline_artifacts(tmp_path: Path) -> None:

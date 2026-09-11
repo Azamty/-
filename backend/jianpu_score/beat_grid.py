@@ -25,10 +25,176 @@ METER_BEAT_COUNTS = {"2/4": 2, "3/4": 3, "4/4": 4, "6/8": 6}
 CONFIDENCE_WARNING_THRESHOLD = 0.65
 TEMPO_FACTORS = (0.5, 1.0, 2.0)
 ONSET_WEIGHTS = {"drums": 1.5, "bass": 1.25, "full_track": 1.0, "all": 1.0}
+BEAT_UNIT_SCHEMA_VERSION = "1.0"
+
+# A BeatNet row is a pulse observation.  Its numeric index is not, by itself,
+# a duration in quarter notes.  Simple meters have an unambiguous quarter-note
+# pulse here.  Compound 6/8 needs an explicit caller definition because the
+# same notation can be tracked as six eighth-note pulses or two dotted-quarter
+# pulses.
+BEAT_UNIT_ALIASES = {
+    "quarter": "quarter",
+    "quarter_note": "quarter",
+    "quarter-pulse": "quarter",
+    "quarter_pulse": "quarter",
+    "eighth": "eighth",
+    "eighth_note": "eighth",
+    "eighth-pulse": "eighth",
+    "eighth_pulse": "eighth",
+    "six_eighth_pulses": "eighth",
+    "dotted_quarter": "dotted_quarter",
+    "dotted-quarter": "dotted_quarter",
+    "dotted_quarter_note": "dotted_quarter",
+    "dotted_quarter_pulse": "dotted_quarter",
+    "two_dotted_quarter_pulses": "dotted_quarter",
+}
 
 
 class BeatGridError(ValueError):
     """Raised when a BeatNet result cannot form a valid beat grid."""
+
+
+def _normalize_beat_unit_name(value: Any, *, label: str = "beat unit") -> str:
+    if not isinstance(value, str):
+        raise BeatGridError(f"{label} must be one of quarter, eighth, dotted_quarter")
+    normalized = value.strip().casefold().replace(" ", "_")
+    try:
+        return BEAT_UNIT_ALIASES[normalized]
+    except KeyError as exc:
+        raise BeatGridError(
+            f"{label} must be one of quarter, eighth, dotted_quarter"
+        ) from exc
+
+
+def resolve_beat_unit(
+    time_signature: str,
+    beat_unit_definition: str | None = None,
+    *,
+    legacy_compat: bool = False,
+) -> dict[str, Any]:
+    """Resolve a beat row's explicit duration in score quarter notes.
+
+    The resolver never uses an observed interval to choose a compound pulse.
+    For 6/8, callers must declare either six eighth-note pulses or two
+    dotted-quarter pulses.  ``legacy_compat`` is reserved for reading an old
+    grid that had no unit field; it preserves its historical quarter-index
+    mapping and marks the result as unproven so an evaluator can fail closed.
+    """
+
+    meter = normalize_time_signature(time_signature)
+    if meter != "6/8":
+        if beat_unit_definition is not None and _normalize_beat_unit_name(beat_unit_definition) != "quarter":
+            raise BeatGridError(f"{meter} requires a quarter-note beat unit")
+        beats_per_bar = METER_BEAT_COUNTS[meter]
+        return {
+            "schema_version": BEAT_UNIT_SCHEMA_VERSION,
+            "beat_unit": "quarter",
+            "beat_duration_quarters": 1.0,
+            "beats_per_bar": beats_per_bar,
+            "bar_duration_quarters": float(beats_per_bar),
+            "source": "standard_meter_definition",
+            "proven": True,
+            "legacy_default_applied": False,
+            "pulse_definition": "quarter_note_pulse",
+        }
+
+    if beat_unit_definition is None:
+        if not legacy_compat:
+            raise BeatGridError(
+                "6/8 beat unit is not provable; explicitly declare "
+                "eighth_pulse or dotted_quarter_pulse"
+            )
+        # Old beat_grid payloads treated every row as one quarter-note index.
+        # Keep that mapping readable for old artifacts, but make its semantic
+        # status explicit so it cannot pass a new meter/unit gate.
+        return {
+            "schema_version": BEAT_UNIT_SCHEMA_VERSION,
+            "beat_unit": "legacy_quarter_index",
+            "beat_duration_quarters": 1.0,
+            "beats_per_bar": METER_BEAT_COUNTS["6/8"],
+            "bar_duration_quarters": float(METER_BEAT_COUNTS["6/8"]),
+            "source": "legacy_schema_default",
+            "proven": False,
+            "legacy_default_applied": True,
+            "pulse_definition": None,
+            "warning": "旧 beat_grid 未声明 6/8 脉冲单位，保留历史四分拍索引；无法作为语义正确的 6/8 通过验收",
+        }
+
+    unit = _normalize_beat_unit_name(beat_unit_definition)
+    if unit == "eighth":
+        return {
+            "schema_version": BEAT_UNIT_SCHEMA_VERSION,
+            "beat_unit": "eighth",
+            "beat_duration_quarters": 0.5,
+            "beats_per_bar": 6,
+            "bar_duration_quarters": 3.0,
+            "source": "explicit_candidate_definition",
+            "proven": True,
+            "legacy_default_applied": False,
+            "pulse_definition": "six_eighth_pulses",
+        }
+    if unit == "dotted_quarter":
+        return {
+            "schema_version": BEAT_UNIT_SCHEMA_VERSION,
+            "beat_unit": "dotted_quarter",
+            "beat_duration_quarters": 1.5,
+            "beats_per_bar": 2,
+            "bar_duration_quarters": 3.0,
+            "source": "explicit_candidate_definition",
+            "proven": True,
+            "legacy_default_applied": False,
+            "pulse_definition": "two_dotted_quarter_pulses",
+        }
+    raise BeatGridError(
+        "6/8 beat unit must be eighth_pulse or dotted_quarter_pulse"
+    )
+
+
+def beat_unit_from_grid(
+    grid: Mapping[str, Any],
+    *,
+    time_signature: str | None = None,
+    legacy_compat: bool = True,
+) -> dict[str, Any]:
+    """Read beat-unit semantics from a grid, with an auditable old-grid path."""
+
+    if not isinstance(grid, Mapping):
+        raise BeatGridError("beat_grid must be an object")
+    raw_meter = time_signature
+    if raw_meter is None:
+        raw_meter = grid.get("time_signature", "4/4")
+        if isinstance(raw_meter, Mapping):
+            raw_meter = raw_meter.get("selected", "4/4")
+    meter = normalize_time_signature(str(raw_meter))
+    mapping = grid.get("mapping")
+    mapping = mapping if isinstance(mapping, Mapping) else {}
+    raw_unit = grid.get("beat_unit_definition", grid.get("beat_unit"))
+    if raw_unit is None:
+        raw_unit = mapping.get("beat_unit_definition", mapping.get("beat_unit"))
+    if raw_unit is None:
+        return resolve_beat_unit(meter, legacy_compat=legacy_compat)
+    resolved = resolve_beat_unit(meter, str(raw_unit), legacy_compat=False)
+    raw_duration = grid.get("beat_duration_quarters", mapping.get("beat_duration_quarters"))
+    if raw_duration is not None:
+        duration = _finite_float(raw_duration, label="beat_duration_quarters")
+        if abs(duration - float(resolved["beat_duration_quarters"])) > 1e-9:
+            raise BeatGridError(
+                "beat_grid beat_duration_quarters conflicts with its explicit beat unit"
+            )
+    raw_source = grid.get("beat_unit_source")
+    if raw_source is None:
+        raw_source = mapping.get("beat_unit_source")
+    if raw_source is not None:
+        resolved = {**resolved, "source": str(raw_source)}
+    raw_state_count = grid.get("dbn_position_count")
+    if raw_state_count is None:
+        raw_state_count = mapping.get("dbn_position_count")
+    if raw_state_count is not None:
+        try:
+            resolved = {**resolved, "state_position_count": int(raw_state_count)}
+        except (TypeError, ValueError) as exc:
+            raise BeatGridError("dbn_position_count must be an integer") from exc
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -116,6 +282,76 @@ def _coefficient_of_variation(values: Sequence[float]) -> float:
     return math.sqrt(sum((value - centre) ** 2 for value in values) / len(values)) / centre
 
 
+def _dbn_meter_state_definition(
+    observations: Sequence[BeatObservation],
+) -> dict[str, Any] | None:
+    """Return a compound pulse definition only from DBN position state.
+
+    BeatNet's state labels are the auditable source of pulse cardinality.  A
+    wall-clock interval is intentionally never consulted here: six positions
+    mean six eighth pulses, while two positions mean two dotted-quarter
+    pulses.  Other state shapes cannot prove a 6/8 pulse unit.
+    """
+
+    runs: list[list[int]] = []
+    current: list[int] = []
+    previous: int | None = None
+    for item in observations:
+        number = item.beat_number
+        # A missing DBN state cannot be treated as an invisible interior gap.
+        # The pulse unit is only proven when every observed state participates
+        # in one of the auditable boundary or complete runs below.
+        if number is None:
+            return None
+        if current and (item.downbeat or number == 1 or (previous is not None and number <= previous)):
+            runs.append(current)
+            current = []
+        current.append(number)
+        previous = number
+    if current:
+        runs.append(current)
+    if not runs:
+        return None
+
+    def is_complete(run: list[int], expected: list[int]) -> bool:
+        return run == expected
+
+    def is_suffix(run: list[int], expected: list[int]) -> bool:
+        return bool(run) and len(run) <= len(expected) and run == expected[-len(run) :]
+
+    def is_prefix(run: list[int], expected: list[int]) -> bool:
+        return bool(run) and len(run) <= len(expected) and run == expected[: len(run)]
+
+    def supports(expected: list[int]) -> bool:
+        # A sole run has no boundary context: it must itself be a complete
+        # cycle.  With multiple runs, only the first and last may be partial;
+        # every interior run must be complete.  Requiring a complete run also
+        # prevents two compatible-looking boundary fragments from proving a
+        # pulse unit on their own.
+        if len(runs) == 1:
+            return is_complete(runs[0], expected)
+        return (
+            any(is_complete(run, expected) for run in runs)
+            and (is_complete(runs[0], expected) or is_suffix(runs[0], expected))
+            and (is_complete(runs[-1], expected) or is_prefix(runs[-1], expected))
+            and all(is_complete(run, expected) for run in runs[1:-1])
+        )
+
+    definitions = (
+        (list(range(1, 7)), "eighth_pulse", "eighth", 6),
+        ([1, 2], "dotted_quarter_pulse", "dotted_quarter", 2),
+    )
+    for expected, definition, unit, position_count in definitions:
+        if supports(expected):
+            return {
+                "beat_unit_definition": definition,
+                "beat_unit": unit,
+                "position_count": position_count,
+                "source": "dbn_meter_state_definition",
+            }
+    return None
+
+
 def infer_time_signature(
     observations: Sequence[BeatObservation],
     *,
@@ -130,6 +366,7 @@ def infer_time_signature(
     and the confidence is reduced.
     """
 
+    state_definition = _dbn_meter_state_definition(observations)
     if meter_hint is not None:
         selected = normalize_time_signature(meter_hint)
         return {
@@ -137,10 +374,43 @@ def infer_time_signature(
             "confidence": 1.0,
             "source": "manual",
             "candidates": [
-                {"value": value, "score": 1.0 if value == selected else 0.0}
+                {
+                    "value": value,
+                    "score": 1.0 if value == selected else 0.0,
+                    "beat_unit_definitions": (
+                        ["eighth_pulse", "dotted_quarter_pulse"]
+                        if value == "6/8"
+                        else ["quarter_pulse"]
+                    ),
+                    "dbn_position_count": (
+                        state_definition["position_count"]
+                        if value == "6/8" and state_definition
+                        else None
+                    ),
+                    "beat_unit_definition": (
+                        state_definition["beat_unit_definition"]
+                        if value == "6/8" and state_definition
+                        else None
+                    ),
+                }
                 for value in TIME_SIGNATURE_CANDIDATES
             ],
             "warning": None,
+            "beat_unit_definition": (
+                state_definition["beat_unit_definition"]
+                if selected == "6/8" and state_definition
+                else None
+            ),
+            "beat_unit_source": (
+                state_definition["source"]
+                if selected == "6/8" and state_definition
+                else None
+            ),
+            "dbn_position_count": (
+                state_definition["position_count"]
+                if selected == "6/8" and state_definition
+                else None
+            ),
         }
 
     times = tuple(item.time_sec for item in observations)
@@ -229,10 +499,43 @@ def infer_time_signature(
         "confidence": round(confidence, 4),
         "source": "beatnet_derived",
         "candidates": [
-            {"value": value, "score": round(scores[value], 4)}
+            {
+                "value": value,
+                "score": round(scores[value], 4),
+                "beat_unit_definitions": (
+                    ["eighth_pulse", "dotted_quarter_pulse"]
+                    if value == "6/8"
+                    else ["quarter_pulse"]
+                ),
+                "dbn_position_count": (
+                    state_definition["position_count"]
+                    if value == "6/8" and state_definition
+                    else None
+                ),
+                "beat_unit_definition": (
+                    state_definition["beat_unit_definition"]
+                    if value == "6/8" and state_definition
+                    else None
+                ),
+            }
             for value in TIME_SIGNATURE_CANDIDATES
         ],
         "warning": warning,
+        "beat_unit_definition": (
+            state_definition["beat_unit_definition"]
+            if selected == "6/8" and state_definition
+            else None
+        ),
+        "beat_unit_source": (
+            state_definition["source"]
+            if selected == "6/8" and state_definition
+            else None
+        ),
+        "dbn_position_count": (
+            state_definition["position_count"]
+            if selected == "6/8" and state_definition
+            else None
+        ),
     }
 
 
@@ -359,23 +662,30 @@ def choose_tempo_candidate(
     source_onsets: Mapping[str, Sequence[float]] | Sequence[float] | None = None,
     time_signature: str = "4/4",
     manual_bpm: float | None = None,
+    beat_duration_quarters: float = 1.0,
+    beats_per_bar: int | None = None,
 ) -> dict[str, Any]:
     """Rank half/original/double tempo interpretations from onset evidence."""
 
     source = _as_times(beat_times)
     normalized_meter = normalize_time_signature(time_signature)
-    beats_per_bar = METER_BEAT_COUNTS[normalized_meter]
+    duration_quarters = _finite_float(beat_duration_quarters, label="beat_duration_quarters")
+    if duration_quarters <= 0:
+        raise BeatGridError("beat_duration_quarters must be greater than zero")
+    resolved_beats_per_bar = int(beats_per_bar if beats_per_bar is not None else METER_BEAT_COUNTS[normalized_meter])
+    if resolved_beats_per_bar <= 0:
+        raise BeatGridError("beats_per_bar must be greater than zero")
     evidence = _onset_evidence(source_onsets)
     strong_octave_evidence = any(source in {"drums", "bass"} and values for source, values in evidence)
     intervals = _intervals(source)
-    detected_bpm = 60.0 / float(median(intervals))
+    detected_bpm = 60.0 * duration_quarters / float(median(intervals))
     candidates: list[dict[str, Any]] = []
     for factor in TEMPO_FACTORS:
         candidate_grid = _candidate_times(source, factor)
         score, onset_error, stability, precision, coverage = _score_candidate(
             candidate_grid,
             evidence,
-            beats_per_bar=beats_per_bar,
+            beats_per_bar=resolved_beats_per_bar,
             factor=factor,
             strong_octave_evidence=strong_octave_evidence,
         )
@@ -385,6 +695,9 @@ def choose_tempo_candidate(
                 "label": label,
                 "factor": factor,
                 "bpm": round(detected_bpm * factor, 4),
+                "beat_duration_quarters": duration_quarters,
+                "beats_per_bar": resolved_beats_per_bar,
+                "bar_duration_quarters": round(duration_quarters * resolved_beats_per_bar, 9),
                 "score": round(score, 6),
                 "onset_error": round(onset_error, 6),
                 "bar_stability": round(stability, 6),
@@ -432,6 +745,9 @@ def choose_tempo_candidate(
         "selected_factor": selected["factor"],
         "manual_bpm": manual_bpm,
         "manual_scale": round(manual_scale, 8),
+        "beat_duration_quarters": duration_quarters,
+        "beats_per_bar": resolved_beats_per_bar,
+        "bar_duration_quarters": round(duration_quarters * resolved_beats_per_bar, 9),
         "selection_reason": selection_reason,
         "candidates": candidates,
         "evidence_sources": [source for source, values in evidence if values],
@@ -443,6 +759,8 @@ def _bar_records(
     downbeats: Sequence[bool],
     *,
     beats_per_bar: int,
+    beat_duration_quarters: float = 1.0,
+    beat_scale: float = 1.0,
 ) -> list[dict[str, Any]]:
     starts = [index for index, is_downbeat in enumerate(downbeats) if is_downbeat]
     if not starts or starts[0] != 0:
@@ -455,7 +773,11 @@ def _bar_records(
         if end_index <= start_index:
             continue
         local = _intervals(beat_times[start_index : min(len(beat_times), end_index + 1)])
-        local_bpm = 60.0 / float(median(local)) if local else 0.0
+        local_bpm = (
+            60.0 * beat_duration_quarters * beat_scale / float(median(local))
+            if local
+            else 0.0
+        )
         bars.append(
             {
                 "index": bar_index,
@@ -464,6 +786,13 @@ def _bar_records(
                 "start_sec": round(beat_times[start_index], 9),
                 "end_sec": round(beat_times[min(end_index, len(beat_times) - 1)], 9),
                 "beat_count": end_index - start_index,
+                "beat_duration_quarters": beat_duration_quarters,
+                "duration_quarters": round(
+                    (end_index - start_index) * beat_duration_quarters * beat_scale,
+                    9,
+                ),
+                "start_quarter": round(start_index * beat_duration_quarters * beat_scale, 9),
+                "end_quarter": round(end_index * beat_duration_quarters * beat_scale, 9),
                 "local_bpm": round(local_bpm, 4),
                 "stable": _coefficient_of_variation(local) <= 0.12 if local else False,
             }
@@ -480,6 +809,7 @@ def build_beat_grid(
     manual_time_signature: str | None = None,
     source_onsets: Mapping[str, Sequence[float]] | Sequence[float] | None = None,
     independent_accent_times: Sequence[float] | None = None,
+    beat_unit_definition: str | None = None,
     engine: str = "beatnet",
 ) -> dict[str, Any]:
     """Build the durable ``beat_grid.json`` representation."""
@@ -490,11 +820,33 @@ def build_beat_grid(
         meter_hint=manual_time_signature or meter_hint,
         independent_accent_times=independent_accent_times,
     )
+    selected_meter = normalize_time_signature(manual_time_signature or meter["selected"])
+    # A newly built 6/8 grid must carry a pulse definition from the DBN meter
+    # state (or an explicit fixture/candidate declaration).  Old persisted
+    # grids are handled by beat_unit_from_grid(legacy_compat=True) when they
+    # are read by downstream consumers.
+    derived_definition = meter.get("beat_unit_definition")
+    selected_definition = beat_unit_definition or (
+        str(derived_definition) if selected_meter == "6/8" and derived_definition else None
+    )
+    beat_unit = resolve_beat_unit(
+        selected_meter,
+        selected_definition,
+        legacy_compat=False,
+    )
+    if beat_unit_definition is None and selected_definition is not None and selected_meter == "6/8":
+        beat_unit = {
+            **beat_unit,
+            "source": str(meter.get("beat_unit_source") or "dbn_meter_state_definition"),
+            "state_position_count": meter.get("dbn_position_count"),
+        }
     tempo = choose_tempo_candidate(
         tuple(item.time_sec for item in normalized),
         source_onsets=source_onsets,
-        time_signature=str(manual_time_signature or meter["selected"]),
+        time_signature=selected_meter,
         manual_bpm=manual_bpm,
+        beat_duration_quarters=float(beat_unit["beat_duration_quarters"]),
+        beats_per_bar=int(beat_unit["beats_per_bar"]),
     )
     selected_factor = float(tempo["selected_factor"])
     selected_times = tuple(float(value) for value in next(item for item in tempo["candidates"] if item["selected"])["beat_times"])
@@ -517,9 +869,14 @@ def build_beat_grid(
         for item in normalized:
             selected_numbers.extend((item.beat_number, None))
         selected_numbers = selected_numbers[: len(selected_times)]
-    selected_meter = normalize_time_signature(manual_time_signature or meter["selected"])
-    beats_per_bar = METER_BEAT_COUNTS[selected_meter]
-    bars = _bar_records(selected_times, selected_downbeats, beats_per_bar=beats_per_bar)
+    beats_per_bar = int(beat_unit["beats_per_bar"])
+    bars = _bar_records(
+        selected_times,
+        selected_downbeats,
+        beats_per_bar=beats_per_bar,
+        beat_duration_quarters=float(beat_unit["beat_duration_quarters"]),
+        beat_scale=float(tempo["manual_scale"]),
+    )
     downbeat_starts = [index for index, is_downbeat in enumerate(selected_downbeats) if is_downbeat]
     if not downbeat_starts or downbeat_starts[0] != 0:
         downbeat_starts = [0, *downbeat_starts]
@@ -551,11 +908,27 @@ def build_beat_grid(
                 "beat_number": int(beat_number) if beat_number is not None else index % beats_per_bar + 1,
                 "downbeat": bool(selected_downbeats[index]) if index < len(selected_downbeats) else index % beats_per_bar == 0,
                 "bar_index": current_bar,
-                "local_bpm": round(60.0 / interval, 4) if interval > 0 else 0.0,
+                "beat_duration_quarters": beat_unit["beat_duration_quarters"],
+                "quarter_position": round(
+                    index
+                    * float(beat_unit["beat_duration_quarters"])
+                    * float(tempo["manual_scale"]),
+                    9,
+                ),
+                "local_bpm": round(
+                    60.0
+                    * float(beat_unit["beat_duration_quarters"])
+                    * float(tempo["manual_scale"])
+                    / interval,
+                    4,
+                )
+                if interval > 0
+                else 0.0,
             }
         )
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
+        "beat_unit_schema_version": BEAT_UNIT_SCHEMA_VERSION,
         "engine": engine,
         "mode": BEATNET_MODE,
         "inference": BEATNET_INFERENCE,
@@ -567,12 +940,31 @@ def build_beat_grid(
             "source": "manual" if manual_time_signature else meter["source"],
             "confidence_source": "manual_override" if manual_time_signature else "derived_from_downbeat_periodicity_and_compound_accent",
         },
+        "beat_unit_definition": beat_unit["beat_unit"],
+        "beat_unit": beat_unit["beat_unit"],
+        "beat_duration_quarters": beat_unit["beat_duration_quarters"],
+        "beats_per_bar": beat_unit["beats_per_bar"],
+        "bar_duration_quarters": beat_unit["bar_duration_quarters"],
+        "beat_unit_source": beat_unit["source"],
+        "beat_unit_proven": beat_unit["proven"],
+        "dbn_position_count": beat_unit.get("state_position_count"),
+        "beat_unit_semantics": dict(beat_unit),
         "tempo": tempo,
         "duration_sec": duration,
         "mapping": {
             "beat_times": list(selected_times),
             "seconds_to_beat": "piecewise_linear_with_linear_extrapolation",
+            "seconds_to_quarter": "beat_index_times_beat_duration_quarters",
+            "position_unit": "quarter_note",
             "manual_bpm_scale": tempo["manual_scale"],
+            "beat_unit_definition": beat_unit["beat_unit"],
+            "beat_unit": beat_unit["beat_unit"],
+            "beat_duration_quarters": beat_unit["beat_duration_quarters"],
+            "beats_per_bar": beat_unit["beats_per_bar"],
+            "bar_duration_quarters": beat_unit["bar_duration_quarters"],
+            "beat_unit_source": beat_unit["source"],
+            "beat_unit_proven": beat_unit["proven"],
+            "dbn_position_count": beat_unit.get("state_position_count"),
             "first_beat_sec": selected_times[0],
             "score_origin": {
                 "strategy": "first_downbeat" if first_downbeat_index is not None else "first_beat_fallback",
@@ -599,14 +991,23 @@ def seconds_to_beat(
     beat_times: Sequence[float],
     *,
     scale: float = 1.0,
+    beat_duration_quarters: float = 1.0,
 ) -> float:
-    """Map seconds to a fractional beat index using interpolation/extrapolation."""
+    """Map seconds to a beat position measured in score quarter notes.
+
+    The default duration of one quarter preserves the historical fractional
+    beat-index API.  Compound grids pass their explicit pulse duration so a
+    six-eighth-pulse bar occupies three, rather than six, score quarters.
+    """
 
     value = _finite_float(seconds, label="seconds")
     times = _as_times(beat_times)
     scale_value = _finite_float(scale, label="beat scale")
     if scale_value <= 0:
         raise BeatGridError("beat scale must be greater than zero")
+    duration_value = _finite_float(beat_duration_quarters, label="beat_duration_quarters")
+    if duration_value <= 0:
+        raise BeatGridError("beat_duration_quarters must be greater than zero")
     if value <= times[0]:
         interval = times[1] - times[0]
         position = (value - times[0]) / interval
@@ -619,7 +1020,7 @@ def seconds_to_beat(
             right += 1
         left = right - 1
         position = left + (value - times[left]) / (times[right] - times[left])
-    return position * scale_value
+    return position * scale_value * duration_value
 
 
 def map_note_seconds(
@@ -628,6 +1029,7 @@ def map_note_seconds(
     beat_times: Sequence[float],
     *,
     scale: float = 1.0,
+    beat_duration_quarters: float = 1.0,
 ) -> tuple[float, float]:
     """Map a note interval and reject inverted or zero-length source notes."""
 
@@ -635,8 +1037,18 @@ def map_note_seconds(
     end = _finite_float(end_sec, label="note end_sec")
     if end <= start:
         raise BeatGridError("note end_sec must be greater than start_sec")
-    mapped_start = seconds_to_beat(start, beat_times, scale=scale)
-    mapped_end = seconds_to_beat(end, beat_times, scale=scale)
+    mapped_start = seconds_to_beat(
+        start,
+        beat_times,
+        scale=scale,
+        beat_duration_quarters=beat_duration_quarters,
+    )
+    mapped_end = seconds_to_beat(
+        end,
+        beat_times,
+        scale=scale,
+        beat_duration_quarters=beat_duration_quarters,
+    )
     if mapped_end <= mapped_start:
         raise BeatGridError("mapped note interval is not increasing")
     return mapped_start, mapped_end
