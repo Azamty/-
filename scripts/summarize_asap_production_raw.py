@@ -2,8 +2,10 @@
 
 This is an offline report writer.  It reads only the runner manifests and
 production raw outputs; the ASAP reference MIDI and beat annotations are
-never opened.  That distinction is deliberate: the report verifies that the
-model run used the original audio and original-mix BeatNet route.
+never opened.  The registry WAV inputs were created by the pinned local
+FluidSynth renderer from official ASAP performance MIDI.  That distinction is
+deliberate: the report verifies that recognition used the registry WAV and the
+original-mix BeatNet route.
 """
 
 from __future__ import annotations
@@ -269,7 +271,7 @@ def summarize(
         "result_root": _relative(result_root, repo_root),
         "case_ids": requested,
         "source_policy": {
-            "audio": "original ASAP v1.1 clipped performance audio",
+            "audio": "local pinned FluidSynth render of official ASAP performance MIDI; recognition input is the registry WAV",
             "instrumental_route": "MuScriptor 1.2 on original mix; BeatNet offline/DBN on original mix",
             "reference_isolation": False,
             "reference_midi_or_beat_annotation_read_by_recognizer": False,
@@ -326,7 +328,7 @@ def write_reports(summary: Mapping[str, Any], result_root: str | Path) -> tuple[
         f"- Total pitched events: {summary['counts']['pitched_events']}",
         f"- Recognizer fingerprints: {', '.join(summary['recognizer']['fingerprints']) or 'none'}",
         "",
-        "The recognizer consumed the original ASAP audio clips. Reference MIDI and beat annotations were not read by the recognizer; no reference-isolation, baseline, or new score pipeline was run.",
+        "The recognizer consumed the registry WAV inputs, which come from the local pinned FluidSynth render of official ASAP performance MIDI. Reference MIDI and beat annotations were not read by the recognizer; no reference-isolation, baseline, or new score pipeline was run.",
         "",
         "| Case | Status | Pitched events | Beats | Downbeats | Input SHA | Route | Errors |",
         "| --- | --- | ---: | ---: | ---: | --- | --- | --- |",

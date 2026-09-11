@@ -99,7 +99,9 @@ def test_summary_accepts_raw_only_production_route_and_writes_manifest(tmp_path:
     }
     assert summary["cases"][0]["input"]["sha256_match"] is True
     assert summary["cases"][0]["reference_annotation_used"] is False
+    assert summary["source_policy"]["audio"] == "local pinned FluidSynth render of official ASAP performance MIDI; recognition input is the registry WAV"
     assert all(path.is_file() for path in paths)
+    assert "local pinned FluidSynth render of official ASAP performance MIDI" in paths[1].read_text(encoding="utf-8")
     manifest = json.loads(paths[2].read_text(encoding="utf-8"))
     assert not any(item["path"] == "artifact_manifest.json" for item in manifest["artifacts"])
     assert any(item["path"] == "summary.json" for item in manifest["artifacts"])
