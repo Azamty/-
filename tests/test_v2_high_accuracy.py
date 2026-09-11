@@ -432,6 +432,49 @@ def test_instrumental_partial_failure_keeps_success_and_records_stage(monkeypatc
     assert any(item["artifact_id"].startswith(f"v2-selection-r1-{ids[1]}-") for item in result["artifacts"])
 
 
+def test_main_melody_is_attempted_from_selected_tracks_when_one_part_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path, two_tracks=True)
+    FakeHighAccuracyService.failures = {ids[0]}
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
+
+    manager.select_v2(job_id, ids, merge_main_melody=True)
+    manager._run_job(job_id)
+
+    result = manager._read(job_id)
+    assert result["status"] == "completed"
+    assert result["v2"]["score_refusal"] is None
+    assert any(item["track_id"] == ids[0] for item in result["v2"]["track_failures"])
+    assert result["summary"]["main_melody_score_artifact_ids"]
+    assert any(item["kind"] == "main_melody_selection" for item in result["artifacts"])
+    assert any(call["instrument_id"] == "main-melody" for call in FakeHighAccuracyService.calls)
+
+
+def test_all_parts_and_main_melody_failure_remains_explicit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path)
+    FakeHighAccuracyService.failures = {ids[0], "main-melody"}
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
+
+    manager.select_v2(job_id, ids, merge_main_melody=True)
+    manager._run_job(job_id)
+
+    result = manager._read(job_id)
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "high_accuracy_all_tracks_failed"
+    assert result["v2"]["score_refusal"]["code"] == "all_pitched_tracks_failed"
+    assert {item["track_id"] for item in result["v2"]["track_failures"]} >= {ids[0], "main-melody"}
+    assert any(item["kind"] == "main_melody_selection" for item in result["artifacts"])
+
+
 def test_instrumental_all_pitched_failure_is_explicit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     FakeHighAccuracyService.calls = []
     FakeHighAccuracyService.failures = set()

@@ -69,10 +69,26 @@ def test_repeated_same_pitch_reonsets_are_retained() -> None:
     assert result.audit["transitions"][0]["same_pitch"] is True
 
 
+def test_a_real_downward_leap_can_continue_in_the_lower_register() -> None:
+    events = [
+        _note(0.0, 0.35, 82, stem="lead"),
+        _note(0.35, 0.70, 68, stem="lead"),
+        _note(0.70, 1.05, 66, stem="lead"),
+        _note(0.0, 2.0, 36, stem="bass"),
+    ]
+
+    result = select_melody_path(events)
+
+    assert [event.midi for event in result.selected] == [82, 68, 66]
+
+
 def test_melody_can_change_stems_without_stem_hard_constraint() -> None:
     events = [
+        _note(0.0, 2.0, 36, stem="piano-bass"),
         _note(0.0, 0.35, 72, stem="piano-upper"),
+        _note(0.0, 0.10, 60, stem="piano-accompaniment"),
         _note(0.4, 0.75, 74, stem="piano-lower"),
+        _note(0.4, 0.50, 62, stem="piano-accompaniment"),
         _note(0.8, 1.15, 76, stem="piano-upper"),
     ]
 

@@ -37,7 +37,7 @@ from .jianpu_score.models.demucs import (
     normalize_demucs_model,
     separate_htdemucs,
 )
-from .jianpu_score.quantize import NoNotesError
+from .jianpu_score.quantize import NoNotesError, select_melody_path
 from .jianpu_score.render import (
     natural_svg_sort_key,
     render_score,  # noqa: F401 - legacy monkeypatch/import surface
@@ -1505,9 +1505,27 @@ class V2JobService:
             successful_pitched.append(track)
 
         merged_artifacts: list[dict[str, Any]] = []
+        main_melody_selection_artifact_id: str | None = None
+        main_melody_selection_audit: dict[str, Any] | None = None
+        main_melody_score_artifact_ids: list[str] = []
         merge_requested = bool(selection.get("merge_main_melody", False))
-        if merge_requested and successful_pitched:
-            merged_notes = self._main_melody_notes(notes_with_ids, {str(track["track_id"]) for track in successful_pitched})
+        if merge_requested and selected_pitched:
+            selected_track_ids = {str(track["track_id"]) for track in selected_pitched}
+            merged_notes, main_melody_selection_audit = self._select_main_melody_notes(notes_with_ids, selected_track_ids)
+            selection_path = output / "main-melody.selection.json"
+            _safe_json(selection_path, main_melody_selection_audit)
+            main_melody_selection_artifact_id = f"v2-selection-r{revision}-main-melody-selection"
+            artifacts.append(
+                self.manager._register(
+                    job_dir,
+                    selection_path,
+                    artifact_id=main_melody_selection_artifact_id,
+                    kind="main_melody_selection",
+                    label="主旋律候选与动态规划审计",
+                    media_type="application/json",
+                    stem_id="main-melody",
+                )
+            )
             merged_track = {
                 "track_id": "main-melody",
                 "label_zh": "主旋律（合并）",
@@ -1515,31 +1533,40 @@ class V2JobService:
                 "program": 0,
                 "is_drum": False,
             }
-            try:
-                merged_artifacts = self._render_track_score(
-                    job_id,
-                    output,
-                    merged_track,
-                    merged_notes,
-                    title,
-                    basename="main-melody",
-                    label_override="主旋律（合并）",
-                    bpm=bpm,
-                    key=key,
-                    time_signature=time_signature,
-                    base_analysis=base_analysis,
-                    shared_timeline_event_bounds=shared_timeline_event_bounds,
-                    bpm_manual=bpm_manual,
-                    key_manual=key_manual,
-                    time_signature_manual=time_signature_manual,
-                )
-                artifacts.extend(merged_artifacts)
-                score_artifact_ids.extend(item["artifact_id"] for item in merged_artifacts if item.get("kind", "").endswith(("score_json", "score_midi", "score_svg", "score_svg_long")))
-            except HighAccuracyServiceError as exc:
-                track_failures.append({"track_id": "main-melody", "label": "主旋律（合并）", "stage": exc.stage, "error": exc.cause})
-                artifacts.extend(list(getattr(exc, "v2_artifacts", [])))
-            except Exception as exc:  # noqa: BLE001 - preserve main-melody continuation
-                track_failures.append({"track_id": "main-melody", "label": "主旋律（合并）", "stage": "service", "error": str(exc)})
+            if not merged_notes:
+                track_failures.append({"track_id": "main-melody", "label": "主旋律（合并）", "stage": "selection", "error": "主旋律 selector 没有保留音符"})
+            else:
+                try:
+                    merged_artifacts = self._render_track_score(
+                        job_id,
+                        output,
+                        merged_track,
+                        merged_notes,
+                        title,
+                        basename="main-melody",
+                        label_override="主旋律（合并）",
+                        bpm=bpm,
+                        key=key,
+                        time_signature=time_signature,
+                        base_analysis=base_analysis,
+                        shared_timeline_event_bounds=shared_timeline_event_bounds,
+                        bpm_manual=bpm_manual,
+                        key_manual=key_manual,
+                        time_signature_manual=time_signature_manual,
+                    )
+                    artifacts.extend(merged_artifacts)
+                    main_melody_score_artifact_ids = [
+                        item["artifact_id"]
+                        for item in merged_artifacts
+                        if item.get("kind", "").endswith(("score_json", "score_midi", "score_svg", "score_svg_long"))
+                    ]
+                    score_artifact_ids.extend(main_melody_score_artifact_ids)
+                except HighAccuracyServiceError as exc:
+                    track_failures.append({"track_id": "main-melody", "label": "主旋律（合并）", "stage": exc.stage, "error": exc.cause})
+                    artifacts.extend(list(getattr(exc, "v2_artifacts", [])))
+                except Exception as exc:  # noqa: BLE001 - preserve main-melody continuation
+                    track_failures.append({"track_id": "main-melody", "label": "主旋律（合并）", "stage": "service", "error": str(exc)})
+        main_melody_succeeded = bool(main_melody_score_artifact_ids)
 
         score_refusal: dict[str, str] | None = None
         warnings: list[str] = []
@@ -1549,15 +1576,17 @@ class V2JobService:
                 "message": "未选择有音高乐器，简谱已拒绝；仍可下载选中 MIDI 并试听鼓组。",
             }
             warnings.append(score_refusal["message"])
-        elif not successful_pitched:
+        elif not successful_pitched and not main_melody_succeeded:
             score_refusal = {
                 "code": "all_pitched_tracks_failed",
                 "message": "所有选中的有音高乐器均未完成高精度谱面生成。",
             }
             warnings.append(score_refusal["message"])
+        elif not successful_pitched and main_melody_succeeded:
+            warnings.append("独立乐器分谱均失败，但主旋律合并谱已成功生成；失败详情保留在 track_failures。")
         if track_failures:
             warnings.append(f"有 {len(track_failures)} 个乐器或产物阶段失败，详见任务结果中的 track_failures。")
-        if merge_requested and successful_pitched:
+        if merge_requested and main_melody_succeeded:
             warnings.append("主旋律合并为单声部，结果会丢失和声；该产物不称为总谱。")
 
         page_artifacts = [item for item in artifacts if item.get("kind") in {"instrument_score_svg", "main_melody_score_svg"}]
@@ -1607,6 +1636,8 @@ class V2JobService:
             "score_artifact_ids": score_artifact_ids,
             "midi_artifact_id": f"v2-selection-r{revision}-midi",
             "svg_zip_artifact_id": selection_zip_id,
+            "main_melody_selection_artifact_id": main_melody_selection_artifact_id,
+            "main_melody_score_artifact_ids": main_melody_score_artifact_ids,
             "metadata": {**HIGH_ACCURACY_V2_METADATA, "time_basis": "source_seconds", "velocity_policy": "playback_default", "note_event_velocity": None, "full_decode_reused": True},
         }
         selection_json = output / "selection.json"
@@ -1624,7 +1655,7 @@ class V2JobService:
         with self.manager._lock:
             current = self.manager._read(job_id)
             current_v2 = dict(current.get("v2", {}))
-            current_v2.update({**HIGH_ACCURACY_V2_METADATA, "score_refusal": score_refusal, "track_failures": track_failures, "progress_detail": {"status": "completed" if not score_refusal or score_refusal.get("code") == "no_pitched_tracks" else "failed", "revision": revision}})
+            current_v2.update({**HIGH_ACCURACY_V2_METADATA, "score_refusal": score_refusal, "track_failures": track_failures, "main_melody_selection_artifact_id": main_melody_selection_artifact_id, "main_melody_score_artifact_ids": main_melody_score_artifact_ids, "progress_detail": {"status": "completed" if not score_refusal or score_refusal.get("code") == "no_pitched_tracks" else "failed", "revision": revision}})
             previous = [item for item in current.get("artifacts", []) if not str(item.get("artifact_id", "")).startswith(f"v2-selection-r{revision}-")]
             current.update(
                 {
@@ -1647,6 +1678,8 @@ class V2JobService:
                         "score_refusal": score_refusal,
                         "track_failures": track_failures,
                         "merge_main_melody": merge_requested,
+                        "main_melody_selection_artifact_id": main_melody_selection_artifact_id,
+                        "main_melody_score_artifact_ids": main_melody_score_artifact_ids,
                         "overrides": overrides,
                     },
                     "v2": {**current_v2, "stage": "export"},
@@ -1819,15 +1852,72 @@ class V2JobService:
         return int(match.group(1)) if match else 0
 
     @staticmethod
+    def _select_main_melody_notes(
+        notes: Sequence[Mapping[str, Any]], selected_ids: set[str]
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        pitched = [
+            note
+            for note in notes
+            if str(note.get("track_id")) in selected_ids and not bool(note.get("is_drum"))
+        ]
+        selector_events: list[NoteEvent] = []
+        source_notes: list[dict[str, Any]] = []
+        for source_index, note in enumerate(pitched):
+            metadata = dict(note.get("metadata") or {})
+            metadata.update(
+                {
+                    "melody_source_index": source_index,
+                    "track_id": str(note.get("track_id")),
+                    "instrument_group": str(note.get("instrument_group", "unknown")),
+                }
+            )
+            raw_confidence = note.get("confidence")
+            confidence = None if raw_confidence is None else float(raw_confidence)
+            selector_events.append(
+                NoteEvent(
+                    start_sec=float(note["start_sec"]),
+                    end_sec=float(note["end_sec"]),
+                    midi=int(note["pitch"]),
+                    confidence=confidence,
+                    source="muscriptor-main-melody-candidate",
+                    velocity=int(note["velocity"]) if note.get("velocity") not in {None, 0} else None,
+                    stem_id=str(note.get("track_id")),
+                    metadata=metadata,
+                )
+            )
+            source_notes.append(
+                {
+                    "source_index": source_index,
+                    "track_id": str(note.get("track_id")),
+                    "instrument_group": str(note.get("instrument_group", "unknown")),
+                    "pitch": int(note["pitch"]),
+                    "start_sec": float(note["start_sec"]),
+                    "end_sec": float(note["end_sec"]),
+                    "confidence_observed": raw_confidence is not None,
+                }
+            )
+        result = select_melody_path(selector_events)
+        selected_indices = [int(index) for index in result.audit.get("selected_input_indices", [])]
+        selected = [pitched[index] for index in selected_indices]
+        audit = {
+            "schema_version": "v2-main-melody-selection-v1",
+            "selector_version": result.audit.get("selector_version"),
+            "selected_track_ids": sorted(selected_ids),
+            "source_note_count": len(pitched),
+            "selected_note_count": len(selected),
+            "source_notes": source_notes,
+            "selector": result.audit,
+            "selected_source_indices": selected_indices,
+            "selected_notes": [source_notes[index] for index in selected_indices],
+        }
+        return selected, audit
+
+    @staticmethod
     def _main_melody_notes(notes: Sequence[Mapping[str, Any]], selected_ids: set[str]) -> list[dict[str, Any]]:
-        pitched = [note for note in notes if str(note.get("track_id")) in selected_ids and not bool(note.get("is_drum"))]
-        by_start: dict[float, dict[str, Any]] = {}
-        for note in pitched:
-            key = round(float(note["start_sec"]), 5)
-            current = by_start.get(key)
-            if current is None or int(note["pitch"]) > int(current["pitch"]):
-                by_start[key] = note
-        return sorted(by_start.values(), key=lambda item: (float(item["start_sec"]), int(item["pitch"])))
+        """Compatibility wrapper returning only the selected raw note dicts."""
+
+        selected, _audit = V2JobService._select_main_melody_notes(notes, selected_ids)
+        return selected
 
     @staticmethod
     def _audio_media_type(path: Path) -> str:

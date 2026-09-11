@@ -6,10 +6,16 @@
 
 `backend/jianpu_score/quantize.py` 增加 `onset-dp-v1`。它先按小的起音容差形成候选组，再用动态规划选择一条单音路径。候选和转移都写入 audit：缺失 confidence 保持中性，`metadata.playback_default` 不参与评分；重叠尾音用软惩罚处理，跳过的起音组也会记录。旧 `select_voice_events(..., mode="polyphonic")` 行为保持不变。
 
-这一阶段尚未接入 V2 网站合并入口，因此可以单独回退到父分支：
+## 阶段 2：V2 合并入口
+
+V2 的 `merge_main_melody=true` 现在从用户选中的全部有音高轨构造候选，即使某个独立乐器分谱转换失败，也会独立尝试主旋律。`main-melody.selection.json` 保存 source index、候选 emission、跳过的 onset 组和转移分数；原始 recognition、全和声 notes、独立分谱失败 manifest 都继续保留。
+
+若独立分谱全部失败但主旋律成功，任务保持 completed、`score_refusal=null`，并在 `track_failures` 留下分谱失败；若主旋律也失败，仍返回显式 `all_pitched_tracks_failed`。此阶段不增加网页引擎开关。
+
+两阶段均可以单独回退到父分支：
 
 ```text
 git switch codex/high-accuracy-transcription
 ```
 
-阶段提交只包含 selector 和 fixture 回归；后续接入 V2 时会另行提交，便于逐段比较旧的 onset 最高音策略、新 selector 和最终产物。
+阶段提交分开保留，便于逐段比较旧的 onset 最高音策略、新 selector 和最终产物；回退后旧 V2 合并行为恢复。
