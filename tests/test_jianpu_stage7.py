@@ -556,7 +556,7 @@ def test_unsafe_chord_tie_chain_stays_on_the_same_reusable_lanes(tmp_path: Path)
     assert all(intervals[pitch] == [(384, 1152)] for pitch in (46, 50, 53))
 
 
-def test_explicit_tuplet_ratio_is_required_to_be_three_over_two() -> None:
+def test_explicit_tuplet_ratio_rejects_unsupported_ratio() -> None:
     score = Score(
         title="unsupported tuplet",
         bpm=100,
@@ -576,7 +576,7 @@ def test_explicit_tuplet_ratio_is_required_to_be_three_over_two() -> None:
         ],
     )
 
-    with pytest.raises(JianpuSerializationError, match="only supports explicit 3:2"):
+    with pytest.raises(JianpuSerializationError, match="only supports explicit 3:2 or 4:3"):
         score_to_jianpu(score)
 
 
@@ -619,6 +619,134 @@ def _tuple_fragment_score(
         total_ticks=192,
         voices=[ScoreVoice(voice_id="tuplet", events=events)],
     )
+
+
+def _four_to_three_score(
+    *,
+    explicit_boundaries: bool = True,
+    non_integer_nominal: bool = False,
+) -> Score:
+    """Build a bounded 4:3 group containing the shapes seen in MusicXML."""
+
+    durations = [10, 54, 9, 9] if non_integer_nominal else [9, 54, 9, 9]
+    boundaries = ["start", None, None, "stop"] if explicit_boundaries else [None] * 4
+    events = [
+        ScoreNote(
+            start_tick=0,
+            duration_tick=durations[0],
+            midi=None,
+            tuplet_actual=4,
+            tuplet_normal=3,
+            tuplet_type=boundaries[0],
+        ),
+        ScoreNote(
+            start_tick=durations[0],
+            duration_tick=durations[1],
+            midi=60,
+            chord_pitches=[60, 64, 67],
+            dots=1,
+            tuplet_actual=4,
+            tuplet_normal=3,
+            tuplet_type=boundaries[1],
+        ),
+        ScoreNote(
+            start_tick=durations[0] + durations[1],
+            duration_tick=durations[2],
+            midi=62,
+            tie="start",
+            tie_types=["start"],
+            tuplet_actual=4,
+            tuplet_normal=3,
+            tuplet_type=boundaries[2],
+        ),
+        ScoreNote(
+            start_tick=sum(durations[:3]),
+            duration_tick=durations[3],
+            midi=62,
+            tie="stop",
+            tie_types=["stop"],
+            tuplet_actual=4,
+            tuplet_normal=3,
+            tuplet_type=boundaries[3],
+        ),
+    ]
+    cursor = sum(durations)
+    events.append(ScoreNote(start_tick=cursor, duration_tick=192 - cursor, midi=None))
+    return Score(
+        title="bounded four to three",
+        bpm=96,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=48,
+        total_ticks=192,
+        voices=[ScoreVoice(voice_id="four-to-three", events=events)],
+    )
+
+
+def test_explicit_4_3_boundary_accepts_four_members_with_rest_dot_chord_and_tie() -> None:
+    jianpu = score_to_jianpu(_four_to_three_score())
+
+    assert jianpu.count("4:3[") == 1
+    assert jianpu.count("]") == 1
+    assert "s0" in jianpu
+    assert "135." in jianpu
+    assert "s2 ~ s2" in jianpu
+
+
+def test_explicit_4_3_requires_complete_boundaries() -> None:
+    score = _four_to_three_score(explicit_boundaries=False)
+
+    with pytest.raises(JianpuSerializationError, match="4:3.*explicit start and stop boundaries"):
+        score_to_jianpu(score)
+
+    missing_stop = _four_to_three_score()
+    missing_stop.voices[0].events[3].tuplet_type = None
+    with pytest.raises(JianpuSerializationError, match="gap or inconsistent ratio|no stop boundary"):
+        score_to_jianpu(missing_stop)
+
+
+def test_explicit_4_3_rejects_non_integer_nominal_duration() -> None:
+    score = _four_to_three_score(non_integer_nominal=True)
+
+    with pytest.raises(JianpuSerializationError, match="tuplet note.*not exact"):
+        score_to_jianpu(score)
+
+
+@pytest.mark.skipif(
+    not render_module.JIANPU.is_file() or not render_module.LILYPOND.is_file(),
+    reason="pinned jianpu-ly or LilyPond is unavailable",
+)
+def test_explicit_4_3_render_preserves_score_midi_timing(tmp_path: Path) -> None:
+    score = _four_to_three_score()
+    artifacts = render_score(score, tmp_path, basename="four-to-three")
+    assert artifacts.svg_paths
+    assert artifacts.midi_path is not None
+
+    midi = mido.MidiFile(artifacts.midi_path)
+    scale = score.quarter_ticks / midi.ticks_per_beat
+    observed: dict[int, list[tuple[int, int]]] = {}
+    for track in midi.tracks:
+        absolute = 0
+        active: dict[int, list[int]] = {}
+        for message in track:
+            absolute += message.time
+            if message.type == "note_on" and message.velocity:
+                active.setdefault(message.note, []).append(absolute)
+            elif message.type in {"note_off", "note_on"} and not message.velocity:
+                starts = active.get(message.note, [])
+                if starts:
+                    observed.setdefault(message.note, []).append(
+                        (round(starts.pop(0) * scale), round(absolute * scale))
+                    )
+    for intervals in observed.values():
+        intervals.sort()
+
+    assert observed == {
+        60: [(9, 63)],
+        64: [(9, 63)],
+        67: [(9, 63)],
+        62: [(63, 81)],
+    }
 
 
 def test_explicit_tuplet_boundary_accepts_four_note_rest_fragments() -> None:

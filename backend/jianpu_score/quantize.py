@@ -753,11 +753,12 @@ class _Slice:
     tuplet_actual: int | None = None
     tuplet_normal: int | None = None
     tuplet_type: str | None = None
-    # Standard MusicXML tuplets are restricted to the pinned 3:2 policy.
-    # The importer may additionally mark a bounded fine-grid fragment for
-    # the renderer-specific exact tuplets (for example 3:1).  Keeping this
-    # bit on the slice, rather than widening all Score JSON tuplets, prevents
-    # an arbitrary ratio from entering the production serializer silently.
+    # Standard MusicXML tuplets use the pinned 3:2 policy or an explicitly
+    # bounded 4:3 group.  The importer may additionally mark a bounded
+    # fine-grid fragment for renderer-specific exact tuplets (for example
+    # 3:1).  Keeping this bit on the slice, rather than widening all Score
+    # JSON tuplets, prevents an arbitrary ratio from entering the production
+    # serializer silently.
     fine_grid_tuplet: bool = False
     # A bounded 1/2/4/5-tick event can be represented as one explicit 3:1
     # bracket whose body is one or more ordinary atoms.  This marker closes
@@ -1727,9 +1728,9 @@ def _validate_tuplet_ratio(item: _Slice) -> tuple[int, int] | None:
     if item.tuplet_actual is None or item.tuplet_normal is None:
         raise JianpuSerializationError("tuplet_actual and tuplet_normal must be supplied together")
     ratio = (item.tuplet_actual, item.tuplet_normal)
-    if ratio != (3, 2) and not (item.fine_grid_tuplet and ratio == (3, 1)):
+    if ratio not in {(3, 2), (4, 3)} and not (item.fine_grid_tuplet and ratio == (3, 1)):
         raise JianpuSerializationError(
-            "jianpu-ly serializer only supports explicit 3:2 tuplets; "
+            "jianpu-ly serializer only supports explicit 3:2 or 4:3 tuplets; "
             f"bounded fine-grid tuplets may be 3:1, got {ratio[0]}:{ratio[1]}"
         )
     return ratio
@@ -1738,13 +1739,13 @@ def _validate_tuplet_ratio(item: _Slice) -> tuple[int, int] | None:
 def _explicit_tuplet_groups(slices: list[_Slice]) -> dict[int, tuple[tuple[int, int], int]]:
     """Return ``start -> (ratio, exclusive end)`` for explicit tuplets.
 
-    MusicXML can split one 3:2 group into any number of note, chord, rest, or
-    tie fragments.  In particular a start/stop pair may surround four
-    fragments (the Luv Letter import has 4,8,4,8 actual ticks).  The old
-    implementation assumed exactly three events and therefore rejected a
-    legal group at the final fragment.  Explicit MusicXML boundaries are the
-    authority; without them we retain the legacy, conservative three-slice
-    inference because a longer unbounded run is ambiguous.
+    MusicXML can split one 3:2 or 4:3 group into any number of note, chord,
+    rest, or tie fragments.  In particular a start/stop pair may surround
+    four fragments.  The old implementation assumed exactly three events and
+    therefore rejected a legal group at the final fragment.  Explicit
+    MusicXML boundaries are the authority; without them we retain the legacy,
+    conservative three-slice inference only for 3:2 because a longer
+    unbounded 4:3 run is ambiguous.
     """
 
     groups: dict[int, tuple[tuple[int, int], int]] = {}
@@ -1758,6 +1759,10 @@ def _explicit_tuplet_groups(slices: list[_Slice]) -> dict[int, tuple[tuple[int, 
                 f"fine-grid singleton at tick {slices[index].start_tick} is missing its start boundary"
             )
         if boundary == "start" and slices[index].fine_grid_tuplet_single:
+            if ratio == (4, 3):
+                raise JianpuSerializationError(
+                    f"4:3 tuplet at tick {slices[index].start_tick} requires explicit start and stop boundaries"
+                )
             if open_start is not None:
                 raise JianpuSerializationError(
                     f"nested/overlapping explicit tuplets at tick {slices[index].start_tick}"
@@ -1775,7 +1780,7 @@ def _explicit_tuplet_groups(slices: list[_Slice]) -> dict[int, tuple[tuple[int, 
                 )
             if ratio is None:
                 raise JianpuSerializationError(
-                    f"tuplet start at tick {slices[index].start_tick} has no 3:2 ratio"
+                    f"tuplet start at tick {slices[index].start_tick} has no supported ratio"
                 )
             open_start, open_ratio = index, ratio
         elif boundary == "stop" and open_start is None:
@@ -1824,6 +1829,15 @@ def _explicit_tuplet_groups(slices: list[_Slice]) -> dict[int, tuple[tuple[int, 
             index = min(boundary_indices - covered)
             raise JianpuSerializationError(
                 f"explicit tuplet boundary at tick {slices[index].start_tick} is not part of a complete group"
+            )
+
+    # 4:3 is accepted only when the source supplied both group boundaries.
+    # In particular, do not let the legacy boundary-free three-slice
+    # compatibility path reinterpret a 4:3 run as a complete group.
+    for index, (ratio, _boundary) in enumerate(marked):
+        if ratio == (4, 3) and index not in covered:
+            raise JianpuSerializationError(
+                f"4:3 tuplet at tick {slices[index].start_tick} requires explicit start and stop boundaries"
             )
 
     # Legacy Score JSON has ratios but no MusicXML boundary metadata.  Only a
