@@ -493,44 +493,49 @@ def _quantize_voice_boundaries(
     return [(start, end, event) for (start, end), (_, _, event) in zip(snapped, raw)], triplet_groups
 
 
-def _tempo_events(analysis: MusicAnalysis, mapper: _BeatMapper, quarter_ticks: int) -> list[TempoEvent]:
+def _tempo_points_for_mapper(mapper: _BeatMapper, quarter_ticks: int) -> list[tuple[int, float]]:
+    """Return the shared score-tempo map used by Score and performance MIDI."""
+
     if mapper.fixed or len(mapper.beat_times) < 2:
-        return [TempoEvent(start_tick=0, bpm=analysis.bpm)]
-    median_interval = sorted(
-        right - left for left, right in zip(mapper.beat_times, mapper.beat_times[1:])
-    )[len(mapper.beat_times[1:]) // 2]
-    values: list[TempoEvent] = [
-        TempoEvent(
-            start_tick=0,
-            bpm=60.0 * mapper.beat_scale * mapper.beat_duration_quarters / median_interval,
+        return [(0, float(mapper.bpm))]
+    scale = float(mapper.beat_scale)
+    beat_duration_quarters = float(mapper.beat_duration_quarters or 1.0)
+    intervals = [right - left for left, right in zip(mapper.beat_times, mapper.beat_times[1:])]
+    if any(interval <= 0 for interval in intervals):
+        raise ValueError("beat times must be strictly increasing")
+    raw: list[tuple[int, float]] = []
+    for index, interval in enumerate(intervals):
+        bpm = 60.0 * scale * beat_duration_quarters / interval
+        score_beat = (
+            index * scale * beat_duration_quarters
+            + mapper.shift_beats
+            + mapper.timeline_offset_beats
         )
+        raw.append((round(score_beat * quarter_ticks), bpm))
+    raw_origin_position = (
+        -(mapper.shift_beats + mapper.timeline_offset_beats)
+        / (scale * beat_duration_quarters)
+        if scale
+        else 0.0
+    )
+    base_index = max(0, min(len(raw) - 1, math.floor(raw_origin_position)))
+    points: dict[int, float] = {0: raw[base_index][1]}
+    for tick, bpm in raw:
+        if tick > 0:
+            points[tick] = bpm
+    compact: list[tuple[int, float]] = []
+    for tick, bpm in sorted(points.items()):
+        if compact and abs(bpm - compact[-1][1]) <= 0.01:
+            continue
+        compact.append((tick, bpm))
+    return compact
+
+
+def _tempo_events(analysis: MusicAnalysis, mapper: _BeatMapper, quarter_ticks: int) -> list[TempoEvent]:
+    return [
+        TempoEvent(start_tick=tick, bpm=bpm)
+        for tick, bpm in _tempo_points_for_mapper(mapper, quarter_ticks)
     ]
-    for index, (left, right) in enumerate(zip(mapper.beat_times, mapper.beat_times[1:])):
-        interval = right - left
-        if interval <= 0:
-            continue
-        bpm = 60.0 * mapper.beat_scale * mapper.beat_duration_quarters / interval
-        tick = max(
-            0,
-            round(
-                (
-                    index * mapper.beat_scale * mapper.beat_duration_quarters
-                    + mapper.shift_beats
-                    + mapper.timeline_offset_beats
-                )
-                * quarter_ticks
-            ),
-        )
-        # The first detected beat can be a pickup after audio zero.  Its
-        # partial interval must not overwrite the median tempo at score tick
-        # zero; later intervals still contribute their local tempo changes.
-        if index == 0 and tick == values[0].start_tick:
-            continue
-        if tick == values[-1].start_tick:
-            values[-1] = TempoEvent(start_tick=tick, bpm=bpm)
-        elif abs(bpm - values[-1].bpm) > 0.01:
-            values.append(TempoEvent(start_tick=tick, bpm=bpm))
-    return values
 
 
 def quantize_events(

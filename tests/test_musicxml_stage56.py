@@ -852,6 +852,34 @@ def test_alignment_keeps_normal_musicxml_adaptive_timing() -> None:
     assert alignment["musicxml_to_score_movement_end_ticks"] == 0
 
 
+def test_standardizer_preserves_source_score_origin_and_undetermined_warning() -> None:
+    payload = _manual_payload()
+    source_origin = {
+        "strategy": "downbeat_phase_undetermined",
+        "downbeat_status": "undetermined",
+        "origin_shift_beats": 0.0,
+        "timeline_offset_beats": 0.25,
+    }
+    source_warning = "无法确认弱起；保留共享 BeatNet 原点"
+    score, _report = standardize_musicxml_payload(
+        payload,
+        performance_metadata={
+            "score_origin": source_origin,
+            "score_timeline_offset_beats": 0.25,
+            "downbeat_status": "undetermined",
+            "downbeat_warning": source_warning,
+        },
+    )
+
+    assert score.metadata["score_origin"] == source_origin
+    assert score.metadata["source_score_origin"] == source_origin
+    assert score.metadata["score_timeline_offset_beats"] == pytest.approx(0.25)
+    assert score.metadata["source_score_timeline_offset_beats"] == pytest.approx(0.25)
+    assert score.metadata["downbeat_status"] == "undetermined"
+    assert score.metadata["downbeat_warning"] == source_warning
+    assert source_warning in score.warnings
+
+
 @pytest.mark.parametrize(
     ("key", "expected"),
     [

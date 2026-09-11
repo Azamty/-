@@ -20,6 +20,7 @@ from backend.jianpu_score.high_accuracy_service import (
     ServiceArtifact,
 )
 from backend.jianpu_score.models.adapter import EngineResult
+from backend.jianpu_score.quantize import _build_beat_mapper
 from backend.jianpu_score.render import JIANPU, LILYPOND
 from backend.job_manager import JobManager
 from backend.muscriptor_v2 import stable_track_id
@@ -304,6 +305,112 @@ def test_instrumental_export_registers_service_outputs_and_preserves_override_so
     assert result["summary"]["overrides"]["bpm_manual"] is False
     assert any(item["kind"] == "instrument_preview_midi" for item in result["artifacts"])
     assert not any(item["kind"] == "instrument_midi" for item in result["artifacts"])
+
+
+def test_instrumental_export_passes_full_timeline_when_persisted_analysis_has_no_notes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: list[tuple[str, MusicAnalysis, tuple[NoteEvent, ...]]] = []
+
+    class CapturingFakeHighAccuracyService(FakeHighAccuracyService):
+        def build(self, **kwargs: Any) -> HighAccuracyBuildResult:
+            captured.append(
+                (
+                    str(kwargs["instrument_id"]),
+                    kwargs["analysis"],
+                    tuple(kwargs["events"]),
+                )
+            )
+            return super().build(**kwargs)
+
+    FakeHighAccuracyService.calls = []
+    FakeHighAccuracyService.failures = set()
+    monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", CapturingFakeHighAccuracyService)
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path, two_tracks=True)
+    state = manager._read(job_id)
+    state["v2"]["notes"][0].update({"start_sec": 0.0, "end_sec": 0.2})
+    state["v2"]["notes"][1].update({"start_sec": 1.25, "end_sec": 1.5})
+    beat_times = [0.0, 0.5, 1.0, 1.5, 2.0]
+    full_analysis = _analysis().model_copy(
+        update={
+            "duration_sec": 2.5,
+            "beat_times": beat_times,
+            "metadata": {
+                "beat_engine": "beatnet",
+                "beatnet_version": "1.1.3",
+                "beat_source": "beatnet",
+                "beat_grid": {
+                    "beats": [
+                        {"index": index, "time_sec": time, "downbeat": index == 1}
+                        for index, time in enumerate(beat_times)
+                    ],
+                    "mapping": {"score_origin": {"downbeat_index": 1, "downbeat_sec": 0.5}},
+                },
+            },
+        }
+    )
+    assert full_analysis.note_events == []
+    analysis_path = tmp_path / "jobs" / job_id / "output" / "analysis.json"
+    analysis_path.write_text(full_analysis.model_dump_json(), encoding="utf-8")
+    state["v2"]["analysis_relative"] = "output/analysis.json"
+    manager._write(state)
+    manager.select_v2(job_id, ids)
+    running = manager._read(job_id)
+    running.update({"status": "running", "phase": "rendering"})
+    manager._write(running)
+
+    manager.v2._run_instrumental_export(job_id)
+
+    assert [item[0] for item in captured] == ids
+    origins = []
+    for _track_id, analysis, events in captured:
+        assert len(analysis.metadata["shared_timeline_event_bounds"]) == 2
+        assert analysis.metadata["shared_timeline_scope"] == "persisted_full_analysis"
+        origins.append(_build_beat_mapper(analysis, list(events)).score_origin)
+    assert {origin["timeline_scope"] for origin in origins} == {"persisted_full_analysis"}
+    assert all(origin["origin_shift_beats"] == pytest.approx(0.0) for origin in origins)
+    assert all(origin["timeline_offset_beats"] == pytest.approx(0.0) for origin in origins)
+
+
+def test_analysis_for_events_ignores_reserved_shared_timeline_metadata_injection() -> None:
+    base = _analysis()
+    event = NoteEvent(start_sec=0.25, end_sec=0.5, midi=60)
+    metadata_extra = {
+        "shared_timeline_event_bounds": [{"start_sec": -9.0, "end_sec": -8.0}],
+        "shared_timeline_scope": "spoofed",
+    }
+
+    derived = V2JobService._analysis_for_events(
+        base,
+        [event],
+        bpm=120,
+        key="C",
+        time_signature="4/4",
+        bpm_manual=False,
+        key_manual=False,
+        time_signature_manual=False,
+        metadata_extra=metadata_extra,
+    )
+    assert "shared_timeline_event_bounds" not in derived.metadata
+    assert "shared_timeline_scope" not in derived.metadata
+
+    base_with_notes = base.model_copy(update={"note_events": [NoteEvent(start_sec=1.0, end_sec=1.5, midi=64)]})
+    derived_from_base = V2JobService._analysis_for_events(
+        base_with_notes,
+        [event],
+        bpm=120,
+        key="C",
+        time_signature="4/4",
+        bpm_manual=False,
+        key_manual=False,
+        time_signature_manual=False,
+        metadata_extra=metadata_extra,
+    )
+    assert derived_from_base.metadata["shared_timeline_event_bounds"] == [
+        {"start_sec": 1.0, "end_sec": 1.5}
+    ]
+    assert derived_from_base.metadata["shared_timeline_scope"] == "persisted_full_analysis"
 
 
 def test_instrumental_partial_failure_keeps_success_and_records_stage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

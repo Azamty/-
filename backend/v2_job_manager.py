@@ -894,6 +894,7 @@ class V2JobService:
         key_manual: bool,
         time_signature_manual: bool,
         metadata_extra: Mapping[str, Any] | None = None,
+        shared_timeline_event_bounds: Sequence[Mapping[str, Any]] | None = None,
     ) -> MusicAnalysis:
         duration = max((event.end_sec for event in events), default=0.1)
         metadata = V2JobService._selection_analysis_metadata(
@@ -908,17 +909,29 @@ class V2JobService:
         if metadata_extra:
             metadata.update(deepcopy(dict(metadata_extra)))
         # Each selected instrument is rendered separately, but score phase is
-        # a property of the original full-song BeatNet analysis.  Preserve
-        # only the shared event bounds needed by the mapper so a track cannot
-        # redefine the song origin from its own first onset.
-        shared_events = list(base_analysis.note_events)
-        if shared_events:
+        # a property of the original full-song BeatNet analysis.  The export
+        # stage supplies these bounds explicitly because persisted BeatNet
+        # analysis does not carry MuScriptor note events.
+        metadata.pop("shared_timeline_event_bounds", None)
+        metadata.pop("shared_timeline_scope", None)
+        if shared_timeline_event_bounds is not None:
+            metadata["shared_timeline_event_bounds"] = [
+                {
+                    "start_sec": float(event["start_sec"]),
+                    "end_sec": float(event["end_sec"]),
+                }
+                for event in shared_timeline_event_bounds
+            ]
+            metadata["shared_timeline_scope"] = "persisted_full_analysis"
+        elif base_analysis.note_events:
+            # Keep direct callers that already carry complete note events
+            # compatible, while never replacing an explicitly supplied scope.
             metadata["shared_timeline_event_bounds"] = [
                 {
                     "start_sec": float(event.start_sec),
                     "end_sec": float(event.end_sec),
                 }
-                for event in shared_events
+                for event in base_analysis.note_events
             ]
             metadata["shared_timeline_scope"] = "persisted_full_analysis"
         return base_analysis.model_copy(
@@ -1395,12 +1408,21 @@ class V2JobService:
         bpm_manual = bool(selection.get("bpm_override_explicit", False))
         key_manual = bool(selection.get("key_override_explicit", False))
         time_signature_manual = bool(selection.get("time_signature_override_explicit", False))
-        notes_with_ids: list[dict[str, Any]] = []
+        all_notes_with_ids: list[dict[str, Any]] = []
         for note in notes:
             track_key = (str(note.get("instrument_group")), int(note.get("program", 0)), bool(note.get("is_drum", False)))
             track_id = stable_track_id(*track_key)
-            if track_id in selected_set:
-                notes_with_ids.append({**note, "track_id": track_id})
+            all_notes_with_ids.append({**note, "track_id": track_id})
+        shared_timeline_event_bounds = [
+            {
+                "start_sec": float(note["start_sec"]),
+                "end_sec": float(note["end_sec"]),
+            }
+            for note in all_notes_with_ids
+        ]
+        notes_with_ids = [
+            note for note in all_notes_with_ids if note.get("track_id") in selected_set
+        ]
         selected_pitched = [track for track in selected_tracks if not bool(track.get("is_drum"))]
         output = self._output_dir(job_id) / "selections" / f"rev-{revision:04d}"
         if output.exists() and output.is_symlink():
@@ -1466,6 +1488,7 @@ class V2JobService:
                     key=key,
                     time_signature=time_signature,
                     base_analysis=base_analysis,
+                    shared_timeline_event_bounds=shared_timeline_event_bounds,
                     bpm_manual=bpm_manual,
                     key_manual=key_manual,
                     time_signature_manual=time_signature_manual,
@@ -1505,6 +1528,7 @@ class V2JobService:
                     key=key,
                     time_signature=time_signature,
                     base_analysis=base_analysis,
+                    shared_timeline_event_bounds=shared_timeline_event_bounds,
                     bpm_manual=bpm_manual,
                     key_manual=key_manual,
                     time_signature_manual=time_signature_manual,
@@ -1649,6 +1673,7 @@ class V2JobService:
         key: str = "C",
         time_signature: str = "4/4",
         base_analysis: MusicAnalysis | None = None,
+        shared_timeline_event_bounds: Sequence[Mapping[str, Any]] | None = None,
         bpm_manual: bool = False,
         key_manual: bool = False,
         time_signature_manual: bool = False,
@@ -1687,6 +1712,7 @@ class V2JobService:
             bpm_manual=bpm_manual,
             key_manual=key_manual,
             time_signature_manual=time_signature_manual,
+            shared_timeline_event_bounds=shared_timeline_event_bounds,
             metadata_extra={
                 "instrument_group": str(track.get("instrument_group", "unknown")),
                 "program": int(track.get("program", 0)),

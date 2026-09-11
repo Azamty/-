@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -5882,6 +5883,38 @@ def standardize_musicxml_payload(
         warnings.append("Overlapping MusicXML events were preserved in additional ScoreVoice lanes")
     if any(item.get("reason") not in {"matched_musicxml_event", "matched_musicxml_tie_chain"} for item in alignment):
         warnings.append("Source performance alignment contains quantization movement or explicit accounting; inspect alignment_report.json")
+    source_score_origin = (
+        deepcopy(dict(performance_metadata["score_origin"]))
+        if performance_metadata and isinstance(performance_metadata.get("score_origin"), Mapping)
+        else None
+    )
+    source_timeline_offset = (
+        performance_metadata.get("score_timeline_offset_beats")
+        if performance_metadata
+        else None
+    )
+    if source_timeline_offset is None and source_score_origin is not None:
+        source_timeline_offset = source_score_origin.get("timeline_offset_beats")
+    if source_timeline_offset is not None:
+        try:
+            source_timeline_offset = float(source_timeline_offset)
+        except (TypeError, ValueError):
+            raise MusicXMLStandardizationError("performance score timeline offset is invalid")
+    source_downbeat_status = (
+        performance_metadata.get("downbeat_status")
+        if performance_metadata
+        else None
+    )
+    if source_downbeat_status is None and source_score_origin is not None:
+        source_downbeat_status = source_score_origin.get("downbeat_status")
+    source_downbeat_warning = (
+        performance_metadata.get("downbeat_warning")
+        if performance_metadata
+        else None
+    )
+    if not source_downbeat_warning and source_score_origin is not None:
+        source_downbeat_warning = source_score_origin.get("warning")
+
     metadata: dict[str, Any] = {
         "notation_engine": "musescore-midi-import",
         "score_normalizer": "music21",
@@ -5935,6 +5968,19 @@ def standardize_musicxml_payload(
             if item.get("reason") in {"tie_chain_voice_reassigned", "tie_chain_event_split"}
         ],
     }
+    if source_score_origin is not None:
+        metadata["score_origin"] = source_score_origin
+        metadata["source_score_origin"] = deepcopy(source_score_origin)
+    if source_timeline_offset is not None:
+        metadata["score_timeline_offset_beats"] = source_timeline_offset
+        metadata["source_score_timeline_offset_beats"] = source_timeline_offset
+    if source_downbeat_status is not None:
+        metadata["downbeat_status"] = str(source_downbeat_status)
+    if source_downbeat_warning:
+        metadata["downbeat_warning"] = str(source_downbeat_warning)
+        if str(source_downbeat_status) == "undetermined":
+            warnings.append(str(source_downbeat_warning))
+    warnings = list(dict.fromkeys(warnings))
     score = Score(
         title=sanitize_title(title or payload.title),
         bpm=tempo_events[0].bpm,

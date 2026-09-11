@@ -15,6 +15,7 @@ from backend.jianpu_score.performance_midi import (
     write_performance_midi,
     write_performance_midi_bundle,
 )
+from backend.jianpu_score.quantize import quantize_events
 
 
 def _analysis(
@@ -372,6 +373,27 @@ def test_manual_bpm_scale_is_reflected_in_performance_tempo_map() -> None:
     assert metadata["tempo_points"][0]["bpm"] == pytest.approx(60.0)
     assert metadata["manual_bpm_override"] is True
     assert metadata["manual_time_signature_override"] is True
+
+
+def test_score_and_performance_use_the_same_tempo_at_explicit_score_zero() -> None:
+    analysis = _analysis(beat_times=[0.5, 1.0, 2.0, 3.0], downbeat_index=1)
+    event = NoteEvent(start_sec=0.0, end_sec=0.25, midi=60)
+
+    score = quantize_events([event], analysis, mode="monophonic", quarter_ticks=48)
+    _midi_bytes, metadata = build_performance_midi(
+        [event],
+        analysis,
+        instrument_group="piano",
+    )
+
+    assert [(item.start_tick, item.bpm) for item in score.tempo_events] == [
+        (0, pytest.approx(120.0)),
+        (96, pytest.approx(60.0)),
+    ]
+    assert [(item["tick"], item["bpm"]) for item in metadata["tempo_points"]] == [
+        (0, pytest.approx(120.0)),
+        (960, pytest.approx(60.0)),
+    ]
 
 
 def test_write_performance_midi_uses_independent_names_and_refuses_accidental_overwrite(tmp_path) -> None:

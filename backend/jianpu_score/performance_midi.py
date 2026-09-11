@@ -10,7 +10,6 @@ ticks.
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import math
 import unicodedata
@@ -22,7 +21,7 @@ from typing import Any
 import mido
 
 from .domain import MusicAnalysis, NoteEvent, normalize_key, normalize_time_signature
-from .quantize import _build_beat_mapper
+from .quantize import _build_beat_mapper, _tempo_points_for_mapper
 
 PERFORMANCE_TICKS_PER_QUARTER = 480
 PERFORMANCE_SCHEMA_VERSION = "1.0"
@@ -149,61 +148,15 @@ def _score_origin_audio_seconds(mapper: Any) -> float:
 def _tempo_points(mapper: Any) -> list[tuple[int, int, float]]:
     """Return ``(absolute_tick, microseconds_per_beat, bpm)`` points.
 
-    Each BeatNet interval gets its own tempo.  A point at score tick zero is
-    always present, even when the first observed beat is a pickup after score
-    zero, so MIDI playback has a defined tempo before the first change.
+    The score and performance MIDI paths use the same score-origin interval
+    so their opening playback tempo cannot diverge.
     """
 
-    if mapper.fixed or len(mapper.beat_times) < 2:
-        bpm = _finite_positive(mapper.bpm, label="BPM")
-        return [(0, round(mido.bpm2tempo(bpm)), bpm)]
-    times = mapper.beat_times
-    scale = float(mapper.beat_scale)
-    shift = float(mapper.shift_beats + mapper.timeline_offset_beats)
-    intervals = [right - left for left, right in itertools.pairwise(times)]
-    if any(interval <= 0 for interval in intervals):
-        raise ValueError("beat times must be strictly increasing")
-
-    raw: list[tuple[int, int, float]] = []
-    for index, interval in enumerate(intervals):
-        beat_duration_quarters = float(mapper.beat_duration_quarters or 1.0)
-        bpm = _finite_positive(
-            60.0 * scale * beat_duration_quarters / interval,
-            label="tempo map BPM",
-        )
-        score_beat = index * scale * beat_duration_quarters + shift
-        tick = round(score_beat * PERFORMANCE_TICKS_PER_QUARTER)
-        raw.append((tick, round(mido.bpm2tempo(bpm)), bpm))
-
-    # MIDI cannot represent negative delta time.  Select the tempo interval
-    # that contains score zero after applying the explicit score origin, then
-    # retain later points in the non-negative score timeline.  This matters
-    # when the first detected downbeat is a later BeatNet beat: the interval
-    # before that downbeat must not become the playback tempo at tick zero.
-    raw_origin_position = (
-        -shift / (scale * float(mapper.beat_duration_quarters or 1.0))
-        if scale
-        else 0.0
-    )
-    base_index = max(0, min(len(raw) - 1, math.floor(raw_origin_position)))
-    points: dict[int, tuple[int, float]] = {0: (raw[base_index][1], raw[base_index][2])}
-    for tick, tempo, bpm in raw:
-        if tick <= 0:
-            continue
-        points[tick] = (tempo, bpm)
-    # A local beat grid emits one candidate tempo per interval.  Consecutive
-    # intervals that quantize to the same MIDI tempo are semantically one
-    # tempo segment; retaining every duplicate needlessly asks MusicXML
-    # source alignment to prove a mapping for redundant events.  Collapse
-    # only adjacent equal encoded tempos, preserving every actual change and
-    # the original tick of each change.
-    compact: list[tuple[int, int, float]] = []
-    for tick, value in sorted(points.items()):
-        point = (tick, value[0], value[1])
-        if compact and point[1] == compact[-1][1]:
-            continue
-        compact.append(point)
-    return compact
+    points = _tempo_points_for_mapper(mapper, PERFORMANCE_TICKS_PER_QUARTER)
+    return [
+        (tick, round(mido.bpm2tempo(_finite_positive(bpm, label="tempo map BPM"))), bpm)
+        for tick, bpm in points
+    ]
 
 
 def _tick_to_seconds(tick: int, tempo_points: Sequence[tuple[int, int, float]]) -> float:
