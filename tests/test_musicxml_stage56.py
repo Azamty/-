@@ -23,6 +23,7 @@ from backend.jianpu_score.musicxml_standardize import (
     WorkerPickup,
     WorkerTempo,
     WorkerTimeSignature,
+    _reconcile_conductor_metadata,
     _normalize_worker_key,
     _key_sharps,
     _repair_fine_score_events,
@@ -54,6 +55,7 @@ from scripts.musicxml_score_worker import _duration_details
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "fixtures" / "high_accuracy" / "beat_grid_fixture.json"
+NEGATIVE_TEMPO_FIXTURE = ROOT / "fixtures" / "high_accuracy" / "musicxml_negative_tempo_offset.musicxml"
 PROFILE = ROOT / "tools" / "musescore-4.7.4" / "midi_import_options.xml"
 EXTERNAL_READY = (
     resolve_musescore() is not None
@@ -581,6 +583,148 @@ def test_score_normalizer_preserves_notation_fields_and_more_than_four_voices() 
     assert report["score_voice_count"] == 5
     assert score.metadata["measure_total_ticks"] == score.total_ticks
     assert score.metadata["measure_duration_total_ticks"] == score.total_ticks
+
+
+def test_negative_musicxml_tempo_requires_authoritative_performance_metadata() -> None:
+    payload = _manual_payload()
+    payload.tempo_events = [
+        WorkerTempo(offset_quarter=-1.5, bpm=90),
+        WorkerTempo(offset_quarter=0, bpm=120),
+    ]
+
+    with pytest.raises(
+        MusicXMLStandardizationError,
+        match="fractional tempo offset corruption requires a complete authoritative performance tempo map",
+    ):
+        standardize_musicxml_payload(payload)
+
+
+def test_negative_musicxml_tempo_is_replaced_and_audited_from_performance_map() -> None:
+    payload = _manual_payload()
+    payload.tempo_events = [
+        WorkerTempo(offset_quarter=-1.5, bpm=90),
+        WorkerTempo(offset_quarter=0, bpm=120),
+    ]
+    performance = {
+        "ticks_per_quarter": 480,
+        "tempo_points": [
+            {"tick": 0, "bpm": 120},
+            {"tick": 960, "bpm": 100},
+        ]
+    }
+
+    conductor = _reconcile_conductor_metadata(payload, performance)
+    repair = next(
+        item
+        for item in conductor["reconciliation"]
+        if item["reason"] == "musescore_fractional_tempo_offset_corruption"
+    )
+    assert repair["musicxml_tempo_values"] == [
+        {"offset_quarter": -1.5, "bpm": 90.0},
+        {"offset_quarter": 0.0, "bpm": 120.0},
+    ]
+    assert repair["negative_musicxml_tempo_values"] == [
+        {"offset_quarter": -1.5, "bpm": 90.0},
+    ]
+    assert repair["production_tempo_points"] == [
+        {"offset_quarter": 0.0, "bpm": 120.0},
+        {"offset_quarter": 2.0, "bpm": 100.0},
+    ]
+    assert conductor["tempo_values"] == repair["production_tempo_points"]
+
+
+def test_complete_performance_tempo_map_replaces_wrong_positive_musicxml_offsets() -> None:
+    payload = _manual_payload()
+    payload.tempo_events = [
+        WorkerTempo(offset_quarter=0, bpm=120),
+        WorkerTempo(offset_quarter=2.3958, bpm=100),
+        WorkerTempo(offset_quarter=6.0417, bpm=90),
+    ]
+    performance = {
+        "ticks_per_quarter": 480,
+        "tempo_points": [
+            {"tick": 0, "bpm": 120},
+            {"tick": 1766, "bpm": 100},
+            {"tick": 3369, "bpm": 90},
+        ],
+    }
+
+    conductor = _reconcile_conductor_metadata(payload, performance)
+    assert conductor["tempo_values"] == [
+        {"offset_quarter": pytest.approx(0.0), "bpm": 120.0},
+        {"offset_quarter": pytest.approx(1766 / 480), "bpm": 100.0},
+        {"offset_quarter": pytest.approx(3369 / 480), "bpm": 90.0},
+    ]
+    audit = next(item for item in conductor["reconciliation"] if item["field"] == "tempo")
+    assert audit["reason"] == "authoritative_performance_tempo_map"
+    assert audit["musicxml_tempo_values"] == [
+        {"offset_quarter": 0.0, "bpm": 120.0},
+        {"offset_quarter": 2.3958, "bpm": 100.0},
+        {"offset_quarter": 6.0417, "bpm": 90.0},
+    ]
+
+
+def test_explicit_corrupt_performance_tempo_map_fails_closed_even_for_positive_xml() -> None:
+    payload = _manual_payload()
+    payload.tempo_events = [WorkerTempo(offset_quarter=0, bpm=120)]
+    for performance in (
+        {"ticks_per_quarter": 480, "tempo_points": [{"tick": 480, "bpm": 120}]},
+        {"ticks_per_quarter": 480, "tempo_points": [{"tick": 0, "bpm": 120}, {"tick": 0, "bpm": 100}]},
+        {"ticks_per_quarter": 480, "tempo_points": [{"tick": 0, "bpm": 120}, {"tick": "480", "bpm": 100}]},
+        {"ticks_per_quarter": 960, "tempo_points": [{"tick": 0, "bpm": 120}]},
+    ):
+        with pytest.raises(MusicXMLStandardizationError, match="explicit performance tempo_points are incomplete"):
+            standardize_musicxml_payload(payload, performance_metadata=performance)
+
+
+def test_negative_musicxml_tempo_rejects_missing_or_incomplete_source_map() -> None:
+    payload = _manual_payload()
+    payload.tempo_events = [WorkerTempo(offset_quarter=-1.5, bpm=90)]
+    for performance in (
+        None,
+        {"bpm": 120},
+        {"ticks_per_quarter": 480, "tempo_points": []},
+        {"ticks_per_quarter": 480, "tempo_points": [{"tick": 480, "bpm": 120}]},
+    ):
+        with pytest.raises(MusicXMLStandardizationError, match="fractional tempo offset corruption requires a complete"):
+            standardize_musicxml_payload(payload, performance_metadata=performance)
+
+
+def test_nonnegative_musicxml_tempo_is_retained_without_performance_source() -> None:
+    payload = _manual_payload()
+    payload.tempo_events = [
+        WorkerTempo(offset_quarter=0, bpm=120),
+        WorkerTempo(offset_quarter=2, bpm=96),
+    ]
+
+    conductor = _reconcile_conductor_metadata(payload, None)
+    assert conductor["tempo_values"] == [
+        {"offset_quarter": 0.0, "bpm": 120.0},
+        {"offset_quarter": 2.0, "bpm": 96.0},
+    ]
+    assert not any(item.get("field") == "tempo" for item in conductor["reconciliation"])
+
+
+@pytest.mark.skipif(not EXTERNAL_READY, reason="pinned MuseScore and notation environment are unavailable")
+def test_negative_tempo_fixture_is_preserved_for_explicit_reconciliation() -> None:
+    payload = run_musicxml_worker(NEGATIVE_TEMPO_FIXTURE)
+    assert any(item.offset_quarter < 0 for item in payload.tempo_events)
+    performance = {
+        "ticks_per_quarter": 480,
+        "tempo_points": [
+            {"tick": 0, "bpm": 120},
+            {"tick": 960, "bpm": 100},
+        ],
+    }
+    score, report = standardize_musicxml_payload(payload, performance_metadata=performance)
+    assert [(item.start_tick, item.bpm) for item in score.tempo_events] == [
+        (0, pytest.approx(120.0)),
+        (96, pytest.approx(100.0)),
+    ]
+    assert any(
+        item.get("reason") == "musescore_fractional_tempo_offset_corruption"
+        for item in report["conductor_reconciliation"]
+    )
 
 
 def test_score_normalizer_rejoins_tie_fragments_exposed_in_different_music21_voices() -> None:
@@ -1999,6 +2143,7 @@ def test_production_conductor_metadata_backfills_initial_values_only() -> None:
         performance_metadata={
             "key": "D",
             "time_signature": "4/4",
+            "ticks_per_quarter": 480,
             "tempo_points": [{"tick": 0, "bpm": 96}],
         },
     )

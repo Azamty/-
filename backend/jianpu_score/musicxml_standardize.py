@@ -145,7 +145,12 @@ class WorkerPart(BaseModel):
 class WorkerTempo(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    offset_quarter: float = Field(ge=0)
+    # Keep raw worker coordinates, including a negative value, long enough
+    # for conductor reconciliation to record the corruption and either
+    # replace the complete map from authoritative performance metadata or
+    # fail closed.  The negative value is not a legal Score coordinate and
+    # must never be silently coerced to tick zero.
+    offset_quarter: float
     bpm: float = Field(gt=0)
 
 
@@ -5058,6 +5063,51 @@ def _source_tempo_records(performance_metadata: Mapping[str, Any] | None) -> lis
     return _dedupe_events(sorted(result, key=lambda value: value["offset_quarter"]), ("offset_quarter",))
 
 
+def _authoritative_performance_tempo_records(
+    performance_metadata: Mapping[str, Any] | None,
+) -> list[dict[str, Any]] | None:
+    """Validate the complete production tempo map for corruption recovery.
+
+    ``_source_tempo_records`` intentionally tolerates incomplete metadata for
+    ordinary conductor backfilling.  A corrupted MusicXML tempo map needs a
+    stronger contract: the performance map must be the complete, explicit
+    480-TPQ map, with an origin point and no malformed or reordered entries.
+    Returning ``None`` lets the caller fail closed without falling back to a
+    metadata-only BPM or silently dropping an invalid point.
+    """
+
+    if not isinstance(performance_metadata, Mapping):
+        return None
+    if performance_metadata.get("ticks_per_quarter") != PERFORMANCE_QUARTER_TICKS:
+        return None
+    points = performance_metadata.get("tempo_points")
+    if not isinstance(points, list) or not points:
+        return None
+    result: list[dict[str, Any]] = []
+    previous_tick: int | None = None
+    for index, point in enumerate(points):
+        if not isinstance(point, Mapping):
+            return None
+        tick = point.get("tick")
+        # The performance MIDI writer emits integer absolute ticks.  Do not
+        # coerce strings/floats here: doing so would hide a broken source map.
+        if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
+            return None
+        try:
+            bpm = float(point["bpm"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(bpm) or bpm <= 0:
+            return None
+        if index == 0 and tick != 0:
+            return None
+        if previous_tick is not None and tick <= previous_tick:
+            return None
+        result.append({"offset_quarter": tick / PERFORMANCE_QUARTER_TICKS, "bpm": bpm})
+        previous_tick = tick
+    return result
+
+
 def _source_key_signature(performance_metadata: Mapping[str, Any] | None) -> str | None:
     if not performance_metadata or not isinstance(performance_metadata.get("key"), str):
         return None
@@ -5196,7 +5246,7 @@ def _reconcile_conductor_metadata(
     payload: WorkerPayload,
     performance_metadata: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Merge production conductor metadata without replacing later XML changes."""
+    """Reconcile conductor data, using a complete production tempo map as authority."""
 
     xml_tempo = _dedupe_events(
         (
@@ -5207,39 +5257,87 @@ def _reconcile_conductor_metadata(
     )
     xml_tempo = sorted(xml_tempo, key=lambda value: float(value["offset_quarter"]))
     source_tempo = _source_tempo_records(performance_metadata)
-    tempo_values = list(xml_tempo)
-    reconciliation: list[dict[str, Any]] = []
-    for source in source_tempo:
-        offset = float(source["offset_quarter"])
-        matching = next(
-            (item for item in tempo_values if abs(float(item["offset_quarter"]) - offset) <= 1e-9),
-            None,
+    negative_xml_tempo = [
+        item for item in xml_tempo if float(item["offset_quarter"]) < 0
+    ]
+    authoritative_tempo = _authoritative_performance_tempo_records(performance_metadata)
+    tempo_map_corrupted = bool(negative_xml_tempo)
+    explicit_tempo_points = (
+        isinstance(performance_metadata, Mapping)
+        and "tempo_points" in performance_metadata
+        and bool(performance_metadata.get("tempo_points"))
+    )
+    if tempo_map_corrupted and authoritative_tempo is None:
+        first = negative_xml_tempo[0]
+        raise MusicXMLStandardizationError(
+            "MuseScore fractional tempo offset corruption requires a complete "
+            "authoritative performance tempo map (ticks_per_quarter=480, "
+            "strict tempo_points beginning at tick 0): "
+            f"offset_quarter={float(first['offset_quarter']):.9f}, "
+            f"bpm={float(first['bpm']):.9f}"
         )
-        if matching is None:
-            tempo_values.append(dict(source))
-            reconciliation.append(
-                {
-                    "field": "tempo",
-                    "offset_quarter": offset,
-                    "musicxml_value": None,
-                    "production_value": source["bpm"],
-                    "final_value": source["bpm"],
-                    "reason": "production_metadata_backfilled_missing_tempo",
-                }
+    if explicit_tempo_points and authoritative_tempo is None:
+        raise MusicXMLStandardizationError(
+            "explicit performance tempo_points are incomplete or invalid: "
+            "expected ticks_per_quarter=480, a tick-0 point, finite positive BPM, "
+            "and strictly increasing non-negative integer ticks"
+        )
+    reconciliation: list[dict[str, Any]] = []
+    if authoritative_tempo is not None:
+        # Production performance points are emitted from the same 480-TPQ
+        # performance MIDI that is being imported.  They are the only tempo
+        # authority; XML directions are retained only as audit evidence.  A
+        # negative offset marks MuseScore's fractional-offset unit corruption,
+        # and the positive offsets in that file are corrupted by the same
+        # mismatch, so never merge any XML event into the source map.
+        tempo_values = [dict(item) for item in authoritative_tempo]
+        reconciliation.append(
+            {
+                "field": "tempo",
+                "musicxml_tempo_values": [dict(item) for item in xml_tempo],
+                "negative_musicxml_tempo_values": [dict(item) for item in negative_xml_tempo],
+                "production_tempo_points": [dict(item) for item in authoritative_tempo],
+                "final_value": "authoritative_performance_tempo_map",
+                "reason": (
+                    "musescore_fractional_tempo_offset_corruption"
+                    if tempo_map_corrupted
+                    else "authoritative_performance_tempo_map"
+                ),
+            }
+        )
+    else:
+        tempo_values = list(xml_tempo)
+        for source in source_tempo:
+            offset = float(source["offset_quarter"])
+            matching = next(
+                (item for item in tempo_values if abs(float(item["offset_quarter"]) - offset) <= 1e-9),
+                None,
             )
-        elif offset == 0.0 and abs(float(matching["bpm"]) - float(source["bpm"])) > 0.01:
-            tempo_values = [item for item in tempo_values if abs(float(item["offset_quarter"])) > 1e-9]
-            tempo_values.append(dict(source))
-            reconciliation.append(
-                {
-                    "field": "tempo",
-                    "offset_quarter": offset,
-                    "musicxml_value": matching["bpm"],
-                    "production_value": source["bpm"],
-                    "final_value": source["bpm"],
-                    "reason": "production_metadata_replaced_changed_initial_tempo",
-                }
-            )
+            if matching is None:
+                tempo_values.append(dict(source))
+                reconciliation.append(
+                    {
+                        "field": "tempo",
+                        "offset_quarter": offset,
+                        "musicxml_value": None,
+                        "production_value": source["bpm"],
+                        "final_value": source["bpm"],
+                        "reason": "production_metadata_backfilled_missing_tempo",
+                    }
+                )
+            elif offset == 0.0 and abs(float(matching["bpm"]) - float(source["bpm"])) > 0.01:
+                tempo_values = [item for item in tempo_values if abs(float(item["offset_quarter"])) > 1e-9]
+                tempo_values.append(dict(source))
+                reconciliation.append(
+                    {
+                        "field": "tempo",
+                        "offset_quarter": offset,
+                        "musicxml_value": matching["bpm"],
+                        "production_value": source["bpm"],
+                        "final_value": source["bpm"],
+                        "reason": "production_metadata_replaced_changed_initial_tempo",
+                    }
+                )
     if not tempo_values:
         tempo_values = [{"offset_quarter": 0.0, "bpm": 120.0}]
     tempo_values = sorted(tempo_values, key=lambda value: float(value["offset_quarter"]))
@@ -5651,10 +5749,15 @@ def standardize_musicxml_payload(
         meter_rebar.setdefault("tempo_tail_extensions", []).append(tempo_tail_repair)
     conductor["tempo_values"] = tempo_values
     conductor["reconciliation"].extend(tempo_coordinate_repairs)
-    tempo_events = [
-        TempoEvent(start_tick=max(0, _quarter_to_tick(float(item["offset_quarter"]))), bpm=float(item["bpm"]))
-        for item in tempo_values
-    ]
+    tempo_events: list[TempoEvent] = []
+    for item in tempo_values:
+        start_tick = _quarter_to_tick(float(item["offset_quarter"]))
+        if start_tick < 0:
+            raise MusicXMLStandardizationError(
+                "conductor tempo map contains a negative Score offset after "
+                f"reconciliation: offset_quarter={float(item['offset_quarter']):.9f}"
+            )
+        tempo_events.append(TempoEvent(start_tick=start_tick, bpm=float(item["bpm"])))
     if tempo_events[0].start_tick > 0:
         tempo_events.insert(0, TempoEvent(start_tick=0, bpm=tempo_events[0].bpm))
     alignment = (
