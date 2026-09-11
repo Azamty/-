@@ -294,10 +294,11 @@ def test_score_origin_preserves_downbeat_phase_and_records_pickup() -> None:
         instrument_group="piano",
     )
     assert len(midi_bytes) > 0
-    assert metadata["score_origin"]["strategy"] == "first_downbeat"
-    assert metadata["score_origin"]["downbeat_score_beat"] == pytest.approx(0.0)
-    assert metadata["notes"][0]["start_tick"] == 0
-    assert metadata["score_origin_audio_sec"] == pytest.approx(0.75)
+    assert metadata["score_origin"]["strategy"] == "downbeat_phase_undetermined"
+    assert metadata["score_origin"]["downbeat_score_beat"] == pytest.approx(1.0)
+    assert metadata["score_origin"]["origin_shift_beats"] == pytest.approx(0.0)
+    assert metadata["notes"][0]["start_tick"] == 480
+    assert metadata["score_origin_audio_sec"] == pytest.approx(0.25)
 
     _pickup_bytes, pickup_metadata = build_performance_midi(
         [NoteEvent(start_sec=0.4, end_sec=0.6, midi=55), NoteEvent(start_sec=0.75, end_sec=1.0, midi=60)],
@@ -305,11 +306,11 @@ def test_score_origin_preserves_downbeat_phase_and_records_pickup() -> None:
         instrument_group="piano",
     )
     pickup = pickup_metadata["score_origin"]
-    assert pickup["strategy"] == "first_downbeat_with_pickup_candidate"
+    assert pickup["strategy"] == "downbeat_phase_undetermined"
     assert pickup["pickup_candidate"] is True
-    assert pickup["downbeat_score_beat"] == pytest.approx(4.0)
-    assert pickup["downbeat_score_beat"] % pickup["downbeat_bar_beats"] == pytest.approx(0.0)
-    assert pickup_metadata["notes"][1]["start_tick"] == 1920
+    assert pickup["downbeat_score_beat"] == pytest.approx(1.0)
+    assert pickup["origin_shift_beats"] == pytest.approx(0.0)
+    assert pickup_metadata["notes"][1]["start_tick"] == 480
 
 
 def test_program_key_meter_and_drum_channel_are_written() -> None:

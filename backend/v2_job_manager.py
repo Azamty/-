@@ -907,6 +907,20 @@ class V2JobService:
         )
         if metadata_extra:
             metadata.update(deepcopy(dict(metadata_extra)))
+        # Each selected instrument is rendered separately, but score phase is
+        # a property of the original full-song BeatNet analysis.  Preserve
+        # only the shared event bounds needed by the mapper so a track cannot
+        # redefine the song origin from its own first onset.
+        shared_events = list(base_analysis.note_events)
+        if shared_events:
+            metadata["shared_timeline_event_bounds"] = [
+                {
+                    "start_sec": float(event.start_sec),
+                    "end_sec": float(event.end_sec),
+                }
+                for event in shared_events
+            ]
+            metadata["shared_timeline_scope"] = "persisted_full_analysis"
         return base_analysis.model_copy(
             update={
                 "duration_sec": max(float(base_analysis.duration_sec), duration, 0.1),

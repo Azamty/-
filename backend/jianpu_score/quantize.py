@@ -26,6 +26,11 @@ from .domain import (
 )
 
 
+# Keep onset jitter around the first downbeat on the shared phase rather than
+# switching between a zero shift and a measure-relative alignment.
+DOWNBEAT_PHASE_DEADBAND_QUARTERS = 0.5
+
+
 def _time_signature_values(value: str) -> tuple[int, int]:
     normalized = normalize_time_signature(value)
     numerator, denominator = normalized.split("/", 1)
@@ -38,6 +43,48 @@ class NoNotesError(ValueError):
 
 class JianpuSerializationError(ValueError):
     """Raised when a Score cannot be represented without changing its timing."""
+
+
+def _shared_timeline_event_starts(
+    analysis: MusicAnalysis,
+    events: Iterable[NoteEvent],
+) -> tuple[tuple[float, float], str]:
+    """Return the full-song event bounds used to decide score phase.
+
+    V2 renders each selected instrument separately, while its persisted
+    ``MusicAnalysis.note_events`` still describes the complete recognition.
+    The latter is therefore the shared timeline authority.  Direct callers
+    that do not provide analysis events fall back to the materialized events;
+    that scope is persisted in ``score_origin`` so it cannot be mistaken for
+    a proven full-song origin.
+    """
+
+    source: Iterable[Any]
+    scope: str
+    shared_bounds = analysis.metadata.get("shared_timeline_event_bounds")
+    if isinstance(shared_bounds, list) and shared_bounds:
+        source = shared_bounds
+        scope = str(
+            analysis.metadata.get("shared_timeline_scope")
+            or "shared_timeline_event_bounds"
+        )
+    elif analysis.note_events:
+        source = analysis.note_events
+        scope = "analysis_note_events"
+    else:
+        source = events
+        scope = "materialized_events"
+    bounds: list[tuple[float, float]] = []
+    for item in source:
+        if isinstance(item, NoteEvent):
+            bounds.append((float(item.start_sec), float(item.end_sec)))
+            continue
+        if isinstance(item, Mapping):
+            try:
+                bounds.append((float(item["start_sec"]), float(item["end_sec"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return tuple(bounds), scope
 
 
 def _voice_name(event: NoteEvent, layer_index: int) -> str:
@@ -125,6 +172,7 @@ class _BeatMapper:
     beat_times: tuple[float, ...]
     fixed: bool
     shift_beats: float = 0.0
+    timeline_offset_beats: float = 0.0
     beat_scale: float = 1.0
     beat_duration_quarters: float = 1.0
     beat_unit: str = "quarter"
@@ -148,7 +196,11 @@ class _BeatMapper:
             left = right - 1
             fraction = (seconds - self.beat_times[left]) / (self.beat_times[right] - self.beat_times[left])
             position = left + fraction
-        return position * self.beat_scale * self.beat_duration_quarters + self.shift_beats
+        return (
+            position * self.beat_scale * self.beat_duration_quarters
+            + self.shift_beats
+            + self.timeline_offset_beats
+        )
 
 
 def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _BeatMapper:
@@ -232,9 +284,9 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
     # A BeatNet grid owns the phase of the score.  The old implementation
     # translated audio zero to Score zero, which silently moved a detected
     # downbeat into the middle of a measure whenever the first returned beat
-    # was not the downbeat.  Align the first detected downbeat to a measure
-    # boundary and persist the decision so MusicXML normalization can handle a
-    # possible pickup explicitly later.
+    # was not the downbeat.  Keep that phase in one full-song coordinate system
+    # and only align it when the first event is clearly outside the phase
+    # ambiguity region.
     origin = mapping.get("score_origin") if isinstance(mapping, dict) else None
     grid_beats = beat_grid.get("beats", []) if isinstance(beat_grid, dict) else []
     first_downbeat_index: int | None = None
@@ -249,17 +301,25 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
             first_downbeat_sec = float(beat_times[candidate_index])
     if first_downbeat_index is None and isinstance(grid_beats, list):
         for index, beat in enumerate(grid_beats):
-            if isinstance(beat, dict) and bool(beat.get("downbeat")) and index < len(beat_times):
+            if (
+                isinstance(beat, Mapping)
+                and bool(beat.get("downbeat"))
+                and index < len(beat_times)
+            ):
                 first_downbeat_index = index
                 first_downbeat_sec = float(beat_times[index])
                 break
 
     if first_downbeat_index is None:
+        timeline_bounds, timeline_scope = _shared_timeline_event_starts(analysis, events)
+        earliest_event_sec = min((start for start, _end in timeline_bounds), default=0.0)
+        timeline_offset_beats = max(0.0, -unshifted.seconds_to_beat(earliest_event_sec))
         return _BeatMapper(
             analysis.bpm,
             beat_times,
             False,
             shift_beats=0.0,
+            timeline_offset_beats=timeline_offset_beats,
             beat_scale=beat_scale,
             beat_duration_quarters=beat_duration_quarters,
             beat_unit=str(beat_unit["beat_unit"]),
@@ -275,45 +335,105 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
                 "downbeat_score_beat": None,
                 "pickup_candidate": False,
                 "pickup_beats": 0.0,
+                "pickup_span_quarters": 0.0,
+                "pickup_evidence": {
+                    "observed_pre_downbeat": False,
+                    "reason": "downbeat_index_unavailable",
+                    "pickup_span_quarters": 0.0,
+                },
+                "timeline_offset_beats": timeline_offset_beats,
+                "timeline_scope": timeline_scope,
+                "timeline_event_count": len(timeline_bounds),
             },
         )
 
     downbeat_raw_beat = first_downbeat_index * beat_scale * beat_duration_quarters
-    earliest_event_sec = min((event.start_sec for event in events), default=0.0)
-    has_pre_downbeat_note = (
-        first_downbeat_sec is not None and earliest_event_sec < first_downbeat_sec - 1e-6
-    )
+    timeline_bounds, timeline_scope = _shared_timeline_event_starts(analysis, events)
+    earliest_event_sec = min((start for start, _end in timeline_bounds), default=0.0)
+    earliest_raw_beat = unshifted.seconds_to_beat(earliest_event_sec)
+    # ScoreNote and MIDI ticks are non-negative.  Preserve a negative raw
+    # extrapolation with one explicit full-song timeline offset rather than
+    # silently clipping each note independently.
+    timeline_offset_beats = max(0.0, -earliest_raw_beat)
+    phase_delta_quarters = earliest_raw_beat - downbeat_raw_beat
+    has_pre_downbeat_note = first_downbeat_sec is not None and earliest_event_sec < first_downbeat_sec
+    phase_near_downbeat = abs(phase_delta_quarters) <= DOWNBEAT_PHASE_DEADBAND_QUARTERS
+    phase_undetermined = has_pre_downbeat_note or phase_near_downbeat
     bar_beats = bar_duration_quarters
-    if has_pre_downbeat_note:
-        # Keep a leading note on the non-negative score timeline while making
-        # the detected downbeat land on the next complete measure boundary.
-        target_downbeat_beat = max(bar_beats, math.ceil((downbeat_raw_beat + 1e-9) / bar_beats) * bar_beats)
-        strategy = "first_downbeat_with_pickup_candidate"
-        raw_pre_downbeat_beat = unshifted.seconds_to_beat(earliest_event_sec)
-        pickup_span = max(0.0, downbeat_raw_beat - raw_pre_downbeat_beat)
+    raw_pre_downbeat_beat = earliest_raw_beat if has_pre_downbeat_note else None
+    pickup_span = (
+        max(0.0, downbeat_raw_beat - raw_pre_downbeat_beat)
+        if raw_pre_downbeat_beat is not None
+        else 0.0
+    )
+    # No production BeatNet payload currently carries a trustworthy explicit
+    # pickup declaration.  Any pre-downbeat event is therefore phase
+    # ambiguous, including a very small beat-relative onset deviation.  Keep
+    # the measured span as evidence, but never let it authorize a relocation.
+    # The same dead-band applies just after the downbeat so jitter cannot jump
+    # between two origin conventions.
+    if phase_undetermined:
+        target_downbeat_beat = downbeat_raw_beat
+        strategy = "downbeat_phase_undetermined"
+        downbeat_status = "undetermined"
+        pickup_reason = (
+            "pickup_span_not_shorter_than_bar"
+            if has_pre_downbeat_note and pickup_span >= bar_beats
+            else (
+                "pre_downbeat_phase_unconfirmed"
+                if has_pre_downbeat_note
+                else "downbeat_phase_within_deadband"
+            )
+        )
+        warning = (
+            "无法确认弱起（"
+            f"{pickup_reason}；pickup_span_quarters={pickup_span:.6f}，"
+            f"phase_delta_quarters={phase_delta_quarters:.6f}，"
+            f"deadband_quarters={DOWNBEAT_PHASE_DEADBAND_QUARTERS:.2f}）；"
+            "保留共享 BeatNet 原点"
+        )
     else:
         target_downbeat_beat = 0.0
         strategy = "first_downbeat"
-        raw_pre_downbeat_beat = None
-        pickup_span = 0.0
+        downbeat_status = "aligned"
+        pickup_reason = "no_pre_downbeat_note"
+        warning = None
+    # For the undetermined state this is intentionally an exact zero.  Do not
+    # use a per-track audio origin or a millisecond tolerance to move a full
+    # measure.  The ordinary branch retains the established downbeat alignment.
     shift_beats = target_downbeat_beat - downbeat_raw_beat
+    if phase_undetermined:
+        shift_beats = 0.0
     score_origin = {
         "strategy": strategy,
-        "downbeat_status": "aligned",
+        "downbeat_status": downbeat_status,
         "downbeat_index": first_downbeat_index,
         "downbeat_sec": first_downbeat_sec,
-        "downbeat_score_beat": target_downbeat_beat,
+        "downbeat_score_beat": target_downbeat_beat + timeline_offset_beats,
         "downbeat_bar_beats": bar_beats,
         "pickup_candidate": has_pre_downbeat_note,
-        "pickup_beats": pickup_span if has_pre_downbeat_note else 0.0,
+        "pickup_beats": 0.0,
+        "pickup_span_quarters": pickup_span,
+        "pickup_evidence": {
+            "observed_pre_downbeat": has_pre_downbeat_note,
+            "reason": pickup_reason,
+            "pickup_span_quarters": pickup_span,
+            "phase_delta_quarters": phase_delta_quarters,
+            "deadband_quarters": DOWNBEAT_PHASE_DEADBAND_QUARTERS,
+        },
         "pre_downbeat_note_start_beat": raw_pre_downbeat_beat,
         "origin_shift_beats": shift_beats,
+        "timeline_offset_beats": timeline_offset_beats,
+        "timeline_scope": timeline_scope,
+        "timeline_event_count": len(timeline_bounds),
+        "warning": warning,
     }
     return _BeatMapper(
         analysis.bpm,
         beat_times,
         False,
         shift_beats=shift_beats,
+        timeline_offset_beats=timeline_offset_beats,
         beat_scale=beat_scale,
         beat_duration_quarters=beat_duration_quarters,
         beat_unit=str(beat_unit["beat_unit"]),
@@ -327,7 +447,7 @@ def _build_beat_mapper(analysis: MusicAnalysis, events: list[NoteEvent]) -> _Bea
 
 def _straight_tick(value: float, quarter_ticks: int) -> int:
     sixteenth = max(1, quarter_ticks // 4)
-    return max(0, round(value / sixteenth) * sixteenth)
+    return round(value / sixteenth) * sixteenth
 
 
 def _triplet_group_targets(raw: list[tuple[float, float, NoteEvent]], start_index: int, quarter_ticks: int) -> tuple[int, int, int, int] | None:
@@ -396,6 +516,7 @@ def _tempo_events(analysis: MusicAnalysis, mapper: _BeatMapper, quarter_ticks: i
                 (
                     index * mapper.beat_scale * mapper.beat_duration_quarters
                     + mapper.shift_beats
+                    + mapper.timeline_offset_beats
                 )
                 * quarter_ticks
             ),
@@ -449,6 +570,11 @@ def quantize_events(
             (mapper.seconds_to_beat(event.start_sec) * quarter_ticks, mapper.seconds_to_beat(event.end_sec) * quarter_ticks, event)
             for event in ordered_events
         ]
+        if any(start < -1e-6 or end < -1e-6 for start, end, _event in raw_boundaries):
+            raise ValueError(
+                "beat mapper produced a negative score coordinate; "
+                "refusing to clip it silently"
+            )
         snapped_events, group_count = _quantize_voice_boundaries(raw_boundaries, quarter_ticks)
         triplet_group_count += group_count
         cursor = 0
@@ -525,8 +651,19 @@ def quantize_events(
         "beat_grid": analysis.metadata.get("beat_grid"),
         "beat_offset_sec": analysis.beat_times[0] if analysis.beat_times else 0.0,
         "score_origin": mapper.score_origin,
-        "pickup_beats": float(mapper.score_origin.get("pickup_beats", max(0.0, -mapper.seconds_to_beat(0.0)))),
+        "score_timeline_offset_beats": mapper.timeline_offset_beats,
+        # ``pickup_beats`` is reserved for an explicitly confirmed pickup.
+        # An undetermined pre-downbeat span is recorded separately so it can
+        # never be mistaken for a printable pickup header.
+        "pickup_beats": float(mapper.score_origin.get("pickup_beats", 0.0)),
+        "pickup_span_quarters": float(mapper.score_origin.get("pickup_span_quarters", 0.0)),
         "downbeat_status": mapper.score_origin.get("downbeat_status", "undetermined"),
+        "downbeat_warning": mapper.score_origin.get("warning"),
+        "downbeat_warnings": (
+            [str(mapper.score_origin["warning"])]
+            if mapper.score_origin.get("warning")
+            else []
+        ),
         "triplet_group_count": triplet_group_count,
         "source_stems": sorted({event.stem_id for event in selected if event.stem_id}),
     }
@@ -540,7 +677,18 @@ def quantize_events(
         voices=score_voices,
         tempo_events=tempo_events,
         source=selected[0].source,
-        warnings=list(analysis.warnings),
+        warnings=list(
+            dict.fromkeys(
+                [
+                    *analysis.warnings,
+                    *(
+                        [str(mapper.score_origin["warning"])]
+                        if mapper.score_origin.get("warning")
+                        else []
+                    ),
+                ]
+            )
+        ),
         metadata=metadata,
     )
 

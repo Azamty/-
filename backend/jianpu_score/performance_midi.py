@@ -131,7 +131,7 @@ def _score_origin_audio_seconds(mapper: Any) -> float:
 
     if mapper.fixed or len(mapper.beat_times) < 2:
         return 0.0
-    raw_position = -float(mapper.shift_beats) / float(
+    raw_position = -float(mapper.shift_beats + mapper.timeline_offset_beats) / float(
         (mapper.beat_scale or 1.0) * (mapper.beat_duration_quarters or 1.0)
     )
     times = mapper.beat_times
@@ -159,7 +159,7 @@ def _tempo_points(mapper: Any) -> list[tuple[int, int, float]]:
         return [(0, round(mido.bpm2tempo(bpm)), bpm)]
     times = mapper.beat_times
     scale = float(mapper.beat_scale)
-    shift = float(mapper.shift_beats)
+    shift = float(mapper.shift_beats + mapper.timeline_offset_beats)
     intervals = [right - left for left, right in itertools.pairwise(times)]
     if any(interval <= 0 for interval in intervals):
         raise ValueError("beat times must be strictly increasing")
@@ -232,7 +232,12 @@ def _absolute_note_ticks(
     for index, note in enumerate(notes):
         start_beat = float(mapper.seconds_to_beat(note.start_sec))
         end_beat = float(mapper.seconds_to_beat(note.end_sec))
-        start_tick = max(0, round(start_beat * PERFORMANCE_TICKS_PER_QUARTER))
+        if start_beat < -1e-9 or end_beat < -1e-9:
+            raise ValueError(
+                "beat mapper produced a negative performance coordinate; "
+                "refusing to clip it silently"
+            )
+        start_tick = round(start_beat * PERFORMANCE_TICKS_PER_QUARTER)
         end_tick = max(start_tick + 1, round(end_beat * PERFORMANCE_TICKS_PER_QUARTER))
         cleanup = note.metadata.get("instrumental_cleanup")
         source_index = index
@@ -523,6 +528,7 @@ def build_performance_midi(
         "score_origin_audio_sec": _score_origin_audio_seconds(mapper),
         "beat_scale": mapper.beat_scale,
         "beat_shift_beats": mapper.shift_beats,
+        "score_timeline_offset_beats": mapper.timeline_offset_beats,
         "beat_unit": mapper.beat_unit,
         "beat_unit_source": mapper.beat_unit_source,
         "beat_unit_proven": mapper.beat_unit_proven,

@@ -140,12 +140,12 @@ def test_beatnet_score_origin_aligns_first_downbeat_to_measure_boundary() -> Non
     )
     score = quantize_events([NoteEvent(start_sec=0.5, end_sec=0.75, midi=60)], analysis, mode="monophonic")
     origin = score.metadata["score_origin"]
-    assert origin["strategy"] == "first_downbeat"
-    assert origin["downbeat_score_beat"] == pytest.approx(0.0)
-    assert origin["origin_shift_beats"] == pytest.approx(-1.0)
-    assert score.metadata["downbeat_status"] == "aligned"
+    assert origin["strategy"] == "downbeat_phase_undetermined"
+    assert origin["downbeat_score_beat"] == pytest.approx(1.0)
+    assert origin["origin_shift_beats"] == pytest.approx(0.0)
+    assert score.metadata["downbeat_status"] == "undetermined"
     note = next(event for event in score.voices[0].events if event.midi == 60)
-    assert note.start_tick == 0
+    assert note.start_tick == 12
 
 
 def test_beatnet_score_origin_records_pre_downbeat_pickup_candidate() -> None:
@@ -175,11 +175,124 @@ def test_beatnet_score_origin_records_pre_downbeat_pickup_candidate() -> None:
         mode="polyphonic",
     )
     origin = score.metadata["score_origin"]
-    assert origin["strategy"] == "first_downbeat_with_pickup_candidate"
+    assert origin["strategy"] == "downbeat_phase_undetermined"
     assert origin["pickup_candidate"] is True
-    assert origin["downbeat_score_beat"] == pytest.approx(4.0)
-    assert origin["downbeat_score_beat"] % origin["downbeat_bar_beats"] == pytest.approx(0.0)
-    assert score.metadata["downbeat_status"] == "aligned"
+    assert origin["downbeat_score_beat"] == pytest.approx(1.0)
+    assert origin["origin_shift_beats"] == pytest.approx(0.0)
+    assert origin["pickup_span_quarters"] == pytest.approx(0.8)
+    assert score.metadata["downbeat_status"] == "undetermined"
+    assert score.metadata["downbeat_warning"]
+
+
+def _structured_beat_grid(
+    beat_times: list[float],
+    *,
+    downbeat_index: int,
+    beats_per_bar: int = 4,
+    meter: str = "4/4",
+) -> dict[str, object]:
+    beats: list[dict[str, object]] = []
+    for index, time_sec in enumerate(beat_times):
+        relative_index = index - downbeat_index
+        bar_index = relative_index // beats_per_bar
+        beat_number = relative_index % beats_per_bar + 1
+        beats.append(
+            {
+                "index": index,
+                "time_sec": time_sec,
+                "downbeat": beat_number == 1,
+                "beat_number": beat_number,
+                "bar_index": bar_index,
+            }
+        )
+    return {
+        "beats": beats,
+        "time_signature": {"selected": meter, "source": "beatnet_derived", "confidence": 0.9},
+        "mapping": {
+            "beat_times": beat_times,
+            "manual_bpm_scale": 1.0,
+            "score_origin": {"downbeat_index": downbeat_index, "downbeat_sec": beat_times[downbeat_index]},
+        },
+    }
+
+
+def _grid_analysis(
+    beat_grid: dict[str, object],
+    beat_times: list[float],
+    events: list[NoteEvent],
+    *,
+    meter: str = "4/4",
+) -> MusicAnalysis:
+    return MusicAnalysis(
+        sample_rate=22050,
+        duration_sec=max(beat_times[-1], 1.0) + 0.25,
+        bpm=120,
+        time_signature=meter,
+        beat_times=beat_times,
+        note_events=events,
+        metadata={"beat_source": "beatnet", "beat_grid": beat_grid},
+    )
+
+
+@pytest.mark.parametrize("jitter_sec", [-0.1, -0.05, -0.02, 0.02, 0.05, 0.1])
+def test_pre_downbeat_jitter_never_relocates_a_whole_measure(jitter_sec: float) -> None:
+    beat_times = [index * 0.5 for index in range(9)]
+    grid = _structured_beat_grid(beat_times, downbeat_index=1)
+    event_start = 0.5 + jitter_sec
+    if event_start < 0:
+        event_start = 0.0
+    analysis = _grid_analysis(
+        grid,
+        beat_times,
+        [NoteEvent(start_sec=event_start, end_sec=event_start + 0.1, midi=60)],
+    )
+    score = quantize_events(analysis.note_events, analysis, mode="monophonic")
+    origin = score.metadata["score_origin"]
+    assert abs(float(origin["origin_shift_beats"])) < float(origin["downbeat_bar_beats"])
+    assert origin["strategy"] == "downbeat_phase_undetermined"
+    assert origin["downbeat_status"] == "undetermined"
+    assert origin["origin_shift_beats"] == pytest.approx(0.0)
+
+
+def test_substantive_pre_downbeat_span_stays_undetermined_without_explicit_pickup() -> None:
+    beat_times = [index * 0.5 for index in range(10)]
+    grid = _structured_beat_grid(beat_times, downbeat_index=4)
+    event = NoteEvent(start_sec=0.0, end_sec=0.2, midi=60)
+    analysis = _grid_analysis(grid, beat_times, [event])
+    score = quantize_events([event], analysis, mode="monophonic")
+    origin = score.metadata["score_origin"]
+    assert origin["strategy"] == "downbeat_phase_undetermined"
+    assert origin["downbeat_status"] == "undetermined"
+    assert origin["origin_shift_beats"] == pytest.approx(0.0)
+    assert origin["pickup_span_quarters"] == pytest.approx(4.0)
+    assert score.metadata["downbeat_warning"]
+
+
+def test_pre_downbeat_span_at_bar_duration_is_not_relocated() -> None:
+    beat_times = [index * 0.5 for index in range(10)]
+    grid = _structured_beat_grid(beat_times, downbeat_index=4)
+    event = NoteEvent(start_sec=0.0, end_sec=0.2, midi=60)
+    analysis = _grid_analysis(grid, beat_times, [event])
+    score = quantize_events([event], analysis, mode="monophonic")
+    origin = score.metadata["score_origin"]
+    assert origin["origin_shift_beats"] == pytest.approx(0.0)
+    assert origin["pickup_evidence"]["reason"] == "pickup_span_not_shorter_than_bar"
+
+
+def test_shared_analysis_event_bounds_keep_track_mappers_on_one_origin() -> None:
+    beat_times = [index * 0.5 for index in range(9)]
+    grid = _structured_beat_grid(beat_times, downbeat_index=1)
+    global_events = [
+        NoteEvent(start_sec=0.0, end_sec=0.2, midi=48, stem_id="drums"),
+        NoteEvent(start_sec=0.5, end_sec=0.7, midi=60, stem_id="piano"),
+    ]
+    analysis = _grid_analysis(grid, beat_times, global_events)
+    piano = quantize_events([global_events[1]], analysis, mode="monophonic")
+    drums = quantize_events([global_events[0]], analysis, mode="monophonic")
+    assert piano.metadata["score_origin"]["timeline_scope"] == "analysis_note_events"
+    assert drums.metadata["score_origin"]["timeline_scope"] == "analysis_note_events"
+    assert piano.metadata["score_origin"]["origin_shift_beats"] == pytest.approx(0.0)
+    assert drums.metadata["score_origin"]["origin_shift_beats"] == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(
