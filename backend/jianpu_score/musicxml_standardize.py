@@ -491,7 +491,14 @@ def _worker_raw_events(payload: WorkerPayload) -> tuple[list[_RawEvent], list[di
                     tuplet_type=item.tuplet_type,
                     dots=item.dots,
                     measure_number=item.measure_number,
-                    metadata={"musicxml_event_id": item.event_id},
+                    metadata={
+                        "musicxml_event_id": item.event_id,
+                        # Keep the explicit MusicXML part name alongside the
+                        # synthetic P1-StaffN grouping.  music21 can split a
+                        # named multi-staff part into P1/P2 groups, while the
+                        # part name still carries the source MIDI lane.
+                        "musicxml_part_name": part.name,
+                    },
                 )
             )
     diagnostics.extend(_annotate_source_tuplet_groups(events))
@@ -1981,10 +1988,10 @@ def _source_track_identity_partitions(
     A multi-track performance can be imported as one parent part plus a
     track-specific part.  Pitch-order matching across those parts is unsafe
     when the same pitch occurs in both tracks.  We use a lane only when the
-    MusicXML part group contains the lane's original track name and every
-    remaining group has exactly one remaining lane.  Any incomplete identity
-    evidence returns an explicit failed audit instead of falling back to a
-    potentially wrong global match.
+    MusicXML part group or its explicit display name contains the lane's
+    original track name and every remaining group has exactly one remaining
+    lane.  Any incomplete identity evidence returns an explicit failed audit
+    instead of falling back to a potentially wrong global match.
     """
 
     lane_values = [source.get("midi_lane") for source in source_notes]
@@ -2015,12 +2022,70 @@ def _source_track_identity_partitions(
                     names=sorted({previous, name}),
                 )
             names_by_lane[lane] = name
+    group_part_names: dict[str, list[str]] = {}
+    for unit in units:
+        group = _alignment_unit_group(unit)[0]
+        part_name = unit.chain[0][0].metadata.get("musicxml_part_name")
+        if isinstance(part_name, str) and part_name.strip():
+            values = group_part_names.setdefault(group, [])
+            if part_name not in values:
+                values.append(part_name)
+    for group in groups:
+        names = group_part_names.setdefault(group, [])
+        names.sort()
+        if len(names) > 1:
+            return fail(
+                "source_midi_lane_musicxml_part_names_conflict",
+                part_group=group,
+                musicxml_part_names=names,
+            )
+    group_match_names = {
+        group: (names[0] if names else group)
+        for group, names in group_part_names.items()
+    }
+    lane_metadata = {
+        str(lane): {
+            "track_names": sorted(
+                {
+                    str(source["midi_track_name"])
+                    for source in source_notes
+                    if int(source["midi_lane"]) == lane and source.get("midi_track_name")
+                }
+            ),
+            "midi_channels": sorted(
+                {
+                    int(source["midi_channel"])
+                    for source in source_notes
+                    if int(source["midi_lane"]) == lane and source.get("midi_channel") is not None
+                }
+            ),
+            "midi_track_indices": sorted(
+                {
+                    int(source["midi_track_index"])
+                    for source in source_notes
+                    if int(source["midi_lane"]) == lane and source.get("midi_track_index") is not None
+                }
+            ),
+        }
+        for lane in lanes
+    }
+    candidate_matches: dict[str, list[dict[str, Any]]] = {}
     group_to_lane: dict[str, int] = {}
     for group in groups:
+        match_name = group_match_names[group]
         candidates = [
             (len(name), lane)
             for lane, name in names_by_lane.items()
-            if name.casefold() in group.casefold()
+            if name.casefold() in match_name.casefold()
+        ]
+        candidate_matches[group] = [
+            {
+                "lane": lane,
+                "source_track_name": names_by_lane[lane],
+                "musicxml_part_name": match_name,
+                "match_length": length,
+            }
+            for length, lane in sorted(candidates, key=lambda item: (-item[0], item[1]))
         ]
         if not candidates:
             continue
@@ -2030,10 +2095,41 @@ def _source_track_identity_partitions(
                 "source_midi_lane_part_identity_ambiguous",
                 part_group=group,
                 candidate_lanes=[lane for _length, lane in candidates],
+                musicxml_part_name=match_name,
+                candidate_matches=candidate_matches,
             )
         group_to_lane[group] = candidates[0][1]
     if not group_to_lane:
-        return None
+        return fail(
+            "source_midi_lane_part_identity_missing",
+            mapped_groups={},
+            unassigned_lanes=list(lanes),
+            unassigned_groups=list(groups),
+            group_part_names=dict(group_match_names),
+            candidate_matches=candidate_matches,
+            source_lane_metadata=lane_metadata,
+        )
+
+    def duplicate_groups_by_lane(mapping: Mapping[str, int]) -> dict[str, list[str]]:
+        groups_by_lane: dict[int, list[str]] = {}
+        for group, lane in mapping.items():
+            groups_by_lane.setdefault(int(lane), []).append(group)
+        return {
+            str(lane): sorted(group_names)
+            for lane, group_names in groups_by_lane.items()
+            if len(group_names) > 1
+        }
+
+    duplicate_lane_groups = duplicate_groups_by_lane(group_to_lane)
+    if duplicate_lane_groups:
+        return fail(
+            "source_midi_lane_part_identity_not_bijective",
+            mapped_groups=dict(group_to_lane),
+            duplicate_lane_groups=duplicate_lane_groups,
+            group_part_names=dict(group_match_names),
+            candidate_matches=candidate_matches,
+            source_lane_metadata=lane_metadata,
+        )
     unassigned_lanes = [lane for lane in lanes if lane not in set(group_to_lane.values())]
     unassigned_groups = [group for group in groups if group not in group_to_lane]
     # A complete imported identity partition is valid: every MusicXML group
@@ -2050,11 +2146,24 @@ def _source_track_identity_partitions(
             mapped_groups=dict(group_to_lane),
             unassigned_lanes=unassigned_lanes,
             unassigned_groups=unassigned_groups,
+            group_part_names=dict(group_match_names),
+            candidate_matches=candidate_matches,
+            source_lane_metadata=lane_metadata,
         )
     if unassigned_lanes:
         fallback_lane = unassigned_lanes[0]
         for group in unassigned_groups:
             group_to_lane[group] = fallback_lane
+    duplicate_lane_groups = duplicate_groups_by_lane(group_to_lane)
+    if duplicate_lane_groups:
+        return fail(
+            "source_midi_lane_part_identity_not_bijective",
+            mapped_groups=dict(group_to_lane),
+            duplicate_lane_groups=duplicate_lane_groups,
+            group_part_names=dict(group_match_names),
+            candidate_matches=candidate_matches,
+            source_lane_metadata=lane_metadata,
+        )
 
     sources_by_lane: dict[int, list[dict[str, Any]]] = {lane: [] for lane in lanes}
     for source in source_notes:
@@ -2125,6 +2234,9 @@ def _source_track_identity_partitions(
         "mapped_groups": dict(group_to_lane),
         "unassigned_lanes": list(unassigned_lanes),
         "unassigned_groups": list(unassigned_groups),
+        "group_part_names": dict(group_match_names),
+        "candidate_matches": candidate_matches,
+        "source_lane_metadata": lane_metadata,
     }
 
 

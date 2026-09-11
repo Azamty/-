@@ -437,6 +437,119 @@ def test_midi_lane_identity_accepts_complete_named_partition_without_fallback() 
     assert len(hints) == len(sources)
 
 
+@pytest.mark.parametrize(
+    ("base_name", "display_prefix"),
+    [
+        ("synthetic-multitrack-02", "Piano"),
+        ("asap-v11-04", "Piano"),
+    ],
+    ids=["synthetic", "asap"],
+)
+def test_midi_lane_identity_uses_display_names_for_multistaff_groups(
+    base_name: str,
+    display_prefix: str,
+) -> None:
+    lane_two_name = f"{base_name} voice 2"
+    events = [
+        _parted_timed_event("p1-60", 60, 0, 48, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("p1-62", 62, 480, 528, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("p1-64", 64, 960, 1008, part_id="P1-Staff2", part_group="P1", staff=2),
+        _parted_timed_event("p2-65", 65, 0, 48, part_id="P2-Staff1", part_group="P2", staff=1),
+        _parted_timed_event("p2-67", 67, 480, 528, part_id="P2-Staff1", part_group="P2", staff=1),
+        _parted_timed_event("p2-69", 69, 960, 1008, part_id="P2-Staff2", part_group="P2", staff=2),
+    ]
+    for event in events[:3]:
+        event.metadata["musicxml_part_name"] = f"{display_prefix}, {base_name}"
+    for event in events[3:]:
+        event.metadata["musicxml_part_name"] = f"{display_prefix}, {lane_two_name}"
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 480, 528),
+        _timed_source(2, 64, 960, 1008),
+        _timed_source(3, 65, 0, 48),
+        _timed_source(4, 67, 480, 528),
+        _timed_source(5, 69, 960, 1008),
+    ]
+    for source in sources[:3]:
+        source.update(midi_lane=0, midi_track_name=base_name, midi_channel=1, midi_track_index=1)
+    for source in sources[3:]:
+        source.update(midi_lane=1, midi_track_name=lane_two_name, midi_channel=2, midi_track_index=2)
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert audit["applied"] is True
+    assert audit["mapped_groups"] == {"P1": 0, "P2": 1}
+    assert audit["group_part_names"] == {
+        "P1": f"{display_prefix}, {base_name}",
+        "P2": f"{display_prefix}, {lane_two_name}",
+    }
+    assert audit["unassigned_lanes"] == []
+    assert audit["unassigned_groups"] == []
+    assert audit["candidate_matches"]["P2"] == [
+        {
+            "lane": 1,
+            "match_length": len(lane_two_name),
+            "musicxml_part_name": f"{display_prefix}, {lane_two_name}",
+            "source_track_name": lane_two_name,
+        },
+        {
+            "lane": 0,
+            "match_length": len(base_name),
+            "musicxml_part_name": f"{display_prefix}, {lane_two_name}",
+            "source_track_name": base_name,
+        },
+    ]
+    assert audit["source_lane_metadata"] == {
+        "0": {"midi_channels": [1], "midi_track_indices": [1], "track_names": [base_name]},
+        "1": {"midi_channels": [2], "midi_track_indices": [2], "track_names": [lane_two_name]},
+    }
+    assert audit["pitch_multiset_equal"] is True
+    assert audit["one_to_one"] is True
+    assert len(hints) == len(sources)
+
+
+def test_midi_lane_identity_missing_display_names_fails_closed_before_global_match() -> None:
+    events = [
+        _parted_timed_event("p1-60", 60, 0, 48, part_id="P1-Staff1", part_group="P1", staff=1),
+        _parted_timed_event("p2-60", 60, 0, 48, part_id="P2-Staff1", part_group="P2", staff=1),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 60, 0, 48),
+    ]
+    sources[0].update(midi_lane=0, midi_track_name="lane one", midi_channel=1, midi_track_index=1)
+    sources[1].update(midi_lane=1, midi_track_name="lane two", midi_channel=2, midi_track_index=2)
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert hints == {}
+    assert audit["applied"] is False
+    assert audit["reason"] == "source_midi_lane_part_identity_missing"
+    assert audit["mapped_groups"] == {}
+    assert audit["unassigned_lanes"] == [0, 1]
+    assert audit["unassigned_groups"] == ["P1", "P2"]
+    assert audit["candidate_matches"] == {"P1": [], "P2": []}
+
+
+def test_midi_lane_identity_rejects_non_bijective_longest_matches() -> None:
+    events = [
+        _parted_timed_event("p1-60", 60, 0, 48, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("p2-62", 62, 480, 528, part_id="P2", part_group="P2", staff=1),
+    ]
+    events[0].metadata["musicxml_part_name"] = "Piano, lane two"
+    events[1].metadata["musicxml_part_name"] = "Piano, lane two"
+    sources = [_timed_source(0, 60, 0, 48), _timed_source(1, 62, 480, 528)]
+    sources[0].update(midi_lane=0, midi_track_name="lane", midi_channel=1, midi_track_index=1)
+    sources[1].update(midi_lane=1, midi_track_name="lane two", midi_channel=2, midi_track_index=2)
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert hints == {}
+    assert audit["applied"] is False
+    assert audit["reason"] == "source_midi_lane_part_identity_not_bijective"
+    assert audit["duplicate_lane_groups"] == {"1": ["P1", "P2"]}
+
+
 def test_midi_lane_singleton_reuses_unique_shared_affine_model() -> None:
     events = [
         _parted_timed_event("lane1-60", 60, 0, 48, part_id="P1", part_group="P1", staff=1),
