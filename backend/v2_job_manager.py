@@ -1875,15 +1875,9 @@ class V2JobService:
         for source_index, note in indexed:
             grouped.setdefault(round(float(note["start_sec"]), 5), []).append(source_index)
         onset_keys = sorted(grouped)
-        for key in onset_keys:
-            grouped[key].sort(
-                key=lambda index: (
-                    -int(pitched[index]["pitch"]),
-                    float(pitched[index]["end_sec"]),
-                    index,
-                )
-            )
-        baseline_indices = [grouped[key][0] for key in onset_keys]
+        # ``max`` is stable for equal values, matching the historical loop:
+        # an equal-pitch duplicate keeps the first raw event at that onset.
+        baseline_indices = [max(grouped[key], key=lambda index: int(pitched[index]["pitch"])) for key in onset_keys]
 
         def local_ioi(group_index: int) -> float:
             distances: list[float] = []

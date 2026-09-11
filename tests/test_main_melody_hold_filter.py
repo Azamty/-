@@ -136,6 +136,18 @@ def test_derived_note_end_is_clipped_without_losing_source_end_audit() -> None:
     assert audit["derived_notes"][0]["clipped_to_next_onset"] is True
 
 
+def test_equal_pitch_duplicate_keeps_first_raw_event_like_old_v2_baseline() -> None:
+    first = _note("piano", 72, 0.0, 0.9)
+    second = _note("piano", 72, 0.0, 0.2)
+    first["source_label"] = "first"
+    second["source_label"] = "second"
+
+    selected, audit = V2JobService._select_main_melody_notes([first, second], {"piano"})
+
+    assert selected[0]["source_label"] == "first"
+    assert audit["selected_source_indices"] == [0]
+
+
 def test_missing_confidence_and_playback_metadata_are_not_selector_evidence() -> None:
     notes = [_note("piano", 60, 0.0, 0.2), _note("piano", 62, 0.2, 0.4)]
     notes[0]["metadata"] = {"playback_default": 80}
