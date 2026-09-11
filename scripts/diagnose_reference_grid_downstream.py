@@ -824,32 +824,53 @@ def _aggregate(cases: Sequence[Mapping[str, Any]], baseline_report: Mapping[str,
     strict = [item for item in cases if item.get("status") == "success" and not _fallback_used(item)]
     fallback = [item for item in cases if item.get("status") == "success" and _fallback_used(item)]
     all_diagnostic = list(cases)
+    strict_complete = bool(
+        all_diagnostic
+        and len(strict) == len(all_diagnostic)
+        and not fallback
+        and all(item.get("status") == "success" for item in all_diagnostic)
+    )
+    strict_gate_status = "strict_complete" if strict_complete else "strict_incomplete"
     groups = {
-        "strict_production_compatible": _group_summary(strict, label="strict_production_compatible", gate_status="strict_incomplete"),
+        "strict_production_compatible": _group_summary(
+            strict,
+            label="strict_production_compatible",
+            gate_status=strict_gate_status,
+        ),
         "diagnostic_tempo_fallback": _group_summary(fallback, label="diagnostic_tempo_fallback", gate_status="diagnostic_only"),
         "all_diagnostic": _group_summary(all_diagnostic, label="all_diagnostic", gate_status="provisional"),
     }
     all_summary = groups["all_diagnostic"]
     strict_summary = groups["strict_production_compatible"]
     fallback_summary = groups["diagnostic_tempo_fallback"]
-    # A non-empty fallback population makes the strict gate incomplete even
-    # when all diagnostic outputs happen to clear the numerical threshold.
+    if strict_complete:
+        reference_grid_sufficient = bool(strict_summary["rhythm_20_percent_target_met"])
+        reference_grid_sufficiency_status = "strict_complete"
+        reference_grid_sufficiency_reason = (
+            f"all {len(all_diagnostic)} cases completed through the strict production-compatible path; "
+            f"the 20% rhythm target was {'met' if reference_grid_sufficient else 'not met'} numerically."
+        )
+    else:
+        reference_grid_sufficient = None
+        reference_grid_sufficiency_status = "provisional_only_strict_population_incomplete"
+        reference_grid_sufficiency_reason = (
+            f"{len(fallback)} of {len(cases)} cases required diagnostic tempo fallback and "
+            f"{sum(item.get('status') != 'success' for item in all_diagnostic)} failed; "
+            "the all-diagnostic threshold cannot establish production sufficiency."
+        )
     return {
         **all_summary,
         "groups": groups,
         "strict_production_compatible_count": len(strict),
         "diagnostic_tempo_fallback_count": len(fallback),
         "all_diagnostic_count": len(all_diagnostic),
-        "strict_gate_status": "incomplete",
+        "strict_gate_status": strict_gate_status,
         "all_diagnostic_gate_status": "provisional",
         "fallback_gate_status": "diagnostic_only",
-        "strict_gate_eligible": False,
-        "reference_grid_sufficient_for_rhythm_target": None,
-        "reference_grid_sufficiency_status": "provisional_only_strict_population_incomplete",
-        "reference_grid_sufficiency_reason": (
-            f"{len(fallback)} of {len(cases)} cases required diagnostic tempo fallback; "
-            "the all-diagnostic threshold cannot establish production sufficiency."
-        ),
+        "strict_gate_eligible": strict_complete,
+        "reference_grid_sufficient_for_rhythm_target": reference_grid_sufficient,
+        "reference_grid_sufficiency_status": reference_grid_sufficiency_status,
+        "reference_grid_sufficiency_reason": reference_grid_sufficiency_reason,
         # Explicit aliases make the separate populations easy to consume from
         # JSON without requiring callers to understand the compatibility keys.
         "strict_production_compatible": strict_summary,

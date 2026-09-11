@@ -64,6 +64,12 @@ def test_aggregate_reports_whether_oracle_reaches_twenty_percent_gate() -> None:
     report = _aggregate([item("a", "synthetic", 0.7), item("b", "official", 0.7)], {"accuracy_gate": {}})
     assert report["final_score_improvement_vs_baseline_percent"] == pytest.approx(30.0)
     assert report["rhythm_20_percent_target_met"] is True
+    assert report["strict_gate_status"] == "strict_complete"
+    assert report["strict_gate_eligible"] is True
+    assert report["groups"]["strict_production_compatible"]["gate_status"] == "strict_complete"
+    assert report["groups"]["strict_production_compatible"]["gate_eligible"] is True
+    assert report["reference_grid_sufficient_for_rhythm_target"] is True
+    assert report["reference_grid_sufficiency_status"] == "strict_complete"
 
 
 def test_aggregate_separates_strict_fallback_and_all_diagnostic_populations() -> None:
@@ -92,8 +98,34 @@ def test_aggregate_separates_strict_fallback_and_all_diagnostic_populations() ->
     assert report["groups"]["strict_production_compatible"]["case_count"] == 1
     assert report["groups"]["diagnostic_tempo_fallback"]["case_count"] == 1
     assert report["groups"]["all_diagnostic"]["case_count"] == 2
-    assert report["strict_gate_status"] == "incomplete"
+    assert report["strict_gate_status"] == "strict_incomplete"
     assert report["all_diagnostic_gate_status"] == "provisional"
+    assert report["reference_grid_sufficient_for_rhythm_target"] is None
+
+
+def test_aggregate_keeps_strict_gate_incomplete_when_case_fails() -> None:
+    successful = {
+        "id": "strict-success",
+        "category": "synthetic",
+        "status": "success",
+        "baseline": {"metrics": {"rhythm_error": {"mean_fixed_total_assignment_rhythm_error_quarter": 1.0}}},
+        "final_score": {"rhythm_error": {"mean_fixed_total_assignment_rhythm_error_quarter": 0.5}},
+        "diagnostic_tempo_fallback": {"used": False},
+    }
+    failed = {
+        "id": "strict-failure",
+        "category": "synthetic",
+        "status": "failed",
+        "error": "renderer failed",
+        "diagnostic_tempo_fallback": {"used": False},
+    }
+
+    report = _aggregate([successful, failed], {"accuracy_gate": {}})
+
+    assert report["strict_production_compatible_count"] == 1
+    assert report["all_diagnostic_count"] == 2
+    assert report["strict_gate_status"] == "strict_incomplete"
+    assert report["strict_gate_eligible"] is False
     assert report["reference_grid_sufficient_for_rhythm_target"] is None
 
 
