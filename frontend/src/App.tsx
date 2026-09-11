@@ -4,7 +4,7 @@ import { FIXTURE_JOB, FIXTURE_NOTES, FIXTURE_TRACKS } from "./fixtures/multitrac
 import { FIXTURE_VOCAL_JOB } from "./fixtures/vocal";
 import { modelChoiceDisabled, modelChoiceHint } from "./modelChoice";
 import { canPersistSelection, parseSelectionDraft, resolveSelectionValues, SELECTION_DRAFT_SCHEMA, SELECTION_DRAFT_VERSION, selectionStorageKey, type ManualSelectionFields } from "./selectionState";
-import { classifyScoreArtifacts } from "./scoreArtifacts";
+import { classifyScoreArtifacts, filterArtifactsForSelectionRevision } from "./scoreArtifacts";
 import { clampPlaybackOffset, cloneSoundfontBuffer, playbackPosition, slicePlaybackNotes } from "./synthPlayback";
 
 type SourceKind = "instrumental" | "vocal";
@@ -19,6 +19,7 @@ type Artifact = {
   size_bytes: number;
   stem_id?: string | null;
   page?: number | null;
+  relative_path?: string | null;
   url?: string | null;
 };
 
@@ -666,18 +667,22 @@ function App() {
   const isReady = job?.status === "selection_ready" || job?.status === "completed";
   const pitchedSelected = tracks.some((track) => selectedTrackIds.includes(track.track_id) && !track.is_drum);
   const selectedTracks = tracks.filter((track) => selectedTrackIds.includes(track.track_id));
-  const instrumentScoreArtifacts = classifyScoreArtifacts(artifacts, "instrument");
+  const activeSelectionRevision = isInstrumental
+    ? (job?.v2?.selection_revision ?? job?.v2?.selection?.revision)
+    : undefined;
+  const currentArtifacts = filterArtifactsForSelectionRevision(artifacts, activeSelectionRevision);
+  const instrumentScoreArtifacts = classifyScoreArtifacts(currentArtifacts, "instrument");
   const longScoreArtifacts = instrumentScoreArtifacts.long;
   const pagedScoreArtifacts = instrumentScoreArtifacts.paged;
-  const vocalScoreArtifacts = classifyScoreArtifacts(artifacts, "vocal");
+  const vocalScoreArtifacts = classifyScoreArtifacts(currentArtifacts, "vocal");
   const vocalLongScoreArtifacts = vocalScoreArtifacts.long;
   const vocalPagedScoreArtifacts = vocalScoreArtifacts.paged;
-  const originalArtifact = artifacts.find((item) => item.kind === "source_audio");
-  const vocalArtifact = artifacts.find((item) => item.kind === "vocal_audio" || item.artifact_id === "v2-vocals-audio");
-  const selectedMidi = [...artifacts].reverse().find((item) => item.kind === "selected_midi");
-  const selectedZip = [...artifacts].reverse().find((item) => item.kind === "svg_zip");
-  const originalMidi = artifacts.find((item) => item.kind === "original_midi");
-  const vocalMidi = artifacts.find((item) => ["vocal_score_midi", "main_melody_score_midi", "midi"].includes(item.kind));
+  const originalArtifact = currentArtifacts.find((item) => item.kind === "source_audio");
+  const vocalArtifact = currentArtifacts.find((item) => item.kind === "vocal_audio" || item.artifact_id === "v2-vocals-audio");
+  const selectedMidi = [...currentArtifacts].reverse().find((item) => item.kind === "selected_midi");
+  const selectedZip = [...currentArtifacts].reverse().find((item) => item.kind === "svg_zip");
+  const originalMidi = currentArtifacts.find((item) => item.kind === "original_midi");
+  const vocalMidi = currentArtifacts.find((item) => ["vocal_score_midi", "main_melody_score_midi", "midi"].includes(item.kind));
   const highAccuracyMetadata: HighAccuracyMetadata = {
     notation_engine: job?.v2?.notation_engine,
     beat_engine: job?.v2?.beat_engine,
@@ -685,10 +690,10 @@ function App() {
     musescore_version: job?.v2?.musescore_version,
     score_ticks_per_quarter: job?.v2?.score_ticks_per_quarter,
   };
-  const primaryArtifactDownloads = artifacts
+  const primaryArtifactDownloads = currentArtifacts
     .filter((item) => HIGH_ACCURACY_PRIMARY_KINDS.has(item.kind) && item.url)
     .sort((left, right) => highAccuracyArtifactLabel(left).localeCompare(highAccuracyArtifactLabel(right)));
-  const supportArtifactDownloads = artifacts
+  const supportArtifactDownloads = currentArtifacts
     .filter((item) => HIGH_ACCURACY_SUPPORT_KINDS.has(item.kind) && item.url)
     .sort((left, right) => left.artifact_id.localeCompare(right.artifact_id));
   const trackFailures = job?.v2?.track_failures || [];
