@@ -110,6 +110,8 @@ def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
     assert report["evaluated_count"] == 0
     assert report["accuracy_claim_ready"] is False
     assert all(item["metrics"]["pitch_f1"] is None for item in report["cases"])
+    assert all(item["metrics"]["note_onset_f1"] is None for item in report["cases"])
+    assert all(item["metrics"]["pitch_multiset_f1"] is None for item in report["cases"])
 
 
 def test_reliable_diagnostic_case_is_excluded_from_main_gate_index() -> None:
@@ -161,11 +163,39 @@ def test_evaluator_normalizes_different_ppq_and_does_not_invent_missing_beats(tm
     assert evaluated["status"] == "evaluated"
     assert evaluated["crash"] is False
     assert evaluated["metrics"]["pitch_f1"]["f1"] == 1.0
+    assert evaluated["metrics"]["note_onset_f1"] == evaluated["metrics"]["pitch_f1"]
+    assert evaluated["metrics"]["note_onset_f1"]["metric_name"] == "note_onset_f1"
+    assert evaluated["metrics"]["note_onset_f1"]["definition"] == benchmark.NOTE_ONSET_F1_DEFINITION
+    assert evaluated["metrics"]["pitch_multiset_f1"]["f1"] == 1.0
+    assert evaluated["metrics"]["pitch_multiset_f1"]["diagnostic_only"] is True
+    assert evaluated["metrics"]["pitch_multiset_f1"]["formal_accuracy_metric"] is False
     assert evaluated["metrics"]["chord_retention"]["retention"] == 1.0
     assert evaluated["metrics"]["rhythm_error"]["mean_onset_error_quarter"] == 0.0
     assert evaluated["metrics"]["rhythm_error"]["mean_duration_error_quarter"] == 0.0
     assert evaluated["metrics"]["rhythm_error"]["mean_rhythm_error_quarter"] == 0.0
     assert evaluated["metrics"]["beat_f1"] is None
+
+
+def test_pitch_multiset_diagnostic_ignores_time_order_and_duration() -> None:
+    reference = [
+        (60, benchmark.Fraction(0), benchmark.Fraction(1)),
+        (60, benchmark.Fraction(1), benchmark.Fraction(2)),
+        (64, benchmark.Fraction(2), benchmark.Fraction(3)),
+    ]
+    predicted = [
+        (64, benchmark.Fraction(8), benchmark.Fraction(9)),
+        (60, benchmark.Fraction(10), benchmark.Fraction(12)),
+        (60, benchmark.Fraction(14), benchmark.Fraction(14) + benchmark.Fraction(1, 4)),
+    ]
+    note_onset = benchmark.pitch_metrics(
+        reference, predicted, tolerance_quarters=benchmark.Fraction(1, 16)
+    )
+    multiset = benchmark.pitch_multiset_metrics(reference, predicted)
+    assert note_onset["f1"] == 0.0
+    assert multiset["f1"] == 1.0
+    assert "onset" in multiset["definition"]
+    assert multiset["diagnostic_only"] is True
+    assert multiset["formal_accuracy_metric"] is False
 
 
 def test_rhythm_assignment_penalizes_unmatched_notes_and_zero_match_cases() -> None:
@@ -212,6 +242,13 @@ def test_rhythm_gate_prefers_fixed_total_metric_when_report_has_both_fields() ->
     legacy = {"metrics": {"rhythm_error": {"mean_rhythm_error_quarter": 0.01}}}
     assert benchmark._metric_f1(legacy, "rhythm_error", "mean_rhythm_error_quarter") is None
     assert benchmark._has_fixed_total_rhythm_metric(legacy) is False
+
+
+def test_note_onset_gate_accepts_legacy_pitch_f1_and_canonical_name() -> None:
+    legacy = {"metrics": {"pitch_f1": {"f1": 0.71}}}
+    canonical = {"metrics": {"note_onset_f1": {"f1": 0.72}}}
+    assert benchmark._metric_f1(legacy, "note_onset_f1", "f1") == 0.71
+    assert benchmark._metric_f1(canonical, "pitch_f1", "f1") == 0.72
 
 
 def test_accuracy_gate_rejects_legacy_rhythm_report_instead_of_falling_back() -> None:
@@ -372,6 +409,42 @@ def test_beat_unit_semantic_gate_rejects_legacy_six_eight_and_three_four_misrepo
     )
     assert mismatch["valid"] is False
     assert any("does not match expected meter" in error for error in mismatch["errors"])
+
+
+def test_beat_semantic_gate_uses_reference_annotation_meter_only_for_evaluation(tmp_path: Path) -> None:
+    reference_annotation = tmp_path / "reference-beats.json"
+    reference_annotation.write_text(
+        json.dumps({"beat_grid": {"time_signature": {"selected": "3/4"}}}),
+        encoding="utf-8",
+    )
+    predicted = tmp_path / "predicted-beats.json"
+    predicted.write_text(
+        json.dumps(
+            {
+                "time_signature": {"selected": "4/4"},
+                "beat_unit_definition": "quarter",
+                "beat_unit_source": "standard_meter_definition",
+                "beat_unit_proven": True,
+                "beat_duration_quarters": 1.0,
+                "beats_per_bar": 4,
+                "bar_duration_quarters": 4.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    case = {"beat_annotation": str(reference_annotation)}
+    gate = benchmark.beat_unit_semantic_gate(case, predicted)
+    assert gate["expected_meter"] == "3/4"
+    assert gate["expected_meter_source"] == "reference_beat_annotation.time_signature.selected"
+    assert gate["valid"] is False
+    assert any("does not match expected meter" in error for error in gate["errors"])
+    # An explicit manifest expectation remains authoritative over the
+    # evaluator-only reference fallback.
+    explicit = benchmark.beat_unit_semantic_gate(
+        {"expected_meter": "4/4", "beat_annotation": str(reference_annotation)}, predicted
+    )
+    assert explicit["valid"] is True
+    assert explicit["expected_meter_source"] == "case.expected_meter"
 
 
 def test_evaluator_never_scans_neighbor_pipeline_artifacts(tmp_path: Path) -> None:
@@ -554,6 +627,10 @@ def test_accuracy_gate_requires_real_baseline_and_accepts_synthetic_passing_fixt
     gate = benchmark.assess_accuracy_claim(new, baseline)
     assert gate["ready"] is True
     assert abs(float(gate["new_mean_rhythm_error_quarter"]) - 0.1) < 1e-9
+    assert gate["new_mean_note_onset_f1"] == pytest.approx(0.9)
+    assert gate["new_mean_note_onset_f1"] == gate["new_mean_pitch_f1"]
+    assert gate["baseline_mean_note_onset_f1"] == pytest.approx(0.91)
+    assert gate["baseline_mean_note_onset_f1"] == gate["baseline_mean_pitch_f1"]
     assert gate["shared_case_ids"] == [f"case-{index}" for index in range(30)]
 
     insufficient = benchmark.assess_accuracy_claim(new[:29], baseline)

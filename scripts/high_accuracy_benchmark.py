@@ -29,6 +29,11 @@ DEFAULT_OUTPUT = ROOT / "artifacts" / "review" / "high-accuracy-benchmark" / "la
 MidiNote = tuple[int, Fraction, Fraction]
 UNMATCHED_NOTE_PENALTY_QUARTERS = Fraction(1, 1)
 RHYTHM_METRIC_SCHEMA = "fixed_total_assignment_v1"
+NOTE_ONSET_F1_DEFINITION = "pitch and onset tolerance joint F1"
+PITCH_MULTISET_F1_DEFINITION = (
+    "diagnostic pitch multiset overlap F1; ignores onset, order, and duration; "
+    "not a formal accuracy metric"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -158,7 +163,40 @@ def pitch_metrics(reference: Sequence[MidiNote], predicted: Sequence[MidiNote], 
             _, ref_index = min(candidates)
             used.add(ref_index)
             matched.append((ref_index, pred_index))
-    return _f1(len(matched), len(matched), len(predicted), len(reference))
+    metric = _f1(len(matched), len(matched), len(predicted), len(reference))
+    metric.update(
+        {
+            "metric_name": "note_onset_f1",
+            "definition": NOTE_ONSET_F1_DEFINITION,
+            "onset_tolerance_quarters": float(tolerance_quarters),
+        }
+    )
+    return metric
+
+
+def pitch_multiset_metrics(
+    reference: Sequence[MidiNote], predicted: Sequence[MidiNote]
+) -> dict[str, Any]:
+    """Return a pitch-only diagnostic with no temporal matching semantics.
+
+    Each MIDI pitch contributes once per occurrence.  Onset, order, and
+    duration are intentionally ignored, so this value is useful for
+    attribution only and must not be used as the formal accuracy gate.
+    """
+
+    reference_counts = Counter(pitch for pitch, _start, _end in reference)
+    predicted_counts = Counter(pitch for pitch, _start, _end in predicted)
+    matched = sum((reference_counts & predicted_counts).values())
+    metric = _f1(matched, matched, len(predicted), len(reference))
+    metric.update(
+        {
+            "metric_name": "pitch_multiset_f1",
+            "definition": PITCH_MULTISET_F1_DEFINITION,
+            "diagnostic_only": True,
+            "formal_accuracy_metric": False,
+        }
+    )
+    return metric
 
 
 def rhythm_error(reference: Sequence[MidiNote], predicted: Sequence[MidiNote], *, tolerance_quarters: Fraction) -> dict[str, Any]:
@@ -284,16 +322,45 @@ def _read_json_object(path: Path | None) -> Mapping[str, Any] | None:
     return payload if isinstance(payload, Mapping) else None
 
 
-def _expected_time_signature(case: Mapping[str, Any]) -> str | None:
-    value = case.get("time_signature")
+def _time_signature_value(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        value = value.get("selected")
     if isinstance(value, str) and value.strip():
-        return value
+        return value.strip()
+    return None
+
+
+def _expected_time_signature_with_source(case: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    # Explicit manifest expectations always win.  The reference annotation is
+    # consulted only by this evaluator-side semantic gate; it is never fed to
+    # recognition, BeatNet, or score generation.
+    for key in ("expected_meter", "time_signature"):
+        value = _time_signature_value(case.get(key))
+        if value is not None:
+            return value, f"case.{key}"
     context = case.get("music_context_policy")
     if isinstance(context, Mapping):
-        value = context.get("meter") or context.get("time_signature")
-        if isinstance(value, str) and value.strip():
-            return value
-    return None
+        value = _time_signature_value(context.get("meter") or context.get("time_signature"))
+        if value is not None:
+            return value, "case.music_context_policy"
+
+    annotation_value = case.get("reference_beat_annotation") or case.get("beat_annotation")
+    annotation = _read_json_object(_resolve_path(annotation_value))
+    if annotation is not None:
+        candidates: list[Mapping[str, Any]] = [annotation]
+        for key in ("beat_grid", "grid"):
+            nested = annotation.get(key)
+            if isinstance(nested, Mapping):
+                candidates.append(nested)
+        for candidate in candidates:
+            value = _time_signature_value(candidate.get("time_signature"))
+            if value is not None:
+                return value, "reference_beat_annotation.time_signature.selected"
+    return None, None
+
+
+def _expected_time_signature(case: Mapping[str, Any]) -> str | None:
+    return _expected_time_signature_with_source(case)[0]
 
 
 def beat_unit_semantic_gate(
@@ -302,22 +369,24 @@ def beat_unit_semantic_gate(
 ) -> dict[str, Any]:
     """Check meter and pulse-unit semantics independently of timestamp F1."""
 
+    expected, expected_source = _expected_time_signature_with_source(case)
     payload = _read_json_object(beat_grid_path)
     if payload is None:
         return {
             "available": False,
             "valid": None,
-            "expected_meter": _expected_time_signature(case),
+            "expected_meter": expected,
+            "expected_meter_source": expected_source,
             "errors": ["predicted beat_grid artifact is unavailable"],
             "warnings": [],
         }
-    expected = _expected_time_signature(case)
     grid = payload.get("beat_grid") if isinstance(payload.get("beat_grid"), Mapping) else payload
     if not isinstance(grid, Mapping):
         return {
             "available": True,
             "valid": False,
             "expected_meter": expected,
+            "expected_meter_source": expected_source,
             "errors": ["predicted beat_grid payload is not an object"],
             "warnings": [],
         }
@@ -341,6 +410,7 @@ def beat_unit_semantic_gate(
             "valid": False,
             "meter": None,
             "expected_meter": expected,
+            "expected_meter_source": expected_source,
             "errors": [str(exc)],
             "warnings": [],
         }
@@ -427,6 +497,7 @@ def beat_unit_semantic_gate(
         "bar_duration_quarters": semantics.get("bar_duration_quarters"),
         "source": semantics.get("source"),
         "proven": bool(semantics.get("proven")),
+        "expected_meter_source": expected_source,
         "errors": errors,
         "warnings": warnings,
     }
@@ -547,7 +618,15 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         "case_evaluation_scope": case.get("evaluation_scope"),
         "status": "registered",
         "crash": None,
-        "metrics": {"pitch_f1": None, "chord_retention": None, "rhythm_error": None, "beat_f1": None, "downbeat_f1": None},
+        "metrics": {
+            "pitch_f1": None,
+            "note_onset_f1": None,
+            "pitch_multiset_f1": None,
+            "chord_retention": None,
+            "rhythm_error": None,
+            "beat_f1": None,
+            "downbeat_f1": None,
+        },
         "beat_metrics_eligible": False,
         "beat_metrics_reason": None,
         "beat_unit_semantic_gate": None,
@@ -592,8 +671,13 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         # quarter-note Fractions.  The tolerance is therefore independent of
         # whether one file uses 96, 480, or another PPQ.
         tolerance_quarters = Fraction(1, 16)
+        note_onset_metric = pitch_metrics(reference, predicted, tolerance_quarters=tolerance_quarters)
         result["metrics"] = {
-            "pitch_f1": pitch_metrics(reference, predicted, tolerance_quarters=tolerance_quarters),
+            # Keep pitch_f1 as a wire-compatible alias.  The metric is a
+            # pitch-and-onset joint score, despite the historical name.
+            "pitch_f1": note_onset_metric,
+            "note_onset_f1": note_onset_metric,
+            "pitch_multiset_f1": pitch_multiset_metrics(reference, predicted),
             "chord_retention": chord_retention(reference, predicted, tolerance_quarters=tolerance_quarters),
             "rhythm_error": rhythm_error(reference, predicted, tolerance_quarters=tolerance_quarters),
             "beat_f1": None,
@@ -629,7 +713,15 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
 
 
 def _metric_f1(case: Mapping[str, Any], name: str, field: str) -> float | None:
-    value = (case.get("metrics") or {}).get(name)
+    metrics = case.get("metrics") or {}
+    if not isinstance(metrics, Mapping):
+        return None
+    value = metrics.get(name)
+    if name in {"pitch_f1", "note_onset_f1"} and not isinstance(value, Mapping):
+        # Reports written before the canonical name was introduced only have
+        # pitch_f1.  Accept that alias for aggregation while keeping the
+        # canonical metric used by the formal gate explicit.
+        value = metrics.get("pitch_f1" if name == "note_onset_f1" else "note_onset_f1")
     if not isinstance(value, Mapping):
         return None
     number = value.get(field)
@@ -789,8 +881,10 @@ def assess_accuracy_claim(
 
     baseline_rhythm = _mean_metric(baseline_reliable, "rhythm_error", "mean_rhythm_error_quarter")
     new_rhythm = _mean_metric(reliable, "rhythm_error", "mean_rhythm_error_quarter")
-    baseline_pitch = _mean_metric(baseline_reliable, "pitch_f1", "f1")
-    new_pitch = _mean_metric(reliable, "pitch_f1", "f1")
+    baseline_pitch = _mean_metric(baseline_reliable, "note_onset_f1", "f1")
+    new_pitch = _mean_metric(reliable, "note_onset_f1", "f1")
+    baseline_pitch_multiset = _mean_metric(baseline_reliable, "pitch_multiset_f1", "f1")
+    new_pitch_multiset = _mean_metric(reliable, "pitch_multiset_f1", "f1")
     baseline_chord = _mean_metric(baseline_reliable, "chord_retention", "retention")
     new_chord = _mean_metric(reliable, "chord_retention", "retention")
     if baseline_rhythm is None or new_rhythm is None:
@@ -801,9 +895,9 @@ def assess_accuracy_claim(
     elif new_rhythm > baseline_rhythm * 0.8:
         reasons.append(f"节奏误差未下降至少20%（新 {new_rhythm:.6f}，baseline {baseline_rhythm:.6f}）")
     if baseline_pitch is None or new_pitch is None:
-        reasons.append("新链路或 baseline 缺少 pitch F1")
+        reasons.append("新链路或 baseline 缺少 note onset F1（兼容字段 pitch_f1）")
     elif new_pitch + 1e-9 < baseline_pitch - 0.01:
-        reasons.append(f"pitch F1 下降超过0.01（新 {new_pitch:.6f}，baseline {baseline_pitch:.6f}）")
+        reasons.append(f"note onset F1 下降超过0.01（新 {new_pitch:.6f}，baseline {baseline_pitch:.6f}）")
     if baseline_chord is None or new_chord is None:
         reasons.append("新链路或 baseline 缺少和弦保留率")
     elif new_chord < baseline_chord:
@@ -828,6 +922,12 @@ def assess_accuracy_claim(
         "baseline_mean_rhythm_error_quarter": baseline_rhythm,
         "new_mean_pitch_f1": new_pitch,
         "baseline_mean_pitch_f1": baseline_pitch,
+        "new_mean_note_onset_f1": new_pitch,
+        "baseline_mean_note_onset_f1": baseline_pitch,
+        "new_mean_pitch_multiset_f1": new_pitch_multiset,
+        "baseline_mean_pitch_multiset_f1": baseline_pitch_multiset,
+        "note_onset_f1_definition": NOTE_ONSET_F1_DEFINITION,
+        "pitch_multiset_f1_definition": PITCH_MULTISET_F1_DEFINITION,
         "new_mean_chord_retention": new_chord,
         "baseline_mean_chord_retention": baseline_chord,
     }

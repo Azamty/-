@@ -36,11 +36,24 @@ def _json(path: Path) -> Any:
 
 def _metric_summary(evaluation: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(evaluation, Mapping):
-        return {"pitch_f1": None, "chord_retention": None, "rhythm_error": None, "beat_f1": None, "downbeat_f1": None}
+        return {
+            "pitch_f1": None,
+            "note_onset_f1": None,
+            "pitch_multiset_f1": None,
+            "chord_retention": None,
+            "rhythm_error": None,
+            "beat_f1": None,
+            "downbeat_f1": None,
+        }
     metrics = evaluation.get("metrics")
     metrics = metrics if isinstance(metrics, Mapping) else {}
+    legacy_pitch = metrics.get("pitch_f1")
+    note_onset = metrics.get("note_onset_f1") or legacy_pitch
     return {
-        "pitch_f1": metrics.get("pitch_f1"),
+        # Keep the historical key in the report JSON for existing consumers.
+        "pitch_f1": legacy_pitch or note_onset,
+        "note_onset_f1": note_onset,
+        "pitch_multiset_f1": metrics.get("pitch_multiset_f1"),
         "chord_retention": metrics.get("chord_retention"),
         "rhythm_error": metrics.get("rhythm_error"),
         "beat_f1": metrics.get("beat_f1"),
@@ -215,15 +228,16 @@ def write_markdown(report: Mapping[str, Any], path: Path) -> None:
         f"| mean beat F1 | {_number(gate.get('new_mean_beat_f1'))} | — |",
         f"| mean downbeat F1 | {_number(gate.get('new_mean_downbeat_f1'))} | — |",
         f"| fixed-total rhythm error (quarter) | {_number(gate.get('new_mean_rhythm_error_quarter'))} | {_number(gate.get('baseline_mean_rhythm_error_quarter'))} |",
-        f"| pitch F1 | {_number(gate.get('new_mean_pitch_f1'))} | {_number(gate.get('baseline_mean_pitch_f1'))} |",
+        f"| note onset F1 (legacy pitch_f1) | {_number(gate.get('new_mean_note_onset_f1') if gate.get('new_mean_note_onset_f1') is not None else gate.get('new_mean_pitch_f1'))} | {_number(gate.get('baseline_mean_note_onset_f1') if gate.get('baseline_mean_note_onset_f1') is not None else gate.get('baseline_mean_pitch_f1'))} |",
+        f"| pitch multiset F1 (diagnostic only) | {_number(gate.get('new_mean_pitch_multiset_f1'))} | {_number(gate.get('baseline_mean_pitch_multiset_f1'))} |",
         f"| chord retention | {_number(gate.get('new_mean_chord_retention'))} | {_number(gate.get('baseline_mean_chord_retention'))} |",
         "",
-        "The formal gate requires 30 shared successful cases, 30 independent beat/downbeat metric cases, beat F1 ≥ 0.85, downbeat F1 ≥ 0.75, at least 20% lower fixed-total rhythm error, pitch F1 no more than 0.01 below baseline, and no chord-retention drop. A failed case remains in the denominator requirement and is not averaged away.",
+        "The formal gate requires 30 shared successful cases, 30 independent beat/downbeat metric cases, beat F1 ≥ 0.85, downbeat F1 ≥ 0.75, at least 20% lower fixed-total rhythm error, note onset F1 (legacy pitch_f1) no more than 0.01 below baseline, and no chord-retention drop. A failed case remains in the denominator requirement and is not averaged away. Pitch multiset F1 is a diagnostic that ignores onset, order, and duration and is excluded from the formal gate.",
         "",
         "## Case results",
         "",
-        "| case | source | new | baseline | beat F1 | downbeat F1 | pitch F1 | rhythm new / baseline | chord new | failure |",
-        "|---|---|---|---|---:|---:|---:|---:|---:|---|",
+        "| case | source | new | baseline | beat F1 | downbeat F1 | note onset F1 (legacy pitch_f1) | pitch multiset F1 (diagnostic) | rhythm new / baseline | chord new | failure |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for case in report.get("cases", []):
         new = case.get("new", {})
@@ -237,14 +251,15 @@ def write_markdown(report: Mapping[str, Any], path: Path) -> None:
         rhythm = metrics.get("rhythm_error") or {}
         base_rhythm = baseline_metrics.get("rhythm_error") or {}
         lines.append(
-            "| `{id}` | `{src}` | {new} | {base} | {beat} | {down} | {pitch} | {rhythm} / {base_rhythm} | {chord} | {failure} |".format(
+            "| `{id}` | `{src}` | {new} | {base} | {beat} | {down} | {pitch} | {pitch_multiset} | {rhythm} / {base_rhythm} | {chord} | {failure} |".format(
                 id=case.get("id"),
                 src=case.get("source_batch"),
                 new=new.get("status"),
                 base=baseline.get("status"),
                 beat=_number((metrics.get("beat_f1") or {}).get("f1")),
                 down=_number((metrics.get("downbeat_f1") or {}).get("f1")),
-                pitch=_number((metrics.get("pitch_f1") or {}).get("f1")),
+                pitch=_number(((metrics.get("note_onset_f1") or metrics.get("pitch_f1") or {}).get("f1"))),
+                pitch_multiset=_number((metrics.get("pitch_multiset_f1") or {}).get("f1")),
                 rhythm=_number(rhythm.get("mean_fixed_total_assignment_rhythm_error_quarter")),
                 base_rhythm=_number(base_rhythm.get("mean_fixed_total_assignment_rhythm_error_quarter")),
                 chord=_number((metrics.get("chord_retention") or {}).get("retention")),
