@@ -2036,16 +2036,25 @@ def _source_track_identity_partitions(
         return None
     unassigned_lanes = [lane for lane in lanes if lane not in set(group_to_lane.values())]
     unassigned_groups = [group for group in groups if group not in group_to_lane]
-    if len(unassigned_lanes) != 1:
+    # A complete imported identity partition is valid: every MusicXML group
+    # may already carry an unambiguous source lane name.  The fallback lane is
+    # only needed when exactly one lane and one or more groups remain unnamed;
+    # missing or extra identity evidence stays fail-closed.
+    if (
+        len(unassigned_lanes) > 1
+        or (not unassigned_lanes and unassigned_groups)
+        or (unassigned_lanes and not unassigned_groups)
+    ):
         return fail(
             "source_midi_lane_part_identity_incomplete",
             mapped_groups=dict(group_to_lane),
             unassigned_lanes=unassigned_lanes,
             unassigned_groups=unassigned_groups,
         )
-    fallback_lane = unassigned_lanes[0]
-    for group in unassigned_groups:
-        group_to_lane[group] = fallback_lane
+    if unassigned_lanes:
+        fallback_lane = unassigned_lanes[0]
+        for group in unassigned_groups:
+            group_to_lane[group] = fallback_lane
 
     sources_by_lane: dict[int, list[dict[str, Any]]] = {lane: [] for lane in lanes}
     for source in source_notes:
@@ -2114,6 +2123,8 @@ def _source_track_identity_partitions(
         )
     return partitions, {
         "mapped_groups": dict(group_to_lane),
+        "unassigned_lanes": list(unassigned_lanes),
+        "unassigned_groups": list(unassigned_groups),
     }
 
 
