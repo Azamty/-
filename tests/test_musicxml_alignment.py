@@ -584,6 +584,8 @@ def test_midi_lane_singleton_reuses_unique_shared_affine_model() -> None:
     assert singleton["shared_anchor_pair_count"] == 3
     assert hints[3]["scale"] == pytest.approx(0.5)
     assert hints[3]["musicxml_unit_id"] == 3
+    assert singleton["tempo_eligible"] is False
+    assert singleton["coordinate_scope"] == "note_alignment_only"
 
 
 def test_midi_lane_two_anchors_reuses_unique_shared_affine_model() -> None:
@@ -671,6 +673,45 @@ def test_midi_lane_short_partition_rejects_multiple_distinct_shared_models() -> 
     assert audit["pair_count"] == 2
     assert audit["shared_model_count"] == 2
     assert audit["shared_model_lanes"] == [0, 1]
+
+
+def test_midi_lane_singleton_accounts_identity_without_selecting_shared_model() -> None:
+    events = [
+        _parted_timed_event("lane1-60", 60, 0, 48, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-62", 62, 480, 528, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-64", 64, 960, 1008, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane2-65", 65, 5, 53, part_id="P2", part_group="Piano, lane two", staff=1),
+        _parted_timed_event("lane2-67", 67, 485, 533, part_id="P2", part_group="Piano, lane two", staff=1),
+        _parted_timed_event("lane2-69", 69, 965, 1013, part_id="P2", part_group="Piano, lane two", staff=1),
+        _parted_timed_event("lane3-71", 71, 1000, 1048, part_id="P3", part_group="Piano, lane three", staff=1),
+    ]
+    sources = [
+        _timed_source(0, 60, 0, 48),
+        _timed_source(1, 62, 960, 1056),
+        _timed_source(2, 64, 1920, 2016),
+        _timed_source(3, 65, 0, 48),
+        _timed_source(4, 67, 480, 528),
+        _timed_source(5, 69, 960, 1008),
+        _timed_source(6, 71, 1600, 1648),
+    ]
+    for source in sources:
+        lane = 0 if source["source_index"] < 3 else 1 if source["source_index"] < 6 else 2
+        source["midi_lane"] = lane
+        source["midi_track_name"] = {0: "lane one", 1: "lane two", 2: "lane three"}[lane]
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert audit["applied"] is True
+    singleton = next(model for model in audit["models"] if model["lane"] == 2)
+    assert singleton["method"] == "midi_lane_identity_singleton_offset_alignment"
+    assert singleton["candidate_shared_model_count"] == 2
+    assert singleton["tempo_eligible"] is False
+    assert singleton["coordinate_scope"] == "note_alignment_only"
+    assert "shared_anchor_lane" not in singleton
+    assert hints[6]["musicxml_unit_id"] == 6
+    assert hints[6]["coordinate_scope"] == "note_alignment_only"
+    report = _align_source_notes(events, sources, alignment_hints=hints)
+    assert report[-1]["musicxml_event_id"] == "lane3-71"
 
 
 def test_midi_lane_singleton_shared_model_keeps_duration_residual_fail_closed() -> None:
@@ -865,6 +906,65 @@ def test_source_tempo_points_map_through_proven_alignment_and_dedupe_same_tick()
     assert source_repair["source_tick"] == 48.0
     assert source_repair["mapped_tick"] == 24
     assert required_total_ticks == 96
+
+
+def test_source_tempo_mapping_ignores_identity_only_singleton_models() -> None:
+    mapped, repairs, required_total_ticks = _map_source_tempo_values_to_score(
+        {
+            "tempo_values": [
+                {"offset_quarter": 0.0, "bpm": 120.0},
+                {"offset_quarter": 1.0, "bpm": 110.0},
+            ]
+        },
+        performance_metadata={
+            "tempo_points": [
+                {"tick": 0, "bpm": 120.0},
+                {"tick": 480, "bpm": 110.0},
+            ]
+        },
+        source_alignment_report={
+            "applied": True,
+            "models": [
+                {"scale": 0.5, "offset": 0.0, "pair_count": 3, "tempo_eligible": True},
+                {
+                    "scale": 1.0,
+                    "offset": 200.0,
+                    "pair_count": 1,
+                    "tempo_eligible": False,
+                    "coordinate_scope": "note_alignment_only",
+                },
+            ],
+        },
+        total_ticks=96,
+    )
+
+    assert mapped == [
+        {"offset_quarter": 0.0, "bpm": 120.0},
+        {"offset_quarter": 0.5, "bpm": 110.0},
+    ]
+    assert required_total_ticks == 96
+    assert all(item["alignment_model"]["scale"] == pytest.approx(0.5) for item in repairs)
+
+
+def test_source_tempo_mapping_fails_when_only_identity_only_models_exist() -> None:
+    with pytest.raises(MusicXMLStandardizationError, match="require a proven source-to-score alignment model"):
+        _map_source_tempo_values_to_score(
+            {"tempo_values": [{"offset_quarter": 0.5, "bpm": 110.0}]},
+            performance_metadata={"tempo_points": [{"tick": 480, "bpm": 110.0}]},
+            source_alignment_report={
+                "applied": True,
+                "models": [
+                    {
+                        "scale": 1.0,
+                        "offset": 2.0,
+                        "pair_count": 1,
+                        "tempo_eligible": False,
+                        "coordinate_scope": "note_alignment_only",
+                    }
+                ],
+            },
+            total_ticks=96,
+        )
 
 
 def test_source_tempo_points_use_proven_strict_identity_without_repair() -> None:

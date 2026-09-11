@@ -2304,22 +2304,32 @@ def _track_identity_alignment(
 
     for partition in partitions:
         pairs = list(partition["pairs"])
+        shared_model_count: int | None = None
         if len(pairs) >= MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
             scale, offset = _fit_source_alignment_line(pairs)
             method = "midi_lane_affine_alignment"
         elif 1 <= len(pairs) < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
             distinct_shared = distinct_shared_models(int(partition["lane"]))
+            shared_model_count = len(distinct_shared)
             if len(distinct_shared) == 1:
                 shared = distinct_shared[0]
                 scale = float(shared["scale"])
                 offset = float(shared["offset"])
                 method = "midi_lane_shared_affine_alignment"
                 shared_anchor_lane = int(shared["lane"])
-            elif len(pairs) == 1 and not distinct_shared:
+            elif len(pairs) == 1:
                 source, unit = pairs[0]
                 scale = 1.0
                 offset = float(unit.start_tick - int(source["start_tick"]))
-                method = "midi_lane_singleton_offset_alignment"
+                # The exact source/unit identity is enough to account this
+                # singleton note, but multiple shared affine candidates are
+                # not evidence for choosing one as a coordinate model.  Keep
+                # the note hint local and exclude it from tempo mapping.
+                method = (
+                    "midi_lane_identity_singleton_offset_alignment"
+                    if distinct_shared
+                    else "midi_lane_singleton_offset_alignment"
+                )
                 shared_anchor_lane = None
             else:
                 if len(distinct_shared) > 1:
@@ -2397,10 +2407,18 @@ def _track_identity_alignment(
             "offset": offset,
             "method": method,
             "pair_count": len(pairs),
+            "tempo_eligible": len(pairs) >= MIN_SOURCE_ALIGNMENT_MODEL_POINTS,
+            "coordinate_scope": (
+                "tempo_and_note_alignment"
+                if len(pairs) >= MIN_SOURCE_ALIGNMENT_MODEL_POINTS
+                else "note_alignment_only"
+            ),
             "source_indices": [int(source["source_index"]) for source, _unit in pairs],
             "musicxml_unit_ids": [unit.unit_id for _source, unit in pairs],
             "movement_bound_ticks": movement_bound,
         }
+        if shared_model_count is not None:
+            model["candidate_shared_model_count"] = shared_model_count
         if method == "midi_lane_shared_affine_alignment":
             model["shared_anchor_lane"] = shared_anchor_lane
             model["shared_anchor_pair_count"] = next(
@@ -2427,6 +2445,8 @@ def _track_identity_alignment(
                 "end_residual_ticks": end_residual,
                 "start_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_START_RESIDUAL_TICKS,
                 "end_residual_bound_ticks": MAX_CROSS_PART_ALIGNMENT_END_RESIDUAL_TICKS,
+                "tempo_eligible": model["tempo_eligible"],
+                "coordinate_scope": model["coordinate_scope"],
             }
             max_start_residual = max(max_start_residual, start_residual)
             max_end_residual = max(max_end_residual, end_residual)
@@ -2452,6 +2472,7 @@ def _track_identity_alignment(
         "one_to_one": True,
         "provisional_pair_count": len(source_notes),
         "model_count": len(models),
+        "tempo_eligible_model_count": sum(1 for model in models if model["tempo_eligible"]),
         "models": models,
         "max_start_residual_ticks": max_start_residual,
         "max_end_residual_ticks": max_end_residual,
@@ -5312,7 +5333,23 @@ def _map_source_tempo_values_to_score(
                 "reason": "source_tempo_initial_origin_identity",
             }
         ], total_ticks
-    models = [item for item in source_alignment_report.get("models", []) if isinstance(item, Mapping)]
+    all_models = [item for item in source_alignment_report.get("models", []) if isinstance(item, Mapping)]
+    # A lane with fewer than three anchors can still be accounted through an
+    # exact identity hint after pitch/count/bijection and local residual
+    # checks.  It cannot establish a tempo coordinate transform.  Keep the
+    # two proofs separate: only explicitly eligible, sufficiently anchored
+    # lane models may move source tempo points.
+    models = []
+    for item in all_models:
+        try:
+            pair_count = int(item.get("pair_count", len(item.get("source_indices", []))))
+        except (TypeError, ValueError) as exc:
+            raise MusicXMLStandardizationError("source tempo coordinate model is malformed") from exc
+        if pair_count < MIN_SOURCE_ALIGNMENT_MODEL_POINTS:
+            continue
+        if item.get("tempo_eligible", True) is not True:
+            continue
+        models.append(item)
     if not models and (
         source_alignment_report.get("reason") == "existing_source_alignment_within_strict_window"
         and source_alignment_report.get("identity_proven") is True
