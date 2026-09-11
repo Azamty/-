@@ -67,6 +67,15 @@ def _load_json(path: Path) -> Mapping[str, Any]:
     return payload
 
 
+def _production_gate_selected(case: Mapping[str, Any]) -> bool:
+    """Use the explicit main-gate marker, with a legacy fallback."""
+
+    marker = case.get("production_gate_selected")
+    if marker is not None:
+        return marker is True
+    return case.get("reference_midi_reliable") is True and case.get("evaluation_policy") == "reference_metrics"
+
+
 def _reliable_cases(registry: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     cases = registry.get("cases")
     if not isinstance(cases, list):
@@ -75,6 +84,7 @@ def _reliable_cases(registry: Mapping[str, Any]) -> list[Mapping[str, Any]]:
         case
         for case in cases
         if isinstance(case, Mapping)
+        and _production_gate_selected(case)
         and case.get("reference_midi_reliable") is True
         and case.get("evaluation_policy") == "reference_metrics"
     ]

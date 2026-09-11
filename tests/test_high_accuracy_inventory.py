@@ -100,3 +100,36 @@ def test_inventory_marks_reference_raw_without_model_output(tmp_path: Path) -> N
     assert inventory["production_candidate_count"] == 0
     assert record["reference_derived_raw_count"] == 1
     assert record["production_candidate"] is False
+
+
+def test_inventory_excludes_reliable_diagnostic_case_from_gate(tmp_path: Path) -> None:
+    audio = tmp_path / "fixture.wav"
+    audio.write_bytes(b"audio")
+    annotation = tmp_path / "beats.json"
+    annotation.write_text("{}", encoding="utf-8")
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "id": "diagnostic-reliable",
+                        "input": str(audio),
+                        "beat_annotation": str(annotation),
+                        "beat_annotation_independent": True,
+                        "evaluation_scope": "production_end_to_end",
+                        "reference_midi_reliable": True,
+                        "production_gate_selected": False,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    scan = tmp_path / "scan"
+    _write_raw(scan / "diagnostic-reliable" / "production_raw.json", source_audio=audio, model_output=True, notes=[{"midi": 60}])
+    inventory = build_inventory(registry, scan_roots=(scan,))
+    record = inventory["cases"][0]
+    assert record["production_gate_selected"] is False
+    assert record["production_candidate"] is False
+    assert inventory["production_candidate_count"] == 0

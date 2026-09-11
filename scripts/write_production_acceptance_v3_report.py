@@ -61,7 +61,7 @@ def _runner_state(root: Path, case_id: str) -> Mapping[str, Any]:
 def _selected_registry_cases(
     registry: Mapping[str, Any], selected_ids: Sequence[str]
 ) -> dict[str, Mapping[str, Any]]:
-    """Index only the explicitly selected reliable production cases."""
+    """Index only cases marked for the current 30-case production gate."""
 
     registry_cases = {
         str(case["id"]): case
@@ -71,13 +71,17 @@ def _selected_registry_cases(
     reliable_ids = {
         case_id
         for case_id, case in registry_cases.items()
-        if case.get("reference_midi_reliable") is True
+        if (
+            case.get("production_gate_selected") is True
+            if "production_gate_selected" in case
+            else case.get("reference_midi_reliable") is True
+        )
     }
     selected_set = set(selected_ids)
     if len(selected_ids) != 30 or len(selected_set) != 30:
         raise ValueError("v3 selection IDs must contain exactly 30 unique cases")
     if selected_set != reliable_ids:
-        raise ValueError("v3 selection IDs do not equal the registry reliable production set")
+        raise ValueError("v3 selection IDs do not equal the registry production gate selection")
     return {case_id: registry_cases[case_id] for case_id in selected_ids}
 
 

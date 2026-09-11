@@ -57,6 +57,22 @@ def _file_record(value: str | None, *, required: bool = False) -> dict[str, Any]
     return record
 
 
+def _is_production_gate_selected(case: Mapping[str, Any]) -> bool:
+    """Return whether a case belongs to the explicit 30-case main gate.
+
+    ``reference_midi_reliable`` answers whether the reference can support
+    pitch/rhythm/chord metrics.  It deliberately does not answer whether the
+    case is part of the current production gate: a reliable diagnostic case
+    may be retained outside that denominator.  The fallback keeps older
+    schema-2 registries usable while the explicit field is rolled out.
+    """
+
+    marker = case.get("production_gate_selected")
+    if marker is not None:
+        return marker is True
+    return case.get("reference_midi_reliable") is True and case.get("evaluation_policy") == "reference_metrics"
+
+
 def _load_registry(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema_version") not in {"1.0", "2.0"} or not isinstance(payload.get("cases"), list):
@@ -74,9 +90,20 @@ def _load_registry(path: Path) -> dict[str, Any]:
             if item.get("source_id") and item["source_id"] not in payload.get("sources", {}):
                 raise ValueError(f"benchmark case {item['id']} refers to an unknown source_id")
     if payload.get("schema_version") == "2.0":
-        reliable_count = sum(1 for item in payload["cases"] if item.get("reference_midi_reliable") is True and item.get("evaluation_policy") == "reference_metrics")
-        if reliable_count != 30:
-            raise ValueError(f"benchmark schema 2.0 requires exactly 30 reliable cases, found {reliable_count}")
+        selected = [item for item in payload["cases"] if _is_production_gate_selected(item)]
+        if len(selected) != 30:
+            raise ValueError(f"benchmark schema 2.0 requires exactly 30 production gate cases, found {len(selected)}")
+        invalid = [
+            str(item.get("id"))
+            for item in selected
+            if item.get("reference_midi_reliable") is not True
+            or item.get("evaluation_policy") != "reference_metrics"
+        ]
+        if invalid:
+            raise ValueError(
+                "production gate cases must have reliable reference metrics: "
+                + ", ".join(invalid)
+            )
     return payload
 
 
@@ -352,6 +379,7 @@ def evaluate_case(case: Mapping[str, Any], *, result_root: Path | None = None) -
         "input": _file_record(str(case["input"]), required=True),
         "reference_midi": _file_record(case.get("reference_midi"), required=False),
         "reference_midi_reliable": bool(case.get("reference_midi_reliable", False)),
+        "production_gate_selected": _is_production_gate_selected(case),
         "beat_annotation": _file_record(case.get("beat_annotation"), required=False),
         "beat_annotation_independent": case.get("beat_annotation_independent") is True,
         "evaluation_policy": case.get("evaluation_policy", "reference_metrics"),
@@ -469,7 +497,7 @@ def _case_id_index(
     *,
     label: str,
 ) -> tuple[dict[str, Mapping[str, Any]], list[str], list[str]]:
-    """Index reliable cases while retaining ID integrity diagnostics."""
+    """Index selected reliable cases while retaining ID diagnostics."""
 
     all_ids: list[str] = []
     missing: list[str] = []
@@ -490,6 +518,7 @@ def _case_id_index(
             case.get("status") == "evaluated"
             and case.get("evaluation_policy") == "reference_metrics"
             and case.get("reference_midi_reliable") is True
+            and _is_production_gate_selected(case)
         ):
             reliable.setdefault(case_id, case)
     return reliable, missing, duplicates
@@ -685,16 +714,38 @@ def build_report(
         if baseline_root is not None
         else None
     )
+    registry_cases = [
+        case
+        for case in registry.get("cases", [])
+        if isinstance(case, Mapping)
+    ]
+    has_explicit_gate_selection = any("production_gate_selected" in case for case in registry_cases)
+    selected_registry_ids = {
+        str(case.get("id"))
+        for case in registry_cases
+        if _is_production_gate_selected(case) and case.get("id") is not None
+    }
+
+    def is_main_gate_case(case: Mapping[str, Any]) -> bool:
+        # A baseline report can predate the explicit marker.  When the
+        # registry has one, use its IDs as the authority rather than letting a
+        # legacy baseline re-admit a reliable diagnostic case.
+        if has_explicit_gate_selection:
+            return str(case.get("id")) in selected_registry_ids
+        return _is_production_gate_selected(case)
+
     production_cases = [
         case
         for case in cases
-        if str(case.get("evaluation_scope") or "").startswith("production_end_to_end")
+        if is_main_gate_case(case)
+        and str(case.get("evaluation_scope") or "").startswith("production_end_to_end")
     ]
     production_baseline = (
         [
             case
             for case in baseline_cases
-            if str(case.get("evaluation_scope") or "").startswith("production_end_to_end")
+            if is_main_gate_case(case)
+            and str(case.get("evaluation_scope") or "").startswith("production_end_to_end")
         ]
         if baseline_cases is not None
         else None

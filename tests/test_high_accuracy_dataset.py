@@ -39,10 +39,17 @@ def _hash(path: Path) -> str:
 def test_registry_has_distinct_30_case_reliable_set() -> None:
     registry = benchmark._load_registry(ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json")
     reliable = [case for case in registry["cases"] if case.get("reference_midi_reliable") is True]
-    assert len(reliable) == 30
-    assert len({case["id"] for case in reliable}) == 30
-    assert {case["category"] for case in reliable} == {"synthetic_rendered", "official_piano_rendered", "vocal", "specialized_fixture"}
+    selected = [case for case in registry["cases"] if case.get("production_gate_selected") is True]
+    assert len(reliable) == 40
+    assert len(selected) == 30
+    assert len({case["id"] for case in selected}) == 30
+    assert {case["category"] for case in selected} == {"synthetic_rendered", "official_piano_aligned", "vocal", "specialized_fixture"}
+    assert all(case.get("reference_midi_reliable") is True for case in selected)
     assert all(case.get("source_id") in registry["sources"] for case in reliable)
+    maestro = [case for case in reliable if case["category"] == "official_piano_rendered"]
+    assert len(maestro) == 10
+    assert all(case["production_gate_selected"] is False for case in maestro)
+    assert all(case["evaluation_policy"] == "diagnostic_only" for case in maestro)
 
 
 def test_local_midi_cases_record_direct_renderer_and_input_hashes() -> None:

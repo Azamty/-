@@ -36,8 +36,10 @@ def _rhythm_metric(value: float) -> dict[str, object]:
 def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
     registry = benchmark._load_registry(ROOT / "fixtures" / "high_accuracy" / "benchmark_manifest.json")
     assert registry["schema_version"] == "2.0"
-    assert len(registry["cases"]) == 36
-    assert sum(item.get("reference_midi_reliable") is True for item in registry["cases"]) == 30
+    assert len(registry["cases"]) == 46
+    assert sum(item.get("reference_midi_reliable") is True for item in registry["cases"]) == 40
+    assert sum(item.get("production_gate_selected") is True for item in registry["cases"]) == 30
+    assert all(isinstance(item.get("production_gate_selected"), bool) for item in registry["cases"])
     assert {item["id"] for item in registry["cases"] if item["category"] == "vocal"} == {
         "ccmusic-yueding-01",
         "ccmusic-yueding-02",
@@ -54,26 +56,48 @@ def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
     }
     assert sum(item["category"] == "synthetic_rendered" for item in registry["cases"]) == 10
     assert sum(item["category"] == "official_piano_rendered" for item in registry["cases"]) == 10
+    assert sum(item["category"] == "official_piano_aligned" for item in registry["cases"]) == 10
     assert sum(item["category"] == "specialized_fixture" for item in registry["cases"]) == 5
     reliable = [item for item in registry["cases"] if item.get("reference_midi_reliable") is True]
-    assert all(item.get("evaluation_scope") == "production_end_to_end" for item in reliable)
-    assert all(item.get("benchmark_role") == "production_end_to_end" for item in reliable)
+    selected = [item for item in registry["cases"] if item.get("production_gate_selected") is True]
+    assert {item["category"] for item in selected} == {
+        "synthetic_rendered",
+        "official_piano_aligned",
+        "vocal",
+        "specialized_fixture",
+    }
+    assert all(item.get("reference_midi_reliable") is True for item in selected)
+    assert all(item.get("evaluation_policy") == "reference_metrics" for item in selected)
+    assert all(item.get("evaluation_scope") == "production_end_to_end" for item in selected)
+    assert all(item.get("benchmark_role") == "production_end_to_end" for item in selected)
     assert {item.get("render_domain") for item in reliable} == {
         "synthetic_local_midi_render",
         "maestro_local_midi_render",
+        "asap_performance_midi_render",
         "research_mixed_song",
         "specialized_local_midi_render",
     }
-    assert sum(item.get("beat_annotation_independent") is True for item in reliable) == 20
+    assert sum(item.get("beat_annotation_independent") is True for item in reliable) == 30
     assert sum(item.get("beat_annotation_independent") is False for item in reliable) == 10
     assert all(
-        item.get("beat_annotation_source") in {"deterministic_midi_render_ground_truth", "ccmusic_musicxml_score_ground_truth"}
+        item.get("beat_annotation_source") in {"deterministic_midi_render_ground_truth", "ccmusic_musicxml_score_ground_truth", "asap_v1.1_direct_performance_annotation"}
         for item in reliable
         if item.get("beat_annotation_independent") is True
     )
     assert all(item.get("reference_midi_reliable") is False for item in registry["cases"] if item["category"] == "vocal_diagnostic")
     maestro = [item for item in registry["cases"] if item["category"] == "official_piano_rendered"]
     assert all(item["beat_annotation_source"] == "maestro_performance_midi_tick_grid_diagnostic_only" for item in maestro)
+    assert all(item["reference_midi_reliable"] is True for item in maestro)
+    assert all(item["production_gate_selected"] is False for item in maestro)
+    assert all(item["evaluation_policy"] == "diagnostic_only" for item in maestro)
+    assert all(item["evaluation_scope"] == "diagnostic_only" for item in maestro)
+    assert all(item["benchmark_role"] == "diagnostic_only" for item in maestro)
+    asap = [item for item in selected if item["category"] == "official_piano_aligned"]
+    assert len(asap) == 10
+    assert len({item["composer"] for item in asap}) == 10
+    assert {item["time_signature"] for item in asap} == {"2/4", "3/4", "4/4", "6/8"}
+    assert all(item["beat_annotation_source"] == "asap_v1.1_direct_performance_annotation" for item in asap)
+    assert registry["sources"]["asap-v1.1"]["commit"] == "fad8d1e8078d0ae47ad2f280b5d022bd2de24784"
     assert all(item.get("evaluation_policy") == "diagnostic_only" for item in registry["cases"] if item["category"] == "vocal_diagnostic")
     assert registry["sources"]["ccmusic-demo"]["archive_sha256"] == "477b5466936eec40cef7dfd43205900e3e4a651b8ec671fdccaff48910523053"
     luv = next(item for item in registry["cases"] if item["id"] == "luv-letter")
@@ -81,10 +105,33 @@ def test_registry_records_pjs_and_marks_luv_letter_manual_only() -> None:
     assert luv["reference_midi_reliable"] is False
 
     report = benchmark.build_report(registry)
-    assert report["registered_count"] == 36
+    assert report["registered_count"] == 46
     assert report["evaluated_count"] == 0
     assert report["accuracy_claim_ready"] is False
     assert all(item["metrics"]["pitch_f1"] is None for item in report["cases"])
+
+
+def test_reliable_diagnostic_case_is_excluded_from_main_gate_index() -> None:
+    cases = [
+        {
+            "id": "maestro-diagnostic",
+            "status": "evaluated",
+            "evaluation_policy": "diagnostic_only",
+            "reference_midi_reliable": True,
+            "production_gate_selected": False,
+        },
+        {
+            "id": "asap-production",
+            "status": "evaluated",
+            "evaluation_policy": "reference_metrics",
+            "reference_midi_reliable": True,
+            "production_gate_selected": True,
+        },
+    ]
+    indexed, missing, duplicates = benchmark._case_id_index(cases, label="new")
+    assert set(indexed) == {"asap-production"}
+    assert missing == []
+    assert duplicates == []
 
 
 def test_evaluator_normalizes_different_ppq_and_does_not_invent_missing_beats(tmp_path: Path) -> None:

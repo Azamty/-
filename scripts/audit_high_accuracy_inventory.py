@@ -117,6 +117,15 @@ def _case_role(case: Mapping[str, Any]) -> str:
     return "unclassified"
 
 
+def _production_gate_selected(case: Mapping[str, Any]) -> bool:
+    marker = case.get("production_gate_selected")
+    if marker is not None:
+        return marker is True
+    # Legacy ad-hoc registries had no marker and used production scope as the
+    # selection signal.
+    return str(case.get("evaluation_scope") or "") == "production_end_to_end"
+
+
 def _raw_record(path: Path, payload: Mapping[str, Any], *, input_path: Path) -> dict[str, Any]:
     model_output = payload.get("model_output") is True
     reference_output = payload.get("model_output") is False or payload.get("source") == "reference_midi_quantizer_isolation"
@@ -248,6 +257,7 @@ def build_inventory(registry_path: Path = DEFAULT_REGISTRY, *, scan_roots: Seque
         reference_raws = [item for item in raws if item["reference_derived"]]
         successful_model = [item for item in model_raws if item["pitched_note_count"] > 0 and item["source_audio_matches_registry_input"]]
         beat = _beat_info(case)
+        production_gate_selected = _production_gate_selected(case)
         records.append(
             {
                 "id": case_id,
@@ -256,6 +266,7 @@ def build_inventory(registry_path: Path = DEFAULT_REGISTRY, *, scan_roots: Seque
                 "source_id": case.get("source_id"),
                 "case_evaluation_scope": case.get("evaluation_scope"),
                 "benchmark_role": case.get("benchmark_role"),
+                "production_gate_selected": production_gate_selected,
                 "render_domain": case.get("render_domain"),
                 "case_role": _case_role(case),
                 "input": raw_input,
@@ -270,7 +281,12 @@ def build_inventory(registry_path: Path = DEFAULT_REGISTRY, *, scan_roots: Seque
                 "reference_derived_raws": reference_raws,
                 "recorded_raw_failures": failure_by_case.get(case_id, []),
                 "pitched_events_in_latest_production_raw": successful_model[0]["pitched_note_count"] if successful_model else None,
-                "production_candidate": bool(successful_model and beat["eligible"] and _case_role(case) == "production_scope"),
+                "production_candidate": bool(
+                    successful_model
+                    and beat["eligible"]
+                    and production_gate_selected
+                    and _case_role(case) == "production_scope"
+                ),
                 "quantizer_fixture_model_smoke": bool(successful_model and beat["eligible"] and _case_role(case) == "quantizer_fixture"),
             }
         )
@@ -334,7 +350,7 @@ def render_markdown(inventory: Mapping[str, Any]) -> str:
             "",
             "## Gate interpretation",
             "",
-            "The registry's 30-case production composition contains 10 deterministic known-MIDI renders, 10 MAESTRO performance-MIDI renders, 5 CCMusic mixed-song segments, and 5 specialized deterministic segments. A real `model_output=true` MuScriptor/GAME payload with a pitched event and an independent beat annotation is eligible for beat/downbeat scoring. The MAESTRO MIDI remains valid for pitch and event-time comparisons, but its fixed transport ticks are not independent musical beat labels, so those ten cases are excluded from beat/downbeat F1. A reference-isolation payload, empty model result, failed recognizer, or input mismatch never substitutes for a missing model result.",
+            "The registry keeps 40 cases with reliable reference MIDI and marks exactly 30 for the current production gate: 10 deterministic known-MIDI renders, 10 ASAP score/performance-aligned piano clips, 5 CCMusic mixed-song segments, and 5 specialized deterministic segments. A real `model_output=true` MuScriptor/GAME payload with a pitched event and an independent beat annotation is eligible for beat/downbeat scoring. The 10 MAESTRO MIDIs remain valid for pitch and event-time diagnostics, but their fixed transport ticks are not independent musical beat labels, so they are retained as `diagnostic_only` and excluded from the selected gate. A reference-isolation payload, empty model result, failed recognizer, or input mismatch never substitutes for a missing model result.",
             "The local MAESTRO archive/render cache is hash-verified by its selection manifest. Each selected case uses a deterministic source-MIDI transport-tick window with the original member hash, clip hash, and renderer provenance. Its generated 120 BPM tick grid is retained as diagnostic metadata only.",
             "",
             "## CCMusic context audit",
