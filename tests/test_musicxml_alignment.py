@@ -405,6 +405,59 @@ def test_midi_lane_identity_reconciles_duplicate_pitch_across_imported_parts() -
     assert {item["musicxml_event_id"] for item in report} == {"p1-60", "p1-62", "p1-64", "p2-60"}
 
 
+def test_midi_lane_identity_consumes_reversed_same_pitch_hint_order() -> None:
+    # The second lane's affine transform puts its repeated C4 before the
+    # first lane's C4 in score time, even though the source lane starts later.
+    # A global same-pitch DP would reject the audited hint order; identity
+    # matching must consume the exact unit IDs after local bound checks.
+    events = [
+        _parted_timed_event("lane1-60", 60, 100, 148, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-62", 62, 200, 248, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane1-64", 64, 300, 348, part_id="P1", part_group="P1", staff=1),
+        _parted_timed_event("lane2-60", 60, 50, 98, part_id="P2", part_group="Piano, lane two", staff=1),
+        _parted_timed_event("lane2-65", 65, 150, 198, part_id="P2", part_group="Piano, lane two", staff=1),
+        _parted_timed_event("lane2-67", 67, 250, 298, part_id="P2", part_group="Piano, lane two", staff=1),
+    ]
+    sources = [
+        _timed_source(0, 60, 100, 148),
+        _timed_source(1, 62, 200, 248),
+        _timed_source(2, 64, 300, 348),
+        _timed_source(3, 60, 400, 448),
+        _timed_source(4, 65, 500, 548),
+        _timed_source(5, 67, 600, 648),
+    ]
+    for source in sources:
+        lane = 0 if source["source_index"] < 3 else 1
+        source.update(
+            midi_lane=lane,
+            midi_track_name="lane one" if lane == 0 else "lane two",
+            midi_channel=lane + 1,
+            midi_track_index=lane + 1,
+        )
+
+    hints, audit = _estimate_source_alignment(events, sources)
+
+    assert audit["applied"] is True
+    unit_id_by_event = {
+        unit.chain[0][0].event_id: unit.unit_id
+        for unit in _logical_pitch_units(events)
+    }
+    assert [hints[index]["musicxml_unit_id"] for index in (0, 3)] == [
+        unit_id_by_event["lane1-60"],
+        unit_id_by_event["lane2-60"],
+    ]
+    source_pitch_60_units = [
+        unit_id
+        for unit_id in (hints[0]["musicxml_unit_id"], hints[3]["musicxml_unit_id"])
+    ]
+    assert source_pitch_60_units == [unit_id_by_event["lane1-60"], unit_id_by_event["lane2-60"]]
+    assert source_pitch_60_units == [1, 0]
+    assert [
+        item["musicxml_event_id"]
+        for item in _align_source_notes(events, sources, alignment_hints=hints)
+    ] == [event.event_id for event in events]
+
+
 def test_midi_lane_identity_accepts_complete_named_partition_without_fallback() -> None:
     events = [
         _parted_timed_event("p1-60", 60, 10, 34, part_id="P1", part_group="Piano, lane one", staff=1),

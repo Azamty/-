@@ -3296,6 +3296,56 @@ def _match_source_pitch(
             "cohort_count": cohort_count,
         }
 
+    # A preserved MIDI-lane identity proof can legitimately reverse the
+    # score-time order of repeated pitches: MuseScore may put simultaneous
+    # notes from different lanes in different staves, or quantize their
+    # starts in the opposite order.  In that case the hint is an audited
+    # source->logical-unit identity, not a nearest-neighbour suggestion.  Use
+    # it directly only when it covers this complete pitch cohort and every
+    # target unit exactly once.  ``option`` still enforces the existing
+    # transformed residual and movement bounds for every pair; malformed or
+    # out-of-bound identity evidence fails closed instead of falling back to
+    # global same-pitch matching.
+    identity_hints = [
+        (source, (alignment_hints or {}).get(int(source["source_index"])))
+        for source in source_rows
+    ]
+    if identity_hints and all(
+        isinstance(hint, Mapping)
+        and isinstance(hint.get("group"), Mapping)
+        and hint["group"].get("scope") == "midi_lane_identity"
+        for _source, hint in identity_hints
+    ):
+        units_by_id = {unit.unit_id: unit for unit in unit_rows}
+        hinted_ids = [int(hint["musicxml_unit_id"]) for _source, hint in identity_hints]
+        target_ids = [unit.unit_id for unit in unit_rows]
+        if (
+            len(hinted_ids) != len(set(hinted_ids))
+            or set(hinted_ids) != set(target_ids)
+            or any(
+                source.get("midi") is None
+                or unit_id not in units_by_id
+                or units_by_id[unit_id].pitch != int(source["midi"])
+                for (source, _hint), unit_id in zip(identity_hints, hinted_ids, strict=True)
+            )
+        ):
+            return {}, {}, None
+        identity_rows: list[tuple[dict[str, Any], _LogicalPitchUnit, dict[str, Any]]] = []
+        for (source, _hint), unit_id in zip(identity_hints, hinted_ids, strict=True):
+            unit = units_by_id[unit_id]
+            match_option = option(source, unit)
+            if match_option is None:
+                return {}, {}, None
+            identity_rows.append((source, unit, match_option))
+        return (
+            {
+                int(source["source_index"]): (unit, match_option)
+                for source, unit, match_option in identity_rows
+            },
+            {},
+            identity_rows,
+        )
+
     # Exact duplicate/overlap merging is considered only if a full matching
     # pass cannot account for all source rows.  This protects real polyphony
     # whenever MuseScore emitted separate XML units.
