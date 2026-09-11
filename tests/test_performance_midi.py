@@ -396,6 +396,33 @@ def test_score_and_performance_use_the_same_tempo_at_explicit_score_zero() -> No
     ]
 
 
+def test_long_small_tempo_changes_survive_score_and_performance_roundtrip() -> None:
+    slow_interval = 1.0
+    fast_interval = 60.0 / 60.009
+    beat_times = [0.0]
+    for index in range(180):
+        interval = slow_interval if index % 2 == 0 else fast_interval
+        beat_times.append(beat_times[-1] + interval)
+    analysis = _analysis(beat_times=beat_times)
+    event = NoteEvent(start_sec=0.0, end_sec=0.5, midi=60)
+
+    score = quantize_events([event], analysis, mode="monophonic", quarter_ticks=48)
+    _midi_bytes, metadata = build_performance_midi(
+        [event],
+        analysis,
+        instrument_group="piano",
+    )
+
+    score_points = [(item.start_tick, item.bpm) for item in score.tempo_events]
+    performance_points = [(item["tick"], item["bpm"]) for item in metadata["tempo_points"]]
+    assert len(score_points) == len(performance_points) == 180
+    assert [tick * 10 for tick, _bpm in score_points] == [tick for tick, _bpm in performance_points]
+    assert [bpm for _tick, bpm in score_points] == pytest.approx(
+        [bpm for _tick, bpm in performance_points]
+    )
+    assert performance_points[1][1] == pytest.approx(60.009)
+
+
 def test_write_performance_midi_uses_independent_names_and_refuses_accidental_overwrite(tmp_path) -> None:
     analysis = _analysis(beat_times=[0.0, 0.5, 1.0])
     destination = tmp_path / "acoustic_piano.performance.mid"

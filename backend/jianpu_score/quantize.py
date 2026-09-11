@@ -525,7 +525,7 @@ def _tempo_points_for_mapper(mapper: _BeatMapper, quarter_ticks: int) -> list[tu
             points[tick] = bpm
     compact: list[tuple[int, float]] = []
     for tick, bpm in sorted(points.items()):
-        if compact and abs(bpm - compact[-1][1]) <= 0.01:
+        if compact and round(60_000_000.0 / bpm) == round(60_000_000.0 / compact[-1][1]):
             continue
         compact.append((tick, bpm))
     return compact
