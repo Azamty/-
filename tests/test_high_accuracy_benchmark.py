@@ -198,6 +198,28 @@ def test_pitch_multiset_diagnostic_ignores_time_order_and_duration() -> None:
     assert multiset["formal_accuracy_metric"] is False
 
 
+def test_pitch_multiset_one_sided_empty_input_has_zero_f1() -> None:
+    reference = [(60, benchmark.Fraction(0), benchmark.Fraction(1))]
+    empty: list[benchmark.MidiNote] = []
+
+    missing_prediction = benchmark.pitch_multiset_metrics(reference, empty)
+    assert missing_prediction["precision"] is None
+    assert missing_prediction["recall"] == 0.0
+    assert missing_prediction["f1"] == 0.0
+
+    spurious_prediction = benchmark.pitch_multiset_metrics(empty, reference)
+    assert spurious_prediction["precision"] == 0.0
+    assert spurious_prediction["recall"] is None
+    assert spurious_prediction["f1"] == 0.0
+
+
+def test_pitch_multiset_both_empty_keeps_f1_undefined() -> None:
+    metric = benchmark.pitch_multiset_metrics([], [])
+    assert metric["precision"] is None
+    assert metric["recall"] is None
+    assert metric["f1"] is None
+
+
 def test_rhythm_assignment_penalizes_unmatched_notes_and_zero_match_cases() -> None:
     reference = [
         (60, benchmark.Fraction(0), benchmark.Fraction(1)),

@@ -188,6 +188,11 @@ def pitch_multiset_metrics(
     predicted_counts = Counter(pitch for pitch, _start, _end in predicted)
     matched = sum((reference_counts & predicted_counts).values())
     metric = _f1(matched, matched, len(predicted), len(reference))
+    # A one-sided empty input has no overlap and therefore has a defined zero
+    # F1.  The shared helper keeps precision/recall undefined for the empty
+    # side; normalize only this diagnostic metric's F1 value here.
+    if bool(reference_counts) != bool(predicted_counts):
+        metric["f1"] = 0.0
     metric.update(
         {
             "metric_name": "pitch_multiset_f1",
