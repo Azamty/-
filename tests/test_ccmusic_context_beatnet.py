@@ -31,6 +31,7 @@ def _full_grid() -> dict[str, Any]:
             "beat_number": index % 4 + 1,
             "downbeat": index % 4 == 0,
             "bar_index": index // 4,
+            "quarter_position": float(index),
             "local_bpm": 60.0,
         }
         for index in range(10)
@@ -42,9 +43,31 @@ def _full_grid() -> dict[str, Any]:
         "inference": "DBN",
         "beats": beats,
         "downbeats": [item for item in beats if item["downbeat"]],
+        "bars": [
+            {
+                "index": bar_index,
+                "start_beat_index": bar_index * 4,
+                "end_beat_index": min(10, (bar_index + 1) * 4),
+                "start_sec": float(bar_index * 4),
+                "end_sec": float(min(9, (bar_index + 1) * 4 - 1)),
+                "start_quarter": float(bar_index * 4),
+                "end_quarter": float(min(10, (bar_index + 1) * 4)),
+                "beat_count": len(beats[bar_index * 4 : min(10, (bar_index + 1) * 4)]),
+            }
+            for bar_index in range(3)
+        ],
         "time_signature": {"selected": "4/4", "confidence": 0.55},
         "tempo": {"selected_bpm": 60.0, "selected_factor": 1.0},
-        "mapping": {"beat_times": [item["time_sec"] for item in beats]},
+        "mapping": {
+            "beat_times": [item["time_sec"] for item in beats],
+            "score_origin": {
+                "downbeat_index": 4,
+                "downbeat_sec": 4.0,
+                "pickup_candidate": True,
+                "pickup_beats": 4.0,
+                "origin_shift_beats": -4.0,
+            },
+        },
         "beatnet": {"version": "1.1.3"},
     }
 
@@ -67,9 +90,170 @@ def test_full_track_window_keeps_absolute_grid_and_one_boundary_each_side() -> N
     assert [item["full_track_index"] for item in grid["context"]["window"]["boundary_beats"]["after"]] == [6]
     assert [item["full_track_index"] for item in grid["beats"]] == [3, 4, 5]
     assert [item["time_sec"] for item in grid["beats"]] == [0.75, 1.75, 2.75]
+    assert [item["index"] for item in grid["beats"]] == [0, 1, 2]
+    assert [item["bar_index"] for item in grid["beats"]] == [0, 1, 1]
+    assert [item["beat_number"] for item in grid["beats"]] == [4, 1, 2]
+    assert [item["quarter_position"] for item in grid["beats"]] == [0.0, 1.0, 2.0]
+    assert [item["full_track_bar_index"] for item in grid["beats"]] == [0, 1, 1]
+    assert [item["full_track_beat_number"] for item in grid["beats"]] == [4, 1, 2]
+    assert [item["full_track_time_sec"] for item in grid["beats"]] == [3.0, 4.0, 5.0]
     assert [item["full_track_index"] for item in grid["downbeats"]] == [4]
     assert grid["mapping"]["beat_times"] == [0.75, 1.75, 2.75]
+    assert grid["mapping"]["full_track_beat_times"] == list(range(10))
+    assert grid["mapping"]["score_origin"]["downbeat_index"] == 1
+    assert grid["mapping"]["score_origin"]["downbeat_sec"] == 1.75
+    assert grid["mapping"]["score_origin"]["downbeat_status"] == "undetermined"
+    assert grid["mapping"]["score_origin"]["pickup_candidate"] is False
+    assert grid["mapping"]["score_origin"]["origin_shift_beats"] == 0.0
+    assert grid["mapping"]["score_origin"]["full_track_downbeat_index"] == 4
+    assert grid["mapping"]["full_track_score_origin"]["pickup_candidate"] is True
+    assert grid["mapping"]["score_origin"]["warning"] in grid["warnings"]
+    assert [bar["index"] for bar in grid["bars"]] == [0, 1]
+    assert [(bar["start_beat_index"], bar["end_beat_index"]) for bar in grid["bars"]] == [(0, 1), (1, 3)]
+    assert [(bar["start_sec"], bar["end_sec"]) for bar in grid["bars"]] == [(0.0, 0.75), (1.75, 3.0)]
+    assert [(bar["start_quarter"], bar["end_quarter"]) for bar in grid["bars"]] == [(0.0, 1.0), (1.0, 2.25)]
+    assert [bar["beat_count"] for bar in grid["bars"]] == [1, 2]
+    assert [bar["duration_quarters"] for bar in grid["bars"]] == [1.0, 1.25]
+    assert grid["bars"][0]["full_track_beat_count"] == 4
+    assert [bar["partial_window"] for bar in grid["bars"]] == [True, True]
+    assert grid["bars"][0]["full_track_start_beat_index"] == 0
+    assert grid["bars"][0]["full_track_end_beat_index"] == 4
+    assert grid["context"]["evaluation"]["boundary_beats_excluded_from_metrics"] is True
+    assert grid["context"]["window"]["boundary_beats"]["before"][0]["index"] == -1
+    assert grid["context"]["window"]["boundary_beats"]["after"][0]["index"] == 3
+    assert grid["context"]["window"]["boundary_beats"]["before"][0]["include_in_evaluation"] is False
     assert all(item["include_in_evaluation"] for item in grid["beats"])
+
+
+def _grid_with_timing(
+    times: list[float],
+    *,
+    downbeat_indices: set[int],
+    meter: str = "4/4",
+) -> dict[str, Any]:
+    numerator = int(meter.split("/", 1)[0])
+    beats = [
+        {
+            "index": index,
+            "time_sec": time_sec,
+            "beat_number": index % numerator + 1,
+            "downbeat": index in downbeat_indices,
+            "bar_index": index // numerator,
+            "quarter_position": float(index),
+            "local_bpm": 50.0 + index,
+        }
+        for index, time_sec in enumerate(times)
+    ]
+    bars = [
+        {
+            "index": bar_index,
+            "start_beat_index": start,
+            "end_beat_index": min(len(beats), start + numerator),
+            "start_sec": times[start],
+            "end_sec": times[min(len(beats) - 1, start + numerator - 1)],
+            "start_quarter": float(start),
+            "end_quarter": float(min(len(beats), start + numerator)),
+            "beat_count": len(beats[start : min(len(beats), start + numerator)]),
+        }
+        for bar_index, start in enumerate(range(0, len(beats), numerator))
+    ]
+    return {
+        **_full_grid(),
+        "beats": beats,
+        "downbeats": [item for item in beats if item["downbeat"]],
+        "bars": bars,
+        "time_signature": {"selected": meter, "confidence": 0.8},
+        "mapping": {
+            "beat_times": list(times),
+            "score_origin": {"downbeat_index": min(downbeat_indices), "downbeat_sec": times[min(downbeat_indices)]},
+        },
+    }
+
+
+def test_first_full_track_downbeat_can_be_local_window_index_zero() -> None:
+    grid = context.crop_full_track_beat_grid(
+        _grid_with_timing([-1.0, 0.0, 1.0, 2.0, 3.0, 4.0], downbeat_indices={1, 5}),
+        absolute_start_sec=0.0,
+        duration_sec=3.0,
+        full_audio={"path": "mix.wav", "sha256": "audio-hash"},
+        full_grid_record={"path": "full-grid.json", "sha256": "grid-hash", "beat_count": 6},
+    )
+
+    assert [item["index"] for item in grid["beats"]] == [0, 1, 2, 3]
+    assert [item["full_track_index"] for item in grid["beats"]] == [1, 2, 3, 4]
+    assert grid["beats"][0]["downbeat"] is True
+    assert grid["mapping"]["score_origin"]["downbeat_index"] == 0
+    assert grid["mapping"]["score_origin"]["downbeat_sec"] == 0.0
+    assert grid["mapping"]["score_origin"]["downbeat_status"] == "aligned"
+    assert grid["mapping"]["score_origin"]["origin_shift_beats"] == 0.0
+
+
+def test_long_opening_rest_is_local_undetermined_and_not_pickup() -> None:
+    grid = context.crop_full_track_beat_grid(
+        _grid_with_timing([-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0], downbeat_indices={5}),
+        absolute_start_sec=0.0,
+        duration_sec=4.5,
+        full_audio={"path": "mix.wav", "sha256": "audio-hash"},
+        full_grid_record={"path": "full-grid.json", "sha256": "grid-hash", "beat_count": 7},
+    )
+
+    origin = grid["mapping"]["score_origin"]
+    assert origin["downbeat_index"] == 4
+    assert origin["downbeat_sec"] == 4.0
+    assert origin["downbeat_status"] == "undetermined"
+    assert origin["pickup_candidate"] is False
+    assert origin["origin_shift_beats"] == 0.0
+    assert grid["beats"][0]["bar_index"] == 0
+    assert grid["beats"][4]["bar_index"] == 1
+
+
+def test_window_keeps_local_coordinates_when_full_track_tempo_changes_at_edges() -> None:
+    full = _grid_with_timing(
+        [-1.0, 0.0, 0.4, 1.4, 3.0, 3.5, 4.5, 6.0],
+        downbeat_indices={1, 5},
+    )
+    grid = context.crop_full_track_beat_grid(
+        full,
+        absolute_start_sec=0.4,
+        duration_sec=3.1,
+        full_audio={"path": "mix.wav", "sha256": "audio-hash"},
+        full_grid_record={"path": "full-grid.json", "sha256": "grid-hash", "beat_count": 8},
+    )
+
+    assert [item["time_sec"] for item in grid["beats"]] == [0.0, 1.0, 2.6, 3.1]
+    assert [item["full_track_time_sec"] for item in grid["beats"]] == [0.4, 1.4, 3.0, 3.5]
+    assert [item["local_bpm"] for item in grid["beats"]] == [52.0, 53.0, 54.0, 55.0]
+    assert grid["mapping"]["beat_times"] == [0.0, 1.0, 2.6, 3.1]
+    assert grid["mapping"]["full_track_beat_times"] == [-1.0, 0.0, 0.4, 1.4, 3.0, 3.5, 4.5, 6.0]
+
+
+def test_bars_without_source_quarter_bounds_do_not_invent_local_endpoints() -> None:
+    full = _full_grid()
+    full["bars"] = [
+        {
+            "index": 0,
+            "start_beat_index": 0,
+            "end_beat_index": 4,
+            "start_sec": 0.0,
+            "end_sec": 3.0,
+            "beat_count": 4,
+        }
+    ]
+    grid = context.crop_full_track_beat_grid(
+        full,
+        absolute_start_sec=0.25,
+        duration_sec=3.0,
+        full_audio={"path": "mix.wav", "sha256": "audio-hash"},
+        full_grid_record={"path": "full-grid.json", "sha256": "grid-hash", "beat_count": 10},
+    )
+
+    bar = grid["bars"][0]
+    assert (bar["start_sec"], bar["end_sec"]) == (0.0, 2.75)
+    assert "start_quarter" not in bar
+    assert "end_quarter" not in bar
+    assert "duration_quarters" not in bar
+    assert bar["full_track_start_sec"] == 0.0
+    assert bar["full_track_end_sec"] == 3.0
 
 
 def test_context_raw_reuses_game_notes_and_records_full_track_provenance(tmp_path: Path) -> None:

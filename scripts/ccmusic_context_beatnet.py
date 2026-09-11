@@ -85,14 +85,143 @@ def _beat_time(record: Mapping[str, Any]) -> float:
     return value
 
 
-def _context_beat(record: Mapping[str, Any], *, full_index: int, local_time: float, in_window: bool) -> dict[str, Any]:
+def _context_beat(
+    record: Mapping[str, Any],
+    *,
+    full_index: int,
+    local_time: float,
+    in_window: bool,
+    local_index: int | None = None,
+    local_bar_index: int | None = None,
+    local_beat_number: int | None = None,
+    local_quarter_position: float | None = None,
+) -> dict[str, Any]:
+    """Return a beat with local coordinates and explicit full-track audit data."""
+
     value = dict(record)
+    # The old fields silently exposed full-track coordinates after cropping.
+    # Preserve them under names that cannot be mistaken for window values.
+    for field in ("index", "bar_index", "beat_number", "quarter_position"):
+        if field in value:
+            value[f"full_track_{field}"] = value[field]
+            value.pop(field, None)
+    if "time_sec" in value:
+        value["full_track_time_sec"] = value["time_sec"]
+        value.pop("time_sec", None)
+    if "absolute_time_sec" in value:
+        value["full_track_absolute_time_sec"] = value["absolute_time_sec"]
+        value.pop("absolute_time_sec", None)
     value["time_sec"] = round(float(local_time), 9)
     value["absolute_time_sec"] = round(_beat_time(record), 9)
+    value["full_track_time_sec"] = round(_beat_time(record), 9)
     value["full_track_index"] = int(full_index)
+    value["index"] = int(local_index) if local_index is not None else None
+    value["bar_index"] = int(local_bar_index) if local_bar_index is not None else None
+    value["beat_number"] = int(local_beat_number) if local_beat_number is not None else None
+    value["quarter_position"] = (
+        round(float(local_quarter_position), 9)
+        if local_quarter_position is not None
+        else None
+    )
     value["in_window"] = bool(in_window)
     value["include_in_evaluation"] = bool(in_window)
+    value["context_only"] = not bool(in_window)
     return value
+
+
+def _local_bars(
+    full_grid: Mapping[str, Any],
+    inside: Sequence[tuple[int, Mapping[str, Any]]],
+    local_records: Sequence[Mapping[str, Any]],
+    *,
+    absolute_start_sec: float,
+    absolute_end_sec: float,
+    quarter_origin: float,
+    window_end_quarter: float,
+) -> list[dict[str, Any]]:
+    """Filter and rebase full-track bars to the local beat index space."""
+
+    full_bars = full_grid.get("bars")
+    if not isinstance(full_bars, list):
+        return []
+    full_to_local = {int(full_index): local_index for local_index, (full_index, _item) in enumerate(inside)}
+    local_bars: list[dict[str, Any]] = []
+    for full_bar in full_bars:
+        if not isinstance(full_bar, Mapping):
+            continue
+        try:
+            full_start = int(full_bar["start_beat_index"])
+            full_end = int(full_bar["end_beat_index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        overlap = [
+            local_index
+            for full_index, local_index in full_to_local.items()
+            if full_start <= full_index < full_end
+        ]
+        if not overlap:
+            continue
+        local_start = min(overlap)
+        local_end = max(overlap) + 1
+        item = dict(full_bar)
+        for field in (
+            "index",
+            "bar_index",
+            "start_beat_index",
+            "end_beat_index",
+            "start_sec",
+            "end_sec",
+            "start_quarter",
+            "end_quarter",
+            "beat_count",
+            "duration_quarters",
+        ):
+            if field in item:
+                item[f"full_track_{field}"] = item[field]
+                item.pop(field, None)
+        item["index"] = len(local_bars)
+        item["start_beat_index"] = local_start
+        item["end_beat_index"] = local_end
+        item["beat_count"] = local_end - local_start
+        full_start_sec = float(item.get("full_track_start_sec", _beat_time(inside[local_start][1])))
+        full_end_sec = float(item.get("full_track_end_sec", _beat_time(inside[local_end - 1][1])))
+        local_start_sec = max(0.0, min(absolute_end_sec - absolute_start_sec, full_start_sec - absolute_start_sec))
+        local_end_sec = max(0.0, min(absolute_end_sec - absolute_start_sec, full_end_sec - absolute_start_sec))
+        has_quarter_bounds = (
+            "full_track_start_quarter" in item
+            and "full_track_end_quarter" in item
+        )
+        if has_quarter_bounds:
+            full_start_quarter = float(item["full_track_start_quarter"])
+            full_end_quarter = float(item["full_track_end_quarter"])
+            local_start_quarter = max(0.0, min(window_end_quarter, full_start_quarter - quarter_origin))
+            local_end_quarter = max(0.0, min(window_end_quarter, full_end_quarter - quarter_origin))
+            clipped_at_start = full_start_sec < absolute_start_sec or full_start_quarter < quarter_origin
+            clipped_at_end = full_end_sec > absolute_end_sec or full_end_quarter - quarter_origin > window_end_quarter
+        else:
+            # Without both source endpoints, omit local quarter bounds rather
+            # than treating the last visible beat as the bar endpoint.
+            clipped_at_start = full_start_sec < absolute_start_sec
+            clipped_at_end = full_end_sec > absolute_end_sec
+            local_start_quarter = local_end_quarter = None
+        partial = bool(
+            clipped_at_start
+            or clipped_at_end
+            or (local_start == 0 and not bool(local_records[0].get("downbeat")))
+        )
+        item["start_sec"] = round(local_start_sec, 9)
+        item["end_sec"] = round(local_end_sec, 9)
+        if has_quarter_bounds:
+            item["start_quarter"] = round(float(local_start_quarter), 9)
+            item["end_quarter"] = round(float(local_end_quarter), 9)
+            item["duration_quarters"] = round(
+                float(local_end_quarter) - float(local_start_quarter), 9
+            )
+        item["partial_window"] = partial
+        if partial:
+            item["stable"] = False
+        local_bars.append(item)
+    return local_bars
 
 
 def crop_full_track_beat_grid(
@@ -136,24 +265,143 @@ def crop_full_track_beat_grid(
     before_index, before_record = before[-1]
     after_index, after_record = after[0]
     selected = [(before_index, before_record), *inside, (after_index, after_record)]
-    local_records = [
-        _context_beat(item, full_index=index, local_time=_beat_time(item) - start, in_window=start <= _beat_time(item) <= end)
-        for index, item in selected
+
+    # Rebase all derived beat coordinates to the scored window.  The full
+    # record index/time remain available on each record for audit only.
+    full_quarters: list[float] = []
+    for full_index, item in inside:
+        try:
+            quarter = float(item["quarter_position"])
+        except (KeyError, TypeError, ValueError):
+            quarter = float(full_index)
+        if quarter != quarter or quarter in {float("inf"), float("-inf")}:
+            quarter = float(full_index)
+        full_quarters.append(quarter)
+    quarter_origin = full_quarters[0]
+    downbeat_indices = [
+        index for index, (_full_index, item) in enumerate(inside) if bool(item.get("downbeat"))
     ]
-    local_inside = [item for item in local_records if item["include_in_evaluation"]]
-    local_downbeats = [item for item in local_records if item.get("downbeat")]
-    local_inside_downbeats = [item for item in local_inside if item.get("downbeat")]
-    mapping = dict(full_grid.get("mapping") or {}) if isinstance(full_grid.get("mapping"), Mapping) else {}
+    bar_starts = [0, *[index for index in downbeat_indices if index > 0]]
+    bar_starts = sorted(set(bar_starts))
+    local_inside: list[dict[str, Any]] = []
+    for local_index, ((full_index, item), quarter) in enumerate(zip(inside, full_quarters)):
+        local_bar_index = max(
+            (bar for bar, bar_start in enumerate(bar_starts) if bar_start <= local_index),
+            default=0,
+        )
+        local_inside.append(
+            _context_beat(
+                item,
+                full_index=full_index,
+                local_time=_beat_time(item) - start,
+                in_window=True,
+                local_index=local_index,
+                local_bar_index=local_bar_index,
+                # beat_number is the musical beat within the source bar.  A
+                # cropped partial bar must not be renumbered from one.
+                local_beat_number=(
+                    int(item["beat_number"])
+                    if item.get("beat_number") is not None
+                    else None
+                ),
+                local_quarter_position=quarter - quarter_origin,
+            )
+        )
+    local_inside_downbeats = [item for item in local_inside if bool(item.get("downbeat"))]
+
+    window_end_quarter = local_inside[-1]["quarter_position"]
+    if after_record is not None and _beat_time(after_record) > _beat_time(inside[-1][1]):
+        try:
+            after_quarter = float(after_record["quarter_position"])
+        except (KeyError, TypeError, ValueError):
+            after_quarter = float(after_index)
+        if after_quarter != after_quarter or after_quarter in {float("inf"), float("-inf")}:
+            after_quarter = float(after_index)
+        interval = _beat_time(after_record) - _beat_time(inside[-1][1])
+        if interval > 0:
+            window_end_quarter = round(
+                (
+                    full_quarters[-1]
+                    + (end - _beat_time(inside[-1][1]))
+                    / interval
+                    * (after_quarter - full_quarters[-1])
+                )
+                - quarter_origin,
+                9,
+            )
+    window_end_quarter = max(float(local_inside[-1]["quarter_position"]), float(window_end_quarter))
+
+    full_mapping = full_grid.get("mapping") if isinstance(full_grid.get("mapping"), Mapping) else {}
+    mapping = copy.deepcopy(dict(full_mapping))
+    if isinstance(full_mapping.get("beat_times"), list):
+        mapping["full_track_beat_times"] = list(full_mapping["beat_times"])
+    if "first_beat_sec" in full_mapping:
+        mapping["full_track_first_beat_sec"] = full_mapping["first_beat_sec"]
+    if isinstance(full_mapping.get("score_origin"), Mapping):
+        mapping["full_track_score_origin"] = copy.deepcopy(dict(full_mapping["score_origin"]))
+    mapping.pop("score_origin", None)
     mapping["beat_times"] = [float(item["time_sec"]) for item in local_inside]
     mapping["first_beat_sec"] = float(local_inside[0]["time_sec"])
     mapping["window_absolute_start_sec"] = start
     mapping["window_absolute_end_sec"] = end
     mapping["absolute_to_local"] = "local_sec = absolute_sec - window.absolute_start_sec"
+    first_downbeat_index = downbeat_indices[0] if downbeat_indices else None
+    first_is_downbeat = bool(local_inside and local_inside[0].get("downbeat"))
+    full_downbeat_index = int(inside[first_downbeat_index][0]) if first_downbeat_index is not None else None
+    local_origin = {
+        "strategy": (
+            "local_first_downbeat"
+            if first_is_downbeat
+            else "local_window_partial_bar"
+            if first_downbeat_index is not None
+            else "local_downbeat_unavailable"
+        ),
+        "timeline_scope": "ccmusic_local_window",
+        "downbeat_status": "aligned" if first_is_downbeat else "undetermined",
+        "downbeat_index": first_downbeat_index,
+        "downbeat_sec": (
+            float(local_inside[first_downbeat_index]["time_sec"])
+            if first_downbeat_index is not None
+            else None
+        ),
+        "downbeat_score_beat": 0.0 if first_is_downbeat else None,
+        "pickup_candidate": False,
+        "pickup_beats": 0.0,
+        "origin_shift_beats": 0.0,
+        "warning": (
+            None
+            if first_is_downbeat
+            else "裁剪窗口从不完整小节开始；局部重拍阶段未确定，保持局部原点"
+        ),
+        "full_track_downbeat_index": full_downbeat_index,
+        "absolute_downbeat_sec": (
+            round(_beat_time(inside[first_downbeat_index][1]), 9)
+            if first_downbeat_index is not None
+            else None
+        ),
+        "origin_basis": "inside_window_downbeats_only",
+    }
+    mapping["score_origin"] = local_origin
+    mapping["timeline_scope"] = "ccmusic_local_window"
+    mapping["boundary_beats_excluded_from_evaluation"] = True
     grid = copy.deepcopy(dict(full_grid))
     grid["duration_sec"] = duration
-    grid["beats"] = local_records
-    grid["downbeats"] = local_downbeats
+    grid["beats"] = local_inside
+    grid["downbeats"] = local_inside_downbeats
+    grid["bars"] = _local_bars(
+        full_grid,
+        inside,
+        local_inside,
+        absolute_start_sec=start,
+        absolute_end_sec=end,
+        quarter_origin=quarter_origin,
+        window_end_quarter=window_end_quarter,
+    )
     grid["mapping"] = mapping
+    if local_origin["warning"]:
+        warnings = [str(item) for item in (grid.get("warnings") or []) if item]
+        warnings.append(str(local_origin["warning"]))
+        grid["warnings"] = list(dict.fromkeys(warnings))
     grid["context"] = {
         "schema_version": CONTEXT_SCHEMA_VERSION,
         "mode": "full_track_absolute_window",
@@ -172,14 +420,33 @@ def crop_full_track_beat_grid(
             "inside_full_track_indices": [int(index) for index, _item in inside],
             "selected_full_track_indices": [int(index) for index, _item in selected],
             "boundary_beats": {
-                "before": [_context_beat(before_record, full_index=before_index, local_time=_beat_time(before_record) - start, in_window=False)],
-                "after": [_context_beat(after_record, full_index=after_index, local_time=_beat_time(after_record) - start, in_window=False)],
+                "before": [
+                    _context_beat(
+                        before_record,
+                        full_index=before_index,
+                        local_time=_beat_time(before_record) - start,
+                        in_window=False,
+                        local_index=-1,
+                    )
+                ],
+                "after": [
+                    _context_beat(
+                        after_record,
+                        full_index=after_index,
+                        local_time=_beat_time(after_record) - start,
+                        in_window=False,
+                        local_index=len(local_inside),
+                    )
+                ],
             },
             "boundary_policy": "nearest one beat before and after; retained for audit/context and excluded from window beat metrics",
+            "boundary_beats_include_in_evaluation": False,
+            "coordinate_scope": "window_local",
         },
         "evaluation": {
             "beat_records": "beat_grid.beats (window-local; boundary beats are metadata only)",
             "downbeat_records": "beat_grid.downbeats (window-local; boundary beats are metadata only)",
+            "boundary_beats_excluded_from_metrics": True,
             "reference_grid_not_used": True,
         },
     }
