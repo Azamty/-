@@ -187,6 +187,10 @@ def _local_bars(
         full_end_sec = float(item.get("full_track_end_sec", _beat_time(inside[local_end - 1][1])))
         local_start_sec = max(0.0, min(absolute_end_sec - absolute_start_sec, full_start_sec - absolute_start_sec))
         local_end_sec = max(0.0, min(absolute_end_sec - absolute_start_sec, full_end_sec - absolute_start_sec))
+        # A beat exactly on the closed window end belongs to the beat metric,
+        # but its following bar has no duration inside this window.
+        if local_end_sec <= local_start_sec:
+            continue
         has_quarter_bounds = (
             "full_track_start_quarter" in item
             and "full_track_end_quarter" in item
@@ -211,7 +215,12 @@ def _local_bars(
         )
         item["start_sec"] = round(local_start_sec, 9)
         item["end_sec"] = round(local_end_sec, 9)
-        if has_quarter_bounds:
+        # Local quarter zero is anchored at the first visible beat, not at an
+        # arbitrary crop boundary.  A partial bar can therefore extend before
+        # zero or beyond its last visible pulse.  Preserve the source bounds as
+        # audit evidence, but omit local quarter bounds instead of clamping or
+        # inventing a duration for a truncated bar.
+        if has_quarter_bounds and not partial:
             item["start_quarter"] = round(float(local_start_quarter), 9)
             item["end_quarter"] = round(float(local_end_quarter), 9)
             item["duration_quarters"] = round(

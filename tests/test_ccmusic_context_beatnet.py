@@ -37,10 +37,16 @@ def _full_grid() -> dict[str, Any]:
         for index in range(10)
     ]
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "engine": "beatnet",
         "mode": "offline",
         "inference": "DBN",
+        "beat_unit_definition": "quarter",
+        "beat_unit_source": "standard_meter_definition",
+        "beat_unit_proven": True,
+        "beat_duration_quarters": 1.0,
+        "beats_per_bar": 4,
+        "bar_duration_quarters": 4.0,
         "beats": beats,
         "downbeats": [item for item in beats if item["downbeat"]],
         "bars": [
@@ -111,9 +117,10 @@ def test_full_track_window_keeps_absolute_grid_and_one_boundary_each_side() -> N
     assert [bar["index"] for bar in grid["bars"]] == [0, 1]
     assert [(bar["start_beat_index"], bar["end_beat_index"]) for bar in grid["bars"]] == [(0, 1), (1, 3)]
     assert [(bar["start_sec"], bar["end_sec"]) for bar in grid["bars"]] == [(0.0, 0.75), (1.75, 3.0)]
-    assert [(bar["start_quarter"], bar["end_quarter"]) for bar in grid["bars"]] == [(0.0, 1.0), (1.0, 2.25)]
     assert [bar["beat_count"] for bar in grid["bars"]] == [1, 2]
-    assert [bar["duration_quarters"] for bar in grid["bars"]] == [1.0, 1.25]
+    assert all("start_quarter" not in bar for bar in grid["bars"])
+    assert all("end_quarter" not in bar for bar in grid["bars"])
+    assert all("duration_quarters" not in bar for bar in grid["bars"])
     assert grid["bars"][0]["full_track_beat_count"] == 4
     assert [bar["partial_window"] for bar in grid["bars"]] == [True, True]
     assert grid["bars"][0]["full_track_start_beat_index"] == 0
@@ -123,6 +130,37 @@ def test_full_track_window_keeps_absolute_grid_and_one_boundary_each_side() -> N
     assert grid["context"]["window"]["boundary_beats"]["after"][0]["index"] == 3
     assert grid["context"]["window"]["boundary_beats"]["before"][0]["include_in_evaluation"] is False
     assert all(item["include_in_evaluation"] for item in grid["beats"])
+
+
+def test_beat_on_window_end_does_not_create_zero_duration_bar() -> None:
+    grid = context.crop_full_track_beat_grid(
+        _full_grid(),
+        absolute_start_sec=1.0,
+        duration_sec=3.0,
+        full_audio={"path": "mix.wav", "sha256": "audio-hash"},
+        full_grid_record={"path": "full-grid.json", "sha256": "grid-hash", "beat_count": 10},
+    )
+
+    assert [item["full_track_index"] for item in grid["beats"]] == [1, 2, 3, 4]
+    assert len(grid["bars"]) == 1
+    assert grid["bars"][0]["start_sec"] == 0.0
+    assert grid["bars"][0]["end_sec"] == 2.0
+
+
+def test_full_bar_keeps_exact_quarter_duration_between_partial_neighbors() -> None:
+    grid = context.crop_full_track_beat_grid(
+        _full_grid(),
+        absolute_start_sec=0.5,
+        duration_sec=8.0,
+        full_audio={"path": "mix.wav", "sha256": "audio-hash"},
+        full_grid_record={"path": "full-grid.json", "sha256": "grid-hash", "beat_count": 10},
+    )
+
+    full_bar = next(bar for bar in grid["bars"] if not bar["partial_window"])
+    assert full_bar["full_track_index"] == 1
+    assert full_bar["beat_count"] == 4
+    assert full_bar["duration_quarters"] == 4.0
+    assert full_bar["end_quarter"] - full_bar["start_quarter"] == 4.0
 
 
 def _grid_with_timing(
