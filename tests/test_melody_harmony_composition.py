@@ -177,3 +177,39 @@ def test_composition_rejects_mismatched_source_timelines() -> None:
             title="fixture",
             selected_track_ids=["a", "b"],
         )
+
+
+def test_composition_merges_only_ordinary_same_instrument_accompaniment_chords() -> None:
+    score = _score(
+        [
+            ScoreVoice(
+                voice_id="voice-a",
+                events=[_note(0, 48, 60, "e0"), _note(48, 96, 52, "e1")],
+            ),
+            ScoreVoice(
+                voice_id="voice-b",
+                events=[_note(0, 48, None, "r0"), _note(48, 96, 55, "e2")],
+            ),
+        ],
+        total_ticks=96,
+    )
+    composed, report = _compose(
+        score,
+        [
+            _alignment(0, 60, 0, 48, "e0"),
+            _alignment(1, 52, 48, 96, "e1"),
+            _alignment(2, 55, 48, 96, "e2"),
+        ],
+        {0},
+    )
+
+    assert report["accompaniment_merged_group_count"] == 1
+    chord_events = [
+        event
+        for voice in composed.voices
+        for event in voice.events
+        if set(event.chord_pitches) == {52, 55}
+    ]
+    assert len(chord_events) == 1
+    assert Counter(_score_note_intervals(composed)) == Counter(_score_note_intervals(score))
+    assert score_to_jianpu(composed)

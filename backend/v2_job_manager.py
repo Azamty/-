@@ -2101,20 +2101,26 @@ class V2JobService:
         grouped_accompaniment: dict[tuple[Any, ...], list[int]] = {}
         for item in role_intervals["accompaniment"]:
             tie_values = [value for value in item["tie_types"] if value is not None]
-            if tie_values:
+            # A tuplet group is an indivisible notation block even when an
+            # individual member has no tie.  Only ordinary, untied events
+            # from the same selected instrument may become one visual chord.
+            if (
+                tie_values
+                or item["tuplet_actual"] is not None
+                or item["tuplet_normal"] is not None
+                or item["tuplet_type"] is not None
+                or item.get("tuplet_group_key") is not None
+            ):
                 merged_accompaniment.append(item)
                 continue
             group_key = (
-                # Keep independent source voices in independent lanes.  A
-                # cross-voice chord merge would lose the lane identity needed
-                # to keep surrounding ties/tuplets contiguous.
+                # Keep different selected instruments in separate lanes so a
+                # visual chord never erases an instrument boundary.  Voices
+                # within one source Score share an instrument and may merge
+                # when their ordinary event spans are exactly identical.
                 int(item["source_order"]),
-                str(item["source_voice_id"]),
                 int(item["start_tick"]),
                 int(item["end_tick"]),
-                item["tuplet_actual"],
-                item["tuplet_normal"],
-                item["tuplet_type"],
                 int(item["dots"]),
                 item["measure_number"],
             )
@@ -2135,15 +2141,23 @@ class V2JobService:
             target = merged_accompaniment[merge_index]
             target["pitches"] = sorted([*target["pitches"], *item["pitches"]])
             target["tie_types"] = [None] * len(target["pitches"])
+            merged_sources = list(target["metadata"].get("composition_merged_sources", []))
+            if not merged_sources:
+                merged_sources.append(
+                    {
+                        "track_id": target["metadata"].get("composition_source_track_id"),
+                        "voice_id": target["metadata"].get("composition_source_voice_id"),
+                    }
+                )
+            merged_sources.append(
+                {
+                    "track_id": item["metadata"].get("composition_source_track_id"),
+                    "voice_id": item["metadata"].get("composition_source_voice_id"),
+                }
+            )
             target["metadata"] = {
                 **target["metadata"],
-                "composition_merged_sources": [
-                    *target["metadata"].get("composition_merged_sources", []),
-                    {
-                        "track_id": item["metadata"].get("composition_source_track_id"),
-                        "voice_id": item["metadata"].get("composition_source_voice_id"),
-                    },
-                ],
+                "composition_merged_sources": merged_sources,
             }
             merged_accompaniment_group_count += 1
         role_intervals["accompaniment"] = merged_accompaniment
