@@ -1282,9 +1282,10 @@ def _chord_lane_plan(
 
     unsafe_records = _chord_split_records([voice], keys)
     unsafe_indices = {int(record["event_index"]) for record in unsafe_records}
-    if not unsafe_indices:
+    partial_tie_indices = _partial_tie_indices(voice)
+    if not unsafe_indices and not partial_tie_indices:
         return {}, set(), 0, unsafe_records
-    seed_indices = unsafe_indices | _partial_tie_indices(voice)
+    seed_indices = unsafe_indices | partial_tie_indices
 
     events = voice.events
     tie_sets = [_event_tie_sets(event) for event in events]
@@ -1316,8 +1317,6 @@ def _chord_lane_plan(
     component_lane_count: dict[int, int] = {}
     for component in components:
         max_size = max(len(_event_pitches(events[index])) for index in component)
-        lane_count = max(1, max_size)
-        component_lane_count.update({index: lane_count for index in component})
         split_indices.update(component)
         active: dict[int, int] = {}
         for index in sorted(component):
@@ -1333,18 +1332,37 @@ def _chord_lane_plan(
                         )
                     assignment[pitch] = active[pitch]
                     used.add(active[pitch])
-            for pitch in pitches:
-                if pitch in assignment:
-                    continue
-                slot = next((candidate for candidate in range(lane_count) if candidate not in used), None)
+
+            # Pitches with the same tie state can share a chord token.  A
+            # partial-tie-only component therefore needs one lane for the held
+            # pitch and one for the untied chord pitches, instead of one lane
+            # for every pitch.  Unsafe accidental chords remain one pitch per
+            # lane because jianpu-ly has one accidental state per token.
+            remaining = [pitch for pitch in pitches if pitch not in assignment]
+            if index in unsafe_indices:
+                groups = [[pitch] for pitch in remaining]
+            else:
+                by_tie: dict[str | None, list[int]] = {}
+                tie_map = _event_tie_map(events[index])
+                for pitch in remaining:
+                    by_tie.setdefault(tie_map.get(pitch), []).append(pitch)
+                groups = [by_tie[key] for key in sorted(by_tie, key=lambda value: (value is not None, str(value)))]
+            for group in groups:
+                slot = next((candidate for candidate in range(max_size) if candidate not in used), None)
                 if slot is None:
                     raise JianpuSerializationError(
-                        f"chord at tick {events[index].start_tick} needs more than {lane_count} lanes"
+                        f"chord at tick {events[index].start_tick} needs more than {max_size} lanes"
                     )
-                assignment[pitch] = slot
+                for pitch in group:
+                    assignment[pitch] = slot
                 used.add(slot)
             assignments[index] = assignment
             active = {pitch: assignment[pitch] for pitch in after if pitch in assignment}
+        lane_count = max(
+            (max(assignment.values(), default=-1) + 1 for index, assignment in assignments.items() if index in component),
+            default=1,
+        )
+        component_lane_count.update({index: lane_count for index in component})
 
     for record in unsafe_records:
         event_index = int(record["event_index"])

@@ -2221,68 +2221,174 @@ class V2JobService:
             )
             lanes: list[list[dict[str, Any]]] = []
             lane_ends: list[int] = []
-            lane_source_keys: list[tuple[int, str]] = []
-            tie_lane_by_pitch: dict[tuple[int, str, int], int] = {}
-            tuplet_lane_by_group: dict[Any, int] = {}
-            for item in ordered:
-                start_tick = int(item["start_tick"])
-                tied_pitch_keys = [
-                    (int(item["source_order"]), str(item["source_voice_id"]), int(pitch))
-                    for pitch, tie in zip(item["pitches"], item["tie_types"], strict=True)
-                    if tie in {"stop", "continue"}
-                ]
-                preferred_lanes = {
-                    tie_lane_by_pitch[key]
-                    for key in tied_pitch_keys
-                    if key in tie_lane_by_pitch
-                }
-                if len(preferred_lanes) > 1:
-                    raise ValueError("tied source chord pitches require conflicting composition lanes")
-                item_source_key = (int(item["source_order"]), str(item["source_voice_id"]))
-                tuplet_group_key = item.get("tuplet_group_key")
-                if tuplet_group_key is not None and tuplet_group_key in tuplet_lane_by_group:
-                    preferred_lanes.add(tuplet_lane_by_group[tuplet_group_key])
-                if len(preferred_lanes) > 1:
-                    raise ValueError("source tie/tuplet requires conflicting composition lanes")
-                preferred_lane = next(iter(preferred_lanes), None)
-                if preferred_lane is not None:
-                    if (
-                        preferred_lane >= len(lane_ends)
-                        or lane_source_keys[preferred_lane] != item_source_key
-                        or lane_ends[preferred_lane] > start_tick
-                    ):
-                        raise ValueError(
-                            "tied/tuplet source event cannot retain one composition lane at "
-                            f"tick {start_tick}"
+            if role == "melody":
+                # Pack ordinary melody fragments by occupied time, while
+                # reserving every complete tie/tuplet component as one block.
+                # The source voice is metadata for identity; it must not keep
+                # a lane reserved for the whole score.  This lets a melody
+                # which moves between source voices remain readable in one
+                # staff without allowing another event to split a tie or a
+                # tuplet in the middle.
+                parents = list(range(len(ordered)))
+
+                def find(index: int) -> int:
+                    while parents[index] != index:
+                        parents[index] = parents[parents[index]]
+                        index = parents[index]
+                    return index
+
+                def union(left: int, right: int) -> None:
+                    left_root = find(left)
+                    right_root = find(right)
+                    if left_root != right_root:
+                        parents[right_root] = left_root
+
+                def tuple_group_key(item: Mapping[str, Any]) -> tuple[Any, ...] | None:
+                    raw_key = item.get("tuplet_group_key")
+                    if raw_key is None:
+                        return None
+                    try:
+                        hash(raw_key)
+                    except TypeError:
+                        raw_key = repr(raw_key)
+                    return (
+                        int(item["source_order"]),
+                        str(item["source_voice_id"]),
+                        raw_key,
+                    )
+
+                tuple_members: dict[tuple[Any, ...], list[int]] = {}
+                for index, item in enumerate(ordered):
+                    group_key = tuple_group_key(item)
+                    if group_key is not None:
+                        tuple_members.setdefault(group_key, []).append(index)
+                for members in tuple_members.values():
+                    first = members[0]
+                    for member in members[1:]:
+                        union(first, member)
+
+                # Tie identity includes source voice and pitch.  A stop or
+                # continuation can only join the immediately preceding active
+                # fragment in that identity chain.  Unioning events (rather
+                # than assigning them one at a time) prevents a simultaneous
+                # short note from stealing the tie's lane.
+                active_ties: dict[tuple[int, str, int], int] = {}
+                for index, item in enumerate(ordered):
+                    source_key = (int(item["source_order"]), str(item["source_voice_id"]))
+                    for pitch, tie in zip(item["pitches"], item["tie_types"], strict=True):
+                        tie_key = (*source_key, int(pitch))
+                        if tie == "start":
+                            active_ties[tie_key] = index
+                        elif tie == "continue":
+                            previous = active_ties.get(tie_key)
+                            if previous is not None:
+                                union(previous, index)
+                            active_ties[tie_key] = index
+                        elif tie == "stop":
+                            previous = active_ties.pop(tie_key, None)
+                            if previous is not None:
+                                union(previous, index)
+
+                block_members: dict[int, list[int]] = {}
+                for index in range(len(ordered)):
+                    block_members.setdefault(find(index), []).append(index)
+                blocks: list[tuple[int, int, int, list[int]]] = []
+                for members in block_members.values():
+                    members.sort(
+                        key=lambda index: (
+                            int(ordered[index]["start_tick"]),
+                            int(ordered[index]["end_tick"]),
+                            int(ordered[index]["source_event_order"]),
                         )
-                    lane_index = preferred_lane
-                else:
+                    )
+                    block_start = min(int(ordered[index]["start_tick"]) for index in members)
+                    block_end = max(int(ordered[index]["end_tick"]) for index in members)
+                    block_pitch = max(
+                        (max((int(pitch) for pitch in ordered[index]["pitches"]), default=-1) for index in members),
+                        default=-1,
+                    )
+                    blocks.append((block_start, -block_pitch, block_end, members))
+                blocks.sort(key=lambda value: (value[0], value[1], value[2], value[3][0]))
+
+                for block_start, _negative_pitch, block_end, members in blocks:
                     lane_index = next(
                         (
                             index
                             for index, end_tick in enumerate(lane_ends)
-                            if lane_source_keys[index] == item_source_key and end_tick <= start_tick
+                            if end_tick <= block_start
                         ),
                         None,
                     )
-                if lane_index is None:
-                    lane_index = len(lanes)
-                    lanes.append([])
-                    lane_ends.append(0)
-                    lane_source_keys.append(item_source_key)
-                lanes[lane_index].append(item)
-                lane_ends[lane_index] = int(item["end_tick"])
-                if tuplet_group_key is not None:
-                    tuplet_lane_by_group[tuplet_group_key] = lane_index
-                # Keep tie start/continue/stop fragments on one output lane;
-                # otherwise a same-tick independent event can steal the lane
-                # and turn one held note into several MIDI notes.
-                for pitch, tie in zip(item["pitches"], item["tie_types"], strict=True):
-                    tie_key = (int(item["source_order"]), str(item["source_voice_id"]), int(pitch))
-                    if tie in {"start", "continue"}:
-                        tie_lane_by_pitch[tie_key] = lane_index
-                    elif tie == "stop":
-                        tie_lane_by_pitch.pop(tie_key, None)
+                    if lane_index is None:
+                        lane_index = len(lanes)
+                        lanes.append([])
+                        lane_ends.append(0)
+                    lanes[lane_index].extend(ordered[index] for index in members)
+                    lane_ends[lane_index] = block_end
+            else:
+                # Accompaniment lanes retain source-voice affinity because
+                # those voices often carry independent rhythmic parts.  Their
+                # exact-time ordinary pitches are already merged into chords
+                # above; ties and tuplets remain locked to their source lane.
+                lane_source_keys: list[tuple[int, str]] = []
+                tie_lane_by_pitch: dict[tuple[int, str, int], int] = {}
+                tuplet_lane_by_group: dict[Any, int] = {}
+                for item in ordered:
+                    start_tick = int(item["start_tick"])
+                    tied_pitch_keys = [
+                        (int(item["source_order"]), str(item["source_voice_id"]), int(pitch))
+                        for pitch, tie in zip(item["pitches"], item["tie_types"], strict=True)
+                        if tie in {"stop", "continue"}
+                    ]
+                    preferred_lanes = {
+                        tie_lane_by_pitch[key]
+                        for key in tied_pitch_keys
+                        if key in tie_lane_by_pitch
+                    }
+                    if len(preferred_lanes) > 1:
+                        raise ValueError("tied source chord pitches require conflicting composition lanes")
+                    item_source_key = (int(item["source_order"]), str(item["source_voice_id"]))
+                    tuplet_group_key = item.get("tuplet_group_key")
+                    if tuplet_group_key is not None and tuplet_group_key in tuplet_lane_by_group:
+                        preferred_lanes.add(tuplet_lane_by_group[tuplet_group_key])
+                    if len(preferred_lanes) > 1:
+                        raise ValueError("source tie/tuplet requires conflicting composition lanes")
+                    preferred_lane = next(iter(preferred_lanes), None)
+                    if preferred_lane is not None:
+                        if (
+                            preferred_lane >= len(lane_ends)
+                            or lane_source_keys[preferred_lane] != item_source_key
+                            or lane_ends[preferred_lane] > start_tick
+                        ):
+                            raise ValueError(
+                                "tied/tuplet source event cannot retain one composition lane at "
+                                f"tick {start_tick}"
+                            )
+                        lane_index = preferred_lane
+                    else:
+                        lane_index = next(
+                            (
+                                index
+                                for index, end_tick in enumerate(lane_ends)
+                                if lane_source_keys[index] == item_source_key and end_tick <= start_tick
+                            ),
+                            None,
+                        )
+                    if lane_index is None:
+                        lane_index = len(lanes)
+                        lanes.append([])
+                        lane_ends.append(0)
+                        lane_source_keys.append(item_source_key)
+                    lanes[lane_index].append(item)
+                    lane_ends[lane_index] = int(item["end_tick"])
+                    if tuplet_group_key is not None:
+                        tuplet_lane_by_group[tuplet_group_key] = lane_index
+                    for pitch, tie in zip(item["pitches"], item["tie_types"], strict=True):
+                        tie_key = (int(item["source_order"]), str(item["source_voice_id"]), int(pitch))
+                        if tie in {"start", "continue"}:
+                            tie_lane_by_pitch[tie_key] = lane_index
+                        elif tie == "stop":
+                            tie_lane_by_pitch.pop(tie_key, None)
             lane_counts[role] = len(lanes)
             for lane_index, lane in enumerate(lanes, start=1):
                 output_events: list[ScoreNote] = []

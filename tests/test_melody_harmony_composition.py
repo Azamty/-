@@ -215,3 +215,79 @@ def test_composition_merges_only_ordinary_same_instrument_accompaniment_chords()
     assert len(chord_events) == 1
     assert Counter(_score_note_intervals(composed)) == Counter(_score_note_intervals(score))
     assert score_to_jianpu(composed)
+
+
+def test_melody_lanes_reuse_disjoint_source_voices_but_reserve_tie_blocks() -> None:
+    score = _score(
+        [
+            ScoreVoice(
+                voice_id="voice-a",
+                events=[
+                    _note(0, 48, 69, "a0"),
+                    _note(48, 96, 69, "a1", tie="start"),
+                    _note(96, 144, 69, "a2", tie="stop"),
+                    _note(144, 192, None, "a-rest"),
+                ],
+            ),
+            ScoreVoice(
+                voice_id="voice-b",
+                events=[
+                    _note(0, 48, None, "b-rest"),
+                    _note(48, 96, 67, "b0"),
+                    _note(96, 144, None, "b-rest-2"),
+                    _note(144, 192, 64, "b1"),
+                ],
+            ),
+        ],
+        total_ticks=192,
+    )
+    composed, report = _compose(
+        score,
+        [
+            _alignment(0, 69, 0, 48, "a0"),
+            _alignment(1, 69, 48, 96, "a1"),
+            _alignment(2, 69, 96, 144, "a2"),
+            _alignment(3, 67, 48, 96, "b0"),
+            _alignment(4, 64, 144, 192, "b1"),
+        ],
+        {0, 1, 2, 3, 4},
+    )
+
+    # voice-b's first note overlaps the held voice-a tie, so it needs a
+    # second lane; its later note can reuse the first lane after the tie.
+    assert report["lane_counts"]["melody"] == 2
+    assert Counter(_score_note_intervals(composed)) == Counter(_score_note_intervals(score))
+    assert score_to_jianpu(composed)
+
+
+def test_melody_lanes_share_non_overlapping_source_voice_fragments() -> None:
+    score = _score(
+        [
+            ScoreVoice(
+                voice_id="voice-a",
+                events=[_note(0, 48, 69, "a0"), _note(48, 144, None, "a-rest")],
+            ),
+            ScoreVoice(
+                voice_id="voice-b",
+                events=[
+                    _note(0, 48, None, "b-rest"),
+                    _note(48, 96, 67, "b0"),
+                    _note(96, 144, 64, "b1"),
+                ],
+            ),
+        ],
+        total_ticks=144,
+    )
+    composed, report = _compose(
+        score,
+        [
+            _alignment(0, 69, 0, 48, "a0"),
+            _alignment(1, 67, 48, 96, "b0"),
+            _alignment(2, 64, 96, 144, "b1"),
+        ],
+        {0, 1, 2},
+    )
+
+    assert report["lane_counts"]["melody"] == 1
+    assert Counter(_score_note_intervals(composed)) == Counter(_score_note_intervals(score))
+    assert score_to_jianpu(composed)
