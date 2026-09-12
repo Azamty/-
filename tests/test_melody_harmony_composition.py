@@ -147,7 +147,9 @@ def test_composition_keeps_tuplet_grid_and_tied_source_lane() -> None:
             _alignment(0, 60, 0, 16, "e0"),
             _alignment(1, 62, 16, 32, "e1"),
             _alignment(2, 64, 32, 48, "e2"),
-            _alignment(3, 65, 48, 144, "e3", "e4"),
+            # Only the first tie fragment is selected by identity; the
+            # composer must propagate the role to its stop fragment.
+            _alignment(3, 65, 48, 96, "e3"),
             _alignment(4, 55, 96, 120, "e5"),
         ],
         {0, 3},

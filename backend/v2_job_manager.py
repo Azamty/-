@@ -1948,6 +1948,44 @@ class V2JobService:
                 )
 
             for source_voice_order, voice in enumerate(score.voices):
+                # Alignment identity marks the candidate's first tied
+                # fragment in some MusicXML exports.  Propagate that role
+                # across the complete source tie chain before splitting a
+                # chord, otherwise its stop fragment can land in the other
+                # display role and make the composed interval set invalid.
+                event_roles: dict[tuple[int, int], str] = {}
+                active_tie_members: dict[int, list[int]] = {}
+                completed_tie_chains: list[list[tuple[int, int]]] = []
+                for event_index, event in enumerate(voice.events):
+                    pitches = list(event.chord_pitches) if event.chord_pitches else (
+                        [event.midi] if event.midi is not None else []
+                    )
+                    tie_values = list(event.tie_types)
+                    if len(tie_values) != len(pitches):
+                        tie_values = [event.tie] * len(pitches)
+                    for pitch, tie in zip(pitches, tie_values, strict=True):
+                        pitch_int = int(pitch)
+                        event_roles[(event_index, pitch_int)] = (
+                            "melody" if is_melody_slot(event, pitch_int) else "accompaniment"
+                        )
+                        if tie == "start":
+                            active_tie_members[pitch_int] = [event_index]
+                        elif tie == "continue":
+                            active_tie_members.setdefault(pitch_int, []).append(event_index)
+                        elif tie == "stop":
+                            members = [*active_tie_members.pop(pitch_int, []), event_index]
+                            completed_tie_chains.append(
+                                [(member, pitch_int) for member in members]
+                            )
+                completed_tie_chains.extend(
+                    [(member, pitch_int) for member in members]
+                    for pitch_int, members in active_tie_members.items()
+                )
+                for chain in completed_tie_chains:
+                    if any(event_roles.get(member_key) == "melody" for member_key in chain):
+                        for member_key in chain:
+                            event_roles[member_key] = "melody"
+
                 # Keep a source voice's explicit tuplet block intact when a
                 # chord is projected into two display roles.  Missing pitches
                 # become role-local tuplet rests so jianpu-ly still sees the
@@ -1986,7 +2024,7 @@ class V2JobService:
                         tie_values = [event.tie] * len(pitches)
                     group_roles = tuplet_group_roles.setdefault(group_id, set())
                     for pitch in pitches:
-                        if is_melody_slot(event, int(pitch)):
+                        if event_roles.get((event_index, int(pitch))) == "melody":
                             group_roles.add("melody")
                         else:
                             group_roles.add("accompaniment")
@@ -2016,7 +2054,7 @@ class V2JobService:
                     for pitch_index, pitch in enumerate(pitches):
                         role = (
                             "melody"
-                            if is_melody_slot(event, int(pitch))
+                            if event_roles.get((source_event_order, int(pitch))) == "melody"
                             else "accompaniment"
                         )
                         by_role[role].append((int(pitch), tie_values[pitch_index]))
