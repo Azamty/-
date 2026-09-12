@@ -8,6 +8,7 @@ import os
 import re
 import uuid
 import zipfile
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -21,6 +22,9 @@ from .jianpu_score.beat_grid import beat_grid_onsets_from_notes
 from .jianpu_score.domain import (
     MusicAnalysis,
     NoteEvent,
+    Score,
+    ScoreNote,
+    ScoreVoice,
     normalize_key,
     normalize_time_signature,
 )
@@ -29,6 +33,8 @@ from .jianpu_score.high_accuracy_service import (
     HighAccuracyArtifactService,
     HighAccuracyBuildResult,
     HighAccuracyServiceError,
+    _score_note_intervals,
+    _verify_score_midi,
 )
 from .jianpu_score.models.adapter import EngineResult, run_engine
 from .jianpu_score.models.demucs import (
@@ -42,6 +48,7 @@ from .jianpu_score.render import (
     natural_svg_sort_key,
     render_score,  # noqa: F401 - legacy monkeypatch/import surface
 )
+from .jianpu_score.svg_long import merge_svg_pages
 from .jianpu_score.vocal_cleanup import VocalCleanupError, clean_vocal_events
 from .muscriptor_v2 import (
     instrument_label_zh,
@@ -1424,6 +1431,41 @@ class V2JobService:
             note for note in all_notes_with_ids if note.get("track_id") in selected_set
         ]
         selected_pitched = [track for track in selected_tracks if not bool(track.get("is_drum"))]
+        # The melody candidate is computed once from the selected raw notes.
+        # The optional standalone melody export and the production
+        # melody+harmony projection both consume this same auditable result;
+        # neither path re-runs a quantizer or chooses a different pitch after
+        # a Score has been built.
+        melody_candidate_notes: list[dict[str, Any]] = []
+        main_melody_selection_audit: dict[str, Any] | None = None
+        melody_candidate_indices: dict[str, set[int]] = {}
+        if selected_pitched:
+            selected_pitched_ids = {str(track["track_id"]) for track in selected_pitched}
+            melody_candidate_notes, main_melody_selection_audit = self._select_main_melody_notes(
+                notes_with_ids,
+                selected_pitched_ids,
+            )
+            pitched_notes = [
+                note
+                for note in notes_with_ids
+                if str(note.get("track_id")) in selected_pitched_ids and not bool(note.get("is_drum"))
+            ]
+            selected_source_indices = set(main_melody_selection_audit.get("selected_source_indices", []))
+            local_indices_by_track: dict[str, dict[int, int]] = {}
+            for track in selected_pitched:
+                track_id = str(track["track_id"])
+                local_indices_by_track[track_id] = {
+                    id(note): index
+                    for index, note in enumerate(note for note in notes_with_ids if note.get("track_id") == track_id)
+                }
+            for source_index in sorted(selected_source_indices):
+                if source_index < 0 or source_index >= len(pitched_notes):
+                    continue
+                source_note = pitched_notes[source_index]
+                track_id = str(source_note.get("track_id"))
+                local_index = local_indices_by_track.get(track_id, {}).get(id(source_note))
+                if local_index is not None:
+                    melody_candidate_indices.setdefault(track_id, set()).add(local_index)
         output = self._output_dir(job_id) / "selections" / f"rev-{revision:04d}"
         if output.exists() and output.is_symlink():
             raise ValueError("invalid selection output path")
@@ -1450,6 +1492,7 @@ class V2JobService:
         score_artifact_ids: list[str] = []
         track_failures: list[dict[str, Any]] = []
         successful_pitched: list[dict[str, Any]] = []
+        successful_score_results: list[tuple[Mapping[str, Any], Sequence[Mapping[str, Any]], HighAccuracyBuildResult]] = []
         for track in selected_tracks:
             track_id = str(track["track_id"])
             label = str(track.get("label_zh") or instrument_label_zh(str(track.get("instrument_group"))))
@@ -1477,6 +1520,7 @@ class V2JobService:
                 continue
             if bool(track.get("is_drum")):
                 continue
+            score_result_sink: list[HighAccuracyBuildResult] = []
             try:
                 rendered = self._render_track_score(
                     job_id,
@@ -1492,6 +1536,7 @@ class V2JobService:
                     bpm_manual=bpm_manual,
                     key_manual=key_manual,
                     time_signature_manual=time_signature_manual,
+                    score_result_sink=score_result_sink,
                 )
             except HighAccuracyServiceError as exc:
                 track_failures.append({"track_id": track_id, "label": label, "stage": exc.stage, "error": exc.cause})
@@ -1503,15 +1548,83 @@ class V2JobService:
             score_artifact_ids.extend(item["artifact_id"] for item in rendered if item.get("kind", "").endswith(("score_json", "score_midi", "score_svg", "score_svg_long")))
             artifacts.extend(rendered)
             successful_pitched.append(track)
+            if score_result_sink and score_result_sink[-1].score is not None:
+                successful_score_results.append((track, track_notes, score_result_sink[-1]))
 
         merged_artifacts: list[dict[str, Any]] = []
         main_melody_selection_artifact_id: str | None = None
-        main_melody_selection_audit: dict[str, Any] | None = None
         main_melody_score_artifact_ids: list[str] = []
+        melody_harmony_score_artifact_ids: list[str] = []
+        melody_harmony_score_report: dict[str, Any] | None = None
         merge_requested = bool(selection.get("merge_main_melody", False))
+        # Produce the primary web score from the already standardized selected
+        # instrument Scores.  This keeps each source pitch/timing exactly once
+        # in the composed Score and leaves the old optional monophonic export
+        # below intact.
+        if selected_pitched:
+            if len(successful_score_results) != len(selected_pitched):
+                missing = sorted(
+                    {
+                        str(track["track_id"])
+                        for track in selected_pitched
+                    }
+                    - {
+                        str(track["track_id"])
+                        for track, _notes, _result in successful_score_results
+                    }
+                )
+                track_failures.append(
+                    {
+                        "track_id": "melody-harmony",
+                        "label": "主旋律+伴奏和弦",
+                        "stage": "composition",
+                        "error": "选中有音高轨道的完整 Score 不齐全：" + ", ".join(missing),
+                    }
+                )
+            else:
+                try:
+                    melody_harmony_score, melody_harmony_score_report = self._compose_melody_harmony_score(
+                        successful_score_results,
+                        melody_candidate_indices,
+                        title=title,
+                        selected_track_ids=[str(track["track_id"]) for track in selected_pitched],
+                    )
+                except Exception as exc:  # noqa: BLE001 - preserve independent score exports
+                    track_failures.append(
+                        {
+                            "track_id": "melody-harmony",
+                            "label": "主旋律+伴奏和弦",
+                            "stage": "composition",
+                            "error": str(exc),
+                        }
+                    )
+                else:
+                    try:
+                        combined_artifacts, combined_ids = self._render_melody_harmony_score(
+                            job_id,
+                            output,
+                            melody_harmony_score,
+                            title=title,
+                            revision=revision,
+                        )
+                        artifacts.extend(combined_artifacts)
+                        melody_harmony_score_artifact_ids = combined_ids
+                        score_artifact_ids.extend(combined_ids)
+                    except Exception as exc:  # noqa: BLE001 - preserve independent score exports
+                        track_failures.append(
+                            {
+                                "track_id": "melody-harmony",
+                                "label": "主旋律+伴奏和弦",
+                                "stage": "render",
+                                "error": str(exc),
+                            }
+                        )
+
         if merge_requested and selected_pitched:
             selected_track_ids = {str(track["track_id"]) for track in selected_pitched}
-            merged_notes, main_melody_selection_audit = self._select_main_melody_notes(notes_with_ids, selected_track_ids)
+            merged_notes = melody_candidate_notes
+            if main_melody_selection_audit is None:
+                merged_notes, main_melody_selection_audit = self._select_main_melody_notes(notes_with_ids, selected_track_ids)
             selection_path = output / "main-melody.selection.json"
             _safe_json(selection_path, main_melody_selection_audit)
             main_melody_selection_artifact_id = f"v2-selection-r{revision}-main-melody-selection"
@@ -1589,7 +1702,12 @@ class V2JobService:
         if merge_requested and main_melody_succeeded:
             warnings.append("主旋律合并为单声部，结果会丢失和声；该产物不称为总谱。")
 
-        page_artifacts = [item for item in artifacts if item.get("kind") in {"instrument_score_svg", "main_melody_score_svg"}]
+        page_artifacts = [
+            item
+            for item in artifacts
+            if item.get("kind")
+            in {"instrument_score_svg", "main_melody_score_svg", "melody_harmony_score_svg"}
+        ]
         selection_zip_id: str | None = None
         if page_artifacts:
             selection_zip_id = f"v2-selection-r{revision}-svg-zip"
@@ -1638,6 +1756,8 @@ class V2JobService:
             "svg_zip_artifact_id": selection_zip_id,
             "main_melody_selection_artifact_id": main_melody_selection_artifact_id,
             "main_melody_score_artifact_ids": main_melody_score_artifact_ids,
+            "melody_harmony_score_artifact_ids": melody_harmony_score_artifact_ids,
+            "melody_harmony_score": melody_harmony_score_report,
             "metadata": {**HIGH_ACCURACY_V2_METADATA, "time_basis": "source_seconds", "velocity_policy": "playback_default", "note_event_velocity": None, "full_decode_reused": True},
         }
         selection_json = output / "selection.json"
@@ -1655,7 +1775,7 @@ class V2JobService:
         with self.manager._lock:
             current = self.manager._read(job_id)
             current_v2 = dict(current.get("v2", {}))
-            current_v2.update({**HIGH_ACCURACY_V2_METADATA, "score_refusal": score_refusal, "track_failures": track_failures, "main_melody_selection_artifact_id": main_melody_selection_artifact_id, "main_melody_score_artifact_ids": main_melody_score_artifact_ids, "progress_detail": {"status": "completed" if not score_refusal or score_refusal.get("code") == "no_pitched_tracks" else "failed", "revision": revision}})
+            current_v2.update({**HIGH_ACCURACY_V2_METADATA, "score_refusal": score_refusal, "track_failures": track_failures, "main_melody_selection_artifact_id": main_melody_selection_artifact_id, "main_melody_score_artifact_ids": main_melody_score_artifact_ids, "melody_harmony_score_artifact_ids": melody_harmony_score_artifact_ids, "melody_harmony_score": melody_harmony_score_report, "progress_detail": {"status": "completed" if not score_refusal or score_refusal.get("code") == "no_pitched_tracks" else "failed", "revision": revision}})
             previous = [item for item in current.get("artifacts", []) if not str(item.get("artifact_id", "")).startswith(f"v2-selection-r{revision}-")]
             current.update(
                 {
@@ -1680,6 +1800,8 @@ class V2JobService:
                         "merge_main_melody": merge_requested,
                         "main_melody_selection_artifact_id": main_melody_selection_artifact_id,
                         "main_melody_score_artifact_ids": main_melody_score_artifact_ids,
+                        "melody_harmony_score_artifact_ids": melody_harmony_score_artifact_ids,
+                        "melody_harmony_score": melody_harmony_score_report,
                         "overrides": overrides,
                     },
                     "v2": {**current_v2, "stage": "export"},
@@ -1691,6 +1813,655 @@ class V2JobService:
         # been persisted above.  Returning prevents the generic worker from
         # replacing ``high_accuracy_all_tracks_failed`` with ``runtime_error``.
         self.manager._log(job_id, f"V2 selection revision {revision} completed: {len(artifacts)} new artifacts")
+
+    @staticmethod
+    def _compose_melody_harmony_score(
+        score_results: Sequence[
+            tuple[Mapping[str, Any], Sequence[Mapping[str, Any]], HighAccuracyBuildResult]
+        ],
+        melody_candidate_indices: Mapping[str, set[int]],
+        *,
+        title: str,
+        selected_track_ids: Sequence[str],
+    ) -> tuple[Score, dict[str, Any]]:
+        """Project selected source Scores into melody and accompaniment lanes.
+
+        Every pitched slot comes from one of the already standardized source
+        Scores.  The selector only supplies source indices; it never causes a
+        second copy of a note to be appended.  Mixed source chords are split
+        by pitch role while retaining each pitch's tie metadata, and all
+        independent source voices are lane-coloured below the melody.
+        """
+
+        if not score_results:
+            raise ValueError("melody+harmony composition requires at least one source Score")
+        source_scores: list[tuple[str, Score]] = []
+        for track, _track_notes, result in score_results:
+            track_id = str(track.get("track_id"))
+            if result.score is None:
+                raise ValueError(f"source Score missing for selected track {track_id}")
+            if not isinstance(result.alignment_report, Mapping):
+                raise ValueError(f"source alignment report missing for selected track {track_id}")
+            source_scores.append((track_id, result.score))
+
+        baseline = source_scores[0][1]
+        baseline_timeline = {
+            "quarter_ticks": int(baseline.quarter_ticks),
+            "total_ticks": int(baseline.total_ticks),
+            "bpm": float(baseline.bpm),
+            "key": str(baseline.key),
+            "time_signature": str(baseline.time_signature),
+            "tempo_events": [event.model_dump(mode="json") for event in baseline.tempo_events],
+        }
+        for track_id, score in source_scores[1:]:
+            timeline = {
+                "quarter_ticks": int(score.quarter_ticks),
+                "total_ticks": int(score.total_ticks),
+                "bpm": float(score.bpm),
+                "key": str(score.key),
+                "time_signature": str(score.time_signature),
+                "tempo_events": [event.model_dump(mode="json") for event in score.tempo_events],
+            }
+            if timeline != baseline_timeline:
+                raise ValueError(
+                    "selected source Scores do not share one tempo/timeline: "
+                    f"baseline={baseline_timeline!r}, track {track_id}={timeline!r}"
+                )
+        total_ticks = int(baseline.total_ticks)
+        role_intervals: dict[str, list[dict[str, Any]]] = {"melody": [], "accompaniment": []}
+        source_slot_count = 0
+        role_slot_counts = {"melody": 0, "accompaniment": 0}
+        unmapped_candidates: list[dict[str, Any]] = []
+        source_score_intervals: list[tuple[int, int, int]] = []
+
+        for source_order, (track, track_notes, result) in enumerate(score_results):
+            track_id = str(track.get("track_id"))
+            score = result.score
+            assert score is not None
+            source_score_intervals.extend(
+                (int(pitch), int(start_tick), int(end_tick))
+                for pitch, start_tick, end_tick in _score_note_intervals(score)
+            )
+            alignment = result.alignment_report
+            assert isinstance(alignment, Mapping)
+            candidate_indices = set(melody_candidate_indices.get(track_id, set()))
+            candidate_intervals: list[dict[str, int]] = []
+            candidate_event_pitch_ids: set[tuple[str, int]] = set()
+            candidate_event_ids: set[str] = set()
+            for item in alignment.get("source_to_score", []):
+                if not isinstance(item, Mapping):
+                    continue
+                try:
+                    source_index = int(item["source_index"])
+                    pitch = int(item["source_midi"])
+                    start_tick = int(item["score_start_tick"])
+                    end_tick = int(item["score_end_tick"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if source_index not in candidate_indices:
+                    continue
+                if end_tick <= start_tick:
+                    continue
+                candidate_intervals.append(
+                    {
+                        "source_index": source_index,
+                        "pitch": pitch,
+                        "start_tick": start_tick,
+                        "end_tick": end_tick,
+                    }
+                )
+                musicxml_event_ids = item.get("musicxml_event_ids")
+                if not isinstance(musicxml_event_ids, list):
+                    musicxml_event_ids = [item.get("musicxml_event_id")]
+                for event_id in musicxml_event_ids:
+                    if event_id is not None:
+                        candidate_event_ids.add(str(event_id))
+                        candidate_event_pitch_ids.add((str(event_id), pitch))
+            mapped_indices = {item["source_index"] for item in candidate_intervals}
+            for source_index in sorted(candidate_indices - mapped_indices):
+                unmapped_candidates.append(
+                    {
+                        "track_id": track_id,
+                        "source_index": source_index,
+                        "reason": "source_index_missing_from_alignment_report",
+                    }
+                )
+
+            def is_melody_slot(event: ScoreNote, pitch: int) -> bool:
+                event_ids: set[str] = set()
+                metadata = event.metadata
+                for key in ("musicxml_event_id", "original_musicxml_event_id"):
+                    if metadata.get(key) is not None:
+                        event_ids.add(str(metadata[key]))
+                replacement_ids = metadata.get("replacement_musicxml_event_ids")
+                if isinstance(replacement_ids, list):
+                    event_ids.update(str(value) for value in replacement_ids)
+                if candidate_event_ids:
+                    return any((event_id, pitch) in candidate_event_pitch_ids for event_id in event_ids)
+                start_tick = event.start_tick
+                end_tick = event.end_tick
+                return any(
+                    item["pitch"] == pitch
+                    and item["start_tick"] <= start_tick
+                    and end_tick <= item["end_tick"]
+                    for item in candidate_intervals
+                )
+
+            for source_voice_order, voice in enumerate(score.voices):
+                # Keep a source voice's explicit tuplet block intact when a
+                # chord is projected into two display roles.  Missing pitches
+                # become role-local tuplet rests so jianpu-ly still sees the
+                # same start/continue/stop boundaries.
+                tuplet_group_by_event: dict[int, tuple[int, int, int]] = {}
+                tuplet_group_roles: dict[tuple[int, int, int], set[str]] = {}
+                active_tuplet: tuple[int, int, int] | None = None
+                next_tuplet_group = 0
+                for event_index, event in enumerate(voice.events):
+                    ratio = (
+                        (int(event.tuplet_actual), int(event.tuplet_normal))
+                        if event.tuplet_actual is not None and event.tuplet_normal is not None
+                        else None
+                    )
+                    if ratio is None:
+                        if event.tuplet_type is not None:
+                            active_tuplet = None
+                        continue
+                    if event.tuplet_type == "start" or active_tuplet is None or active_tuplet[:2] != ratio:
+                        active_tuplet = (ratio[0], ratio[1], next_tuplet_group)
+                        next_tuplet_group += 1
+                    tuplet_group_by_event[event_index] = active_tuplet
+                    if event.tuplet_type == "stop":
+                        active_tuplet = None
+                for event_index, event in enumerate(voice.events):
+                    group_id = tuplet_group_by_event.get(event_index)
+                    if group_id is None:
+                        continue
+                    pitches = list(event.chord_pitches) if event.chord_pitches else (
+                        [event.midi] if event.midi is not None else []
+                    )
+                    if not pitches:
+                        continue
+                    tie_values = list(event.tie_types)
+                    if len(tie_values) != len(pitches):
+                        tie_values = [event.tie] * len(pitches)
+                    group_roles = tuplet_group_roles.setdefault(group_id, set())
+                    for pitch in pitches:
+                        if is_melody_slot(event, int(pitch)):
+                            group_roles.add("melody")
+                        else:
+                            group_roles.add("accompaniment")
+                for source_event_order, event in enumerate(voice.events):
+                    group_id = tuplet_group_by_event.get(source_event_order)
+                    pitches = list(event.chord_pitches) if event.chord_pitches else (
+                        [event.midi] if event.midi is not None else []
+                    )
+                    group_roles = tuplet_group_roles.get(group_id, set()) if group_id is not None else set()
+                    if group_id is not None and not group_roles:
+                        # A source group containing only rests still carries
+                        # explicit notation boundaries.  Keep it in the
+                        # accompaniment projection so it is not silently
+                        # flattened into an ordinary gap.
+                        group_roles = {"accompaniment"}
+                    # Ordinary source rests are represented by the lane gap
+                    # filler below.  An explicit tuplet rest is different:
+                    # dropping it removes a member of the source group and
+                    # leaves the projected voice with a dangling boundary.
+                    if not pitches and not group_roles:
+                        continue
+                    source_slot_count += len(pitches)
+                    tie_values = list(event.tie_types)
+                    if len(tie_values) != len(pitches):
+                        tie_values = [event.tie] * len(pitches)
+                    by_role: dict[str, list[tuple[int, str | None]]] = {"melody": [], "accompaniment": []}
+                    for pitch_index, pitch in enumerate(pitches):
+                        role = (
+                            "melody"
+                            if is_melody_slot(event, int(pitch))
+                            else "accompaniment"
+                        )
+                        by_role[role].append((int(pitch), tie_values[pitch_index]))
+                    if not pitches:
+                        for role in group_roles:
+                            by_role[role] = []
+                    for role, pitch_ties in by_role.items():
+                        if not pitch_ties and role not in group_roles:
+                            continue
+                        selected_pitches = [pitch for pitch, _tie in pitch_ties]
+                        selected_ties = [tie for _pitch, tie in pitch_ties]
+                        tie = (
+                            selected_ties[0]
+                            if len(selected_ties) == 1
+                            else selected_ties[0]
+                            if selected_ties and selected_ties[0] is not None and all(
+                                value == selected_ties[0] for value in selected_ties
+                            )
+                            else None
+                        )
+                        role_slot_counts[role] += len(selected_pitches)
+                        metadata = deepcopy(dict(event.metadata))
+                        tuplet_group_key = None
+                        if group_id is not None:
+                            # Adjacent tuplets may use the same ratio.  Keep
+                            # the source voice and local group ordinal in the
+                            # lane key; fine-grid repairs already provide a
+                            # stable group id in their metadata.
+                            tuplet_group_key = metadata.get("fine_grid_tuplet_group_id") or (
+                                source_order,
+                                str(voice.voice_id),
+                                int(group_id[0]),
+                                int(group_id[1]),
+                                int(group_id[2]),
+                            )
+                        metadata.update(
+                            {
+                                "composition_role": role,
+                                "composition_source_track_id": track_id,
+                                "composition_source_voice_id": voice.voice_id,
+                                "composition_source_event_order": source_event_order,
+                                "composition_source_voice_order": source_voice_order,
+                                "composition_source_track_order": source_order,
+                            }
+                        )
+                        role_intervals[role].append(
+                            {
+                                "start_tick": int(event.start_tick),
+                                "end_tick": int(event.end_tick),
+                                "pitches": selected_pitches,
+                                "tie": tie,
+                                "tie_types": selected_ties,
+                                "tuplet_actual": event.tuplet_actual,
+                                "tuplet_normal": event.tuplet_normal,
+                                "tuplet_type": event.tuplet_type,
+                                "dots": event.dots,
+                                "measure_number": event.measure_number,
+                                "metadata": metadata,
+                                "source_order": source_order,
+                                "source_voice_order": source_voice_order,
+                                "source_event_order": source_event_order,
+                                "source_voice_id": voice.voice_id,
+                                "tuplet_group_key": tuplet_group_key,
+                                "composition_tuplet_rest": not bool(selected_pitches),
+                            }
+                        )
+
+        if not role_intervals["melody"]:
+            raise ValueError("melody selector did not map any source Score slots")
+        if role_slot_counts["melody"] + role_slot_counts["accompaniment"] != source_slot_count:
+            raise ValueError(
+                "melody+harmony composition changed the source pitch-slot count: "
+                f"{source_slot_count} -> {role_slot_counts['melody'] + role_slot_counts['accompaniment']}"
+            )
+
+        # Exact same-time accompaniment events can share one visual chord
+        # token when their notation context agrees.  This is a display
+        # grouping only: every source pitch remains an individual interval in
+        # the final Score/MIDI, and tied fragments stay in their source lane.
+        merged_accompaniment_group_count = 0
+        merged_accompaniment: list[dict[str, Any]] = []
+        grouped_accompaniment: dict[tuple[Any, ...], list[int]] = {}
+        for item in role_intervals["accompaniment"]:
+            tie_values = [value for value in item["tie_types"] if value is not None]
+            if tie_values:
+                merged_accompaniment.append(item)
+                continue
+            group_key = (
+                # Keep independent source voices in independent lanes.  A
+                # cross-voice chord merge would lose the lane identity needed
+                # to keep surrounding ties/tuplets contiguous.
+                int(item["source_order"]),
+                str(item["source_voice_id"]),
+                int(item["start_tick"]),
+                int(item["end_tick"]),
+                item["tuplet_actual"],
+                item["tuplet_normal"],
+                item["tuplet_type"],
+                int(item["dots"]),
+                item["measure_number"],
+            )
+            existing_indices = grouped_accompaniment.setdefault(group_key, [])
+            pitch_set = set(item["pitches"])
+            merge_index = next(
+                (
+                    index
+                    for index in existing_indices
+                    if pitch_set.isdisjoint(set(merged_accompaniment[index]["pitches"]))
+                ),
+                None,
+            )
+            if merge_index is None:
+                existing_indices.append(len(merged_accompaniment))
+                merged_accompaniment.append(item)
+                continue
+            target = merged_accompaniment[merge_index]
+            target["pitches"] = sorted([*target["pitches"], *item["pitches"]])
+            target["tie_types"] = [None] * len(target["pitches"])
+            target["metadata"] = {
+                **target["metadata"],
+                "composition_merged_sources": [
+                    *target["metadata"].get("composition_merged_sources", []),
+                    {
+                        "track_id": item["metadata"].get("composition_source_track_id"),
+                        "voice_id": item["metadata"].get("composition_source_voice_id"),
+                    },
+                ],
+            }
+            merged_accompaniment_group_count += 1
+        role_intervals["accompaniment"] = merged_accompaniment
+
+        voices: list[ScoreVoice] = []
+        lane_counts: dict[str, int] = {}
+        for role in ("melody", "accompaniment"):
+            ordered = sorted(
+                role_intervals[role],
+                key=lambda item: (
+                    int(item["start_tick"]),
+                    0
+                    if any(
+                        tie in {"start", "stop", "continue"}
+                        for tie in item["tie_types"]
+                    )
+                    else 1,
+                    int(item["end_tick"]),
+                    int(item["source_order"]),
+                    int(item["source_voice_order"]),
+                    int(item["source_event_order"]),
+                ),
+            )
+            lanes: list[list[dict[str, Any]]] = []
+            lane_ends: list[int] = []
+            lane_source_keys: list[tuple[int, str]] = []
+            tie_lane_by_pitch: dict[tuple[int, str, int], int] = {}
+            tuplet_lane_by_group: dict[Any, int] = {}
+            for item in ordered:
+                start_tick = int(item["start_tick"])
+                tied_pitch_keys = [
+                    (int(item["source_order"]), str(item["source_voice_id"]), int(pitch))
+                    for pitch, tie in zip(item["pitches"], item["tie_types"], strict=True)
+                    if tie in {"stop", "continue"}
+                ]
+                preferred_lanes = {
+                    tie_lane_by_pitch[key]
+                    for key in tied_pitch_keys
+                    if key in tie_lane_by_pitch
+                }
+                if len(preferred_lanes) > 1:
+                    raise ValueError("tied source chord pitches require conflicting composition lanes")
+                item_source_key = (int(item["source_order"]), str(item["source_voice_id"]))
+                tuplet_group_key = item.get("tuplet_group_key")
+                if tuplet_group_key is not None and tuplet_group_key in tuplet_lane_by_group:
+                    preferred_lanes.add(tuplet_lane_by_group[tuplet_group_key])
+                if len(preferred_lanes) > 1:
+                    raise ValueError("source tie/tuplet requires conflicting composition lanes")
+                preferred_lane = next(iter(preferred_lanes), None)
+                if preferred_lane is not None:
+                    if (
+                        preferred_lane >= len(lane_ends)
+                        or lane_source_keys[preferred_lane] != item_source_key
+                        or lane_ends[preferred_lane] > start_tick
+                    ):
+                        raise ValueError(
+                            "tied/tuplet source event cannot retain one composition lane at "
+                            f"tick {start_tick}"
+                        )
+                    lane_index = preferred_lane
+                else:
+                    lane_index = next(
+                        (
+                            index
+                            for index, end_tick in enumerate(lane_ends)
+                            if lane_source_keys[index] == item_source_key and end_tick <= start_tick
+                        ),
+                        None,
+                    )
+                if lane_index is None:
+                    lane_index = len(lanes)
+                    lanes.append([])
+                    lane_ends.append(0)
+                    lane_source_keys.append(item_source_key)
+                lanes[lane_index].append(item)
+                lane_ends[lane_index] = int(item["end_tick"])
+                if tuplet_group_key is not None:
+                    tuplet_lane_by_group[tuplet_group_key] = lane_index
+                # Keep tie start/continue/stop fragments on one output lane;
+                # otherwise a same-tick independent event can steal the lane
+                # and turn one held note into several MIDI notes.
+                for pitch, tie in zip(item["pitches"], item["tie_types"], strict=True):
+                    tie_key = (int(item["source_order"]), str(item["source_voice_id"]), int(pitch))
+                    if tie in {"start", "continue"}:
+                        tie_lane_by_pitch[tie_key] = lane_index
+                    elif tie == "stop":
+                        tie_lane_by_pitch.pop(tie_key, None)
+            lane_counts[role] = len(lanes)
+            for lane_index, lane in enumerate(lanes, start=1):
+                output_events: list[ScoreNote] = []
+                cursor = 0
+                for item in lane:
+                    start_tick = int(item["start_tick"])
+                    end_tick = int(item["end_tick"])
+                    if start_tick < cursor or end_tick <= start_tick:
+                        raise ValueError(
+                            f"invalid {role} composition lane interval {start_tick}:{end_tick}"
+                        )
+                    if start_tick > cursor:
+                        output_events.append(
+                            ScoreNote(
+                                start_tick=cursor,
+                                duration_tick=start_tick - cursor,
+                                midi=None,
+                                voice_id=f"{role}:voice-{lane_index}",
+                                source="composition-rest",
+                                staff=1 if role == "melody" else 2,
+                                source_voice=role,
+                                metadata={
+                                    "composition_role": role,
+                                    "implicit": True,
+                                    "reason": "composition_timeline_gap",
+                                },
+                            )
+                        )
+                    pitches = list(item["pitches"])
+                    is_role_rest = not pitches
+                    output_events.append(
+                        ScoreNote(
+                            start_tick=start_tick,
+                            duration_tick=end_tick - start_tick,
+                            midi=None if is_role_rest else min(pitches),
+                            voice_id=f"{role}:voice-{lane_index}",
+                            source=(
+                                "composition-tuplet-rest"
+                                if is_role_rest
+                                else "composition-melody"
+                                if role == "melody"
+                                else "composition-accompaniment"
+                            ),
+                            staff=1 if role == "melody" else 2,
+                            source_voice=role,
+                            tie=None if is_role_rest else item["tie"],
+                            tie_types=[] if is_role_rest else list(item["tie_types"]),
+                            chord_pitches=[] if is_role_rest else pitches,
+                            tuplet_actual=item["tuplet_actual"],
+                            tuplet_normal=item["tuplet_normal"],
+                            tuplet_type=item["tuplet_type"],
+                            dots=int(item["dots"]),
+                            measure_number=item["measure_number"],
+                            metadata=dict(item["metadata"]),
+                        )
+                    )
+                    cursor = end_tick
+                if cursor < total_ticks:
+                    output_events.append(
+                        ScoreNote(
+                            start_tick=cursor,
+                            duration_tick=total_ticks - cursor,
+                            midi=None,
+                            voice_id=f"{role}:voice-{lane_index}",
+                            source="composition-rest",
+                            staff=1 if role == "melody" else 2,
+                            source_voice=role,
+                            metadata={
+                                "composition_role": role,
+                                "implicit": True,
+                                "reason": "composition_timeline_tail",
+                            },
+                        )
+                    )
+                voices.append(
+                    ScoreVoice(
+                        voice_id=f"melody-harmony:{role}:voice-{lane_index}",
+                        events=output_events,
+                        label=(
+                            "主旋律（候选）"
+                            if role == "melody"
+                            else f"伴奏和弦 {lane_index}"
+                        ),
+                        stem_id="melody-harmony",
+                        staff=1 if role == "melody" else 2,
+                        source_voice=role,
+                    )
+                )
+
+        composition_metadata = {
+            "schema_version": "melody-harmony-score-v1",
+            "layout": "melody_above_accompaniment",
+            "role_order": ["melody", "accompaniment"],
+            "selected_track_ids": [str(value) for value in selected_track_ids],
+            "source_score_count": len(source_scores),
+            "source_score_total_ticks": {
+                track_id: score.total_ticks for track_id, score in source_scores
+            },
+            "source_pitch_slot_count": source_slot_count,
+            "melody_pitch_slot_count": role_slot_counts["melody"],
+            "accompaniment_pitch_slot_count": role_slot_counts["accompaniment"],
+            "lane_counts": lane_counts,
+            "accompaniment_merged_group_count": merged_accompaniment_group_count,
+            "pitch_policy": "each selected source Score pitch slot is emitted once; no cross-track chord inference",
+            "timing_policy": "source Score start_tick/end_tick and notation fields are reused",
+            "midi_policy": "rendered from this composed Score and verified against its pitch intervals",
+            "unmapped_melody_candidates": unmapped_candidates,
+        }
+        metadata = deepcopy(dict(baseline.metadata))
+        metadata["melody_harmony"] = composition_metadata
+        composed = Score(
+            title=f"{title} 主旋律+伴奏和弦",
+            bpm=baseline.bpm,
+            key=baseline.key,
+            time_signature=baseline.time_signature,
+            quarter_ticks=baseline.quarter_ticks,
+            total_ticks=total_ticks,
+            voices=voices,
+            tempo_events=list(baseline.tempo_events),
+            source="melody-harmony-composition",
+            warnings=list(baseline.warnings),
+            metadata=metadata,
+        )
+        composed_intervals = _score_note_intervals(composed)
+        if Counter(composed_intervals) != Counter(source_score_intervals):
+            raise ValueError(
+                "melody+harmony composition changed Score note intervals: "
+                f"source={sorted(source_score_intervals)} composed={sorted(composed_intervals)}"
+            )
+        return composed, composition_metadata
+
+    def _render_melody_harmony_score(
+        self,
+        job_id: str,
+        output: Path,
+        score: Score,
+        *,
+        title: str,
+        revision: int,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Render and register one composed Score and its matching MIDI/SVG."""
+
+        combined_dir = output / "melody-harmony"
+        if combined_dir.exists() and combined_dir.is_symlink():
+            raise ValueError("invalid melody+harmony output path")
+        combined_dir.mkdir(parents=True, exist_ok=True)
+        basename = "melody-harmony-score"
+        score_path = combined_dir / f"{basename}.score.json"
+        # Persist the exact composed input before invoking LilyPond/MIDI
+        # rendering.  A renderer failure must leave an auditable Score and
+        # composition report beside its partial logs/artifacts.
+        _safe_json(score_path, score.model_dump(mode="json"))
+        render_artifacts = render_score(score, combined_dir, basename=basename)
+        if render_artifacts.midi_path is None:
+            raise ValueError("melody+harmony render did not produce MIDI")
+        midi_verification = _verify_score_midi(score, Path(render_artifacts.midi_path))
+        long_path = combined_dir / f"{basename}.long.svg"
+        merge_svg_pages(render_artifacts.svg_paths, long_path)
+        score_with_render_metadata = score.model_copy(
+            update={
+                "metadata": {
+                    **score.metadata,
+                    "melody_harmony_render": {
+                        "midi_verification": midi_verification,
+                        "svg_page_count": len(render_artifacts.svg_paths),
+                        "render_basename": basename,
+                    },
+                }
+            }
+        )
+        _safe_json(score_path, score_with_render_metadata.model_dump(mode="json"))
+        job_dir = self.manager._safe_job_dir(job_id)
+        prefix = f"v2-selection-r{revision}-melody-harmony-score"
+        artifacts: list[dict[str, Any]] = []
+        artifact_ids: list[str] = []
+        artifacts.append(
+            self.manager._register(
+                job_dir,
+                long_path,
+                artifact_id=f"{prefix}-svg-long",
+                kind="melody_harmony_score_svg_long",
+                label=f"{title} 主旋律+伴奏和弦长图 SVG",
+                media_type="image/svg+xml",
+                stem_id="melody-harmony",
+            )
+        )
+        artifact_ids.append(f"{prefix}-svg-long")
+        for page_number, path_text in enumerate(render_artifacts.svg_paths, start=1):
+            page_path = Path(path_text)
+            artifact_id = f"{prefix}-svg-{page_number}"
+            artifacts.append(
+                self.manager._register(
+                    job_dir,
+                    page_path,
+                    artifact_id=artifact_id,
+                    kind="melody_harmony_score_svg",
+                    label=f"{title} 主旋律+伴奏和弦第 {page_number} 页",
+                    media_type="image/svg+xml",
+                    stem_id="melody-harmony",
+                    page=page_number,
+                )
+            )
+            artifact_ids.append(artifact_id)
+        midi_path = Path(render_artifacts.midi_path)
+        midi_id = f"{prefix}-midi"
+        artifacts.append(
+            self.manager._register(
+                job_dir,
+                midi_path,
+                artifact_id=midi_id,
+                kind="melody_harmony_score_midi",
+                label=f"{title} 主旋律+伴奏和弦 MIDI",
+                media_type="audio/midi",
+                stem_id="melody-harmony",
+            )
+        )
+        artifact_ids.append(midi_id)
+        score_id = f"{prefix}-json"
+        artifacts.append(
+            self.manager._register(
+                job_dir,
+                score_path,
+                artifact_id=score_id,
+                kind="melody_harmony_score_json",
+                label=f"{title} 主旋律+伴奏和弦 Score 数据",
+                media_type="application/json",
+                stem_id="melody-harmony",
+            )
+        )
+        artifact_ids.append(score_id)
+        return artifacts, artifact_ids
 
     def _render_track_score(
         self,
@@ -1710,6 +2481,7 @@ class V2JobService:
         bpm_manual: bool = False,
         key_manual: bool = False,
         time_signature_manual: bool = False,
+        score_result_sink: list[HighAccuracyBuildResult] | None = None,
     ) -> list[dict[str, Any]]:
         track_id = str(track.get("track_id"))
         label = label_override or str(track.get("label_zh") or instrument_label_zh(str(track.get("instrument_group"))))
@@ -1789,6 +2561,8 @@ class V2JobService:
             stem_id=track_id,
             family=family,
         )
+        if score_result_sink is not None:
+            score_result_sink.append(result)
         return artifacts
 
     @staticmethod
