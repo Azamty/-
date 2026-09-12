@@ -32,6 +32,15 @@ VOICE_MODES = frozenset({"monophonic", "polyphonic"})
 SOURCE_KINDS = frozenset({"mixed", "vocal", "instrumental"})
 MULTIPART_OVERHEAD_BYTES = 2 * 1024 * 1024
 
+_SELECTION_ARTIFACT_ID_REVISION = re.compile(r"^v2-selection-r(\d+)(?:-|$)")
+_SELECTION_ARTIFACT_PATH_REVISION = re.compile(r"(?:^|[/\\])rev-(\d+)(?:[/\\]|$)")
+_V2_SCORE_KINDS = frozenset({
+    "instrument_score_json",
+    "vocal_score_json",
+    "main_melody_score_json",
+    "melody_harmony_score_json",
+})
+
 
 class _PayloadTooLarge(Exception):
     """Internal signal raised while an ASGI request body is being received."""
@@ -141,6 +150,67 @@ def _status_response(manager: JobManager, job_id: str) -> JobResponse:
         return JobResponse.model_validate(manager.get(job_id))
     except KeyError:
         raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "任务不存在"}) from None
+
+
+def _artifact_selection_revision(artifact: dict[str, Any]) -> int | None:
+    artifact_id = str(artifact.get("artifact_id", ""))
+    id_match = _SELECTION_ARTIFACT_ID_REVISION.match(artifact_id)
+    if id_match:
+        return int(id_match.group(1))
+    relative_path = str(artifact.get("relative_path", ""))
+    path_match = _SELECTION_ARTIFACT_PATH_REVISION.search(relative_path) if relative_path else None
+    return int(path_match.group(1)) if path_match else None
+
+
+def _v2_selection_revision(state: dict[str, Any]) -> int | None:
+    v2 = state.get("v2") or {}
+    value = v2.get("selection_revision")
+    if value is None:
+        value = (v2.get("selection") or {}).get("revision")
+    if value is None:
+        return None
+    try:
+        revision = int(value)
+    except (TypeError, ValueError):
+        return None
+    return revision if revision >= 0 else None
+
+
+def _select_v2_score_artifact(state: dict[str, Any], artifacts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick a score JSON without exposing a retained selection revision."""
+
+    current_revision = _v2_selection_revision(state)
+    source_kind = (state.get("v2") or {}).get("source_kind")
+    if current_revision is None or source_kind == "vocal":
+        # Preserve the pre-revision V2 behavior for vocal and older jobs.
+        for artifact in reversed(artifacts):
+            if artifact.get("artifact_id") == "score-json":
+                return artifact
+        for artifact in reversed(artifacts):
+            if artifact.get("kind") == "melody_harmony_score_json":
+                return artifact
+        for artifact in reversed(artifacts):
+            if artifact.get("kind") in _V2_SCORE_KINDS - {"melody_harmony_score_json"} or artifact.get("kind") == "score_json":
+                return artifact
+        return None
+
+    current = [
+        artifact
+        for artifact in artifacts
+        if _artifact_selection_revision(artifact) == current_revision
+        or (current_revision == 0 and _artifact_selection_revision(artifact) is None)
+    ]
+    if current_revision == 0:
+        for artifact in reversed(current):
+            if artifact.get("artifact_id") == "score-json":
+                return artifact
+    for artifact in reversed(current):
+        if artifact.get("kind") == "melody_harmony_score_json":
+            return artifact
+    for artifact in reversed(current):
+        if artifact.get("kind") in _V2_SCORE_KINDS - {"melody_harmony_score_json"}:
+            return artifact
+    return None
 
 
 def _safe_upload_extension(filename: str | None) -> str:
@@ -482,19 +552,11 @@ def create_app(
         status = _status_response(manager, job_id)
         if status.status != "completed":
             raise HTTPException(status_code=409, detail={"code": "score_not_ready", "message": f"任务当前阶段：{status.phase_label}"})
+        state = manager.get(job_id)
         artifacts = manager.list_artifacts(job_id)
-        score_artifact = next((item for item in reversed(artifacts) if item.get("artifact_id") == "score-json"), None)
+        score_artifact = _select_v2_score_artifact(state, artifacts)
         if score_artifact is None:
-            score_artifact = next(
-                (
-                    item
-                    for item in reversed(artifacts)
-                    if item.get("kind") in {"instrument_score_json", "vocal_score_json", "main_melody_score_json"}
-                ),
-                None,
-            )
-        if score_artifact is None:
-            refusal = (manager.get(job_id).get("v2") or {}).get("score_refusal")
+            refusal = (state.get("v2") or {}).get("score_refusal")
             detail = refusal or {"code": "score_not_found", "message": "当前选择没有可下载的简谱"}
             raise HTTPException(status_code=409, detail=detail)
         try:
