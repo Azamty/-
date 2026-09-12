@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canPersistSelection, isValidJobId, parseSelectionDraft, resolveInitialJobId, resolveSelectionValues, SELECTION_DRAFT_SCHEMA, SELECTION_DRAFT_VERSION, selectionStorageKey } from "../src/selectionState.ts";
+import { canPersistSelection, isValidJobId, jobUrlForHistory, parseSelectionDraft, resolveInitialJobId, resolveSelectionValues, SELECTION_DRAFT_SCHEMA, SELECTION_DRAFT_VERSION, selectionStorageKey } from "../src/selectionState.ts";
 
 test("a first ready instrumental job uses the analysis suggestion", () => {
   assert.deepEqual(resolveSelectionValues(
@@ -64,4 +64,16 @@ test("an invalid direct job link does not fall back to an unrelated saved job", 
   assert.equal(result.jobId, null);
   assert.equal(result.invalidQuery, true);
   assert.equal(resolveInitialJobId("", "legacy-job-id").jobId, null);
+});
+
+test("a new upload replaces only the job query and preserves page navigation state", () => {
+  const nextJob = "a7428e72-c181-48cd-9953-f19247955d8e";
+  const nextUrl = new URL(jobUrlForHistory(
+    `https://example.test/score?job=old-job&view=results&filter=pitched#downloads`,
+    nextJob,
+  ), "https://example.test");
+  assert.equal(nextUrl.searchParams.get("job"), nextJob);
+  assert.equal(nextUrl.searchParams.get("view"), "results");
+  assert.equal(nextUrl.searchParams.get("filter"), "pitched");
+  assert.equal(nextUrl.hash, "#downloads");
 });

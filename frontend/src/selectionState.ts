@@ -61,6 +61,13 @@ export function resolveInitialJobId(search: string, storedJobId: string | null):
   return { jobId: isValidJobId(storedJobId) ? storedJobId.trim() : null, invalidQuery: false };
 }
 
+/** Build the current page URL with the newly created job while preserving other navigation state. */
+export function jobUrlForHistory(currentHref: string, jobId: string): string {
+  const url = new URL(currentHref, "http://localhost");
+  url.searchParams.set("job", jobId);
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
 const firstValue = <T>(...values: Array<T | null | undefined>): T | undefined => {
   const found = values.find((value) => value !== undefined && value !== null && String(value).trim() !== "");
   return found === null || found === undefined ? undefined : found;
