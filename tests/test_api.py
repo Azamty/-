@@ -243,3 +243,21 @@ def test_restart_marks_running_interrupted_and_cleanup_keeps_active_jobs(tmp_pat
 
     # The persisted state remains valid JSON after recovery and cleanup.
     json.loads((root / running_id / "job.json").read_text(encoding="utf-8"))
+
+
+def test_create_app_defers_recovery_until_lifespan_starts(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    seed = JobManager(root)
+    job_id, _ = seed.create_job(original_name="still-running.wav", options={})
+    seed._update(job_id, status="running", phase="separating", started_at=utc_now())
+    metadata = root / job_id / "job.json"
+    before_import = metadata.read_bytes()
+
+    app = create_app(jobs_root=root)
+    assert metadata.read_bytes() == before_import
+    assert app.state.jobs.get(job_id)["status"] == "running"
+
+    with TestClient(app):
+        recovered = app.state.jobs.get(job_id)
+        assert recovered["status"] == "interrupted"
+        assert recovered["error"]["code"] == "interrupted"

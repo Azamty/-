@@ -334,7 +334,10 @@ def create_app(
         raise ValueError("max_upload_bytes must be a positive integer")
     if isinstance(multipart_overhead_bytes, bool) or not isinstance(multipart_overhead_bytes, int) or multipart_overhead_bytes < 0:
         raise ValueError("multipart_overhead_bytes must be a non-negative integer")
-    manager = JobManager(jobs_root or (ROOT / "artifacts" / "jobs"))
+    manager = JobManager(
+        jobs_root or (ROOT / "artifacts" / "jobs"),
+        defer_recovery_to_start=True,
+    )
     app = FastAPI(title="谱面工作台", version="0.1.0", lifespan=_lifespan)
     app.state.jobs = manager
     app.add_middleware(

@@ -112,7 +112,12 @@ class JobManager:
     running job as interrupted and leaves it available for an explicit retry.
     """
 
-    def __init__(self, root: str | Path = DEFAULT_JOBS_ROOT) -> None:
+    def __init__(
+        self,
+        root: str | Path = DEFAULT_JOBS_ROOT,
+        *,
+        defer_recovery_to_start: bool = False,
+    ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -122,9 +127,17 @@ class JobManager:
         self._current_job_id: str | None = None
         self._child_process: subprocess.Popen[bytes] | None = None
         self._pending_after_recovery: list[str] = []
+        self._recovery_complete = False
         self.v2 = V2JobService(self)
+        if not defer_recovery_to_start:
+            self._recover_once()
+
+    def _recover_once(self) -> None:
+        if self._recovery_complete:
+            return
         self._recover_running_jobs()
         self._cleanup_safely()
+        self._recovery_complete = True
 
     def _cleanup_safely(self) -> list[str]:
         """Run retention maintenance without taking down the worker/server."""
@@ -262,6 +275,7 @@ class JobManager:
 
     def start(self) -> None:
         with self._lock:
+            self._recover_once()
             if self._worker is not None and self._worker.is_alive():
                 return
             self._stop.clear()
