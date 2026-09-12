@@ -14,7 +14,8 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from .api_models import ArtifactsResponse, JobResponse, V2SelectionRequest
+from .api_models import ArtifactsResponse, JobResponse, V2SelectionRequest, V2NotationRequest
+from .jianpu_score.direct_notation import DirectNotationOptions, NotationEngine
 from .job_manager import JobManager, _error_payload, safe_filename
 from .jianpu_score.analysis import MAX_AUDIO_BYTES, SUPPORTED_EXTENSIONS, probe_audio
 from .jianpu_score.capabilities import get_capabilities
@@ -440,12 +441,15 @@ def create_app(
         source_kind: str = Form("instrumental"),
         title: str | None = Form(None),
         separation_model: str | None = Form(None),
+        notation_engine: NotationEngine = Form("direct-jianpu"),
+        direct_options: str = Form("{}"),
     ) -> JobResponse:
         suffix = _safe_upload_extension(file.filename)
         if source_kind not in {"instrumental", "vocal"}:
             raise _form_error("V2 来源只能是伴奏/纯音乐或人声")
         try:
             selected_model = normalize_demucs_model(separation_model)
+            notation_options = DirectNotationOptions.model_validate_json(direct_options).model_dump(mode="json")
         except ValueError as exc:
             raise _form_error(str(exc)) from exc
         # The instrumental route never invokes Demucs.  Accepting a valid
@@ -459,6 +463,8 @@ def create_app(
             source_kind=source_kind,
             title=clean_title,
             separation_model=selected_model,
+            notation_engine=notation_engine,
+            direct_options=notation_options,
         )
         try:
             bytes_count, input_path = await _write_upload(manager, job_id, file, max_bytes=max_upload_bytes)
@@ -515,6 +521,8 @@ def create_app(
                 job_id,
                 payload.selected_track_ids,
                 payload.merge_main_melody,
+                notation_engine=payload.notation_engine,
+                direct_options=payload.direct_options.model_dump(mode="json") if payload.direct_options is not None else None,
                 bpm_override=payload.bpm_override,
                 key_override=payload.key_override,
                 time_signature_override=payload.time_signature_override,
@@ -526,9 +534,11 @@ def create_app(
         return _status_response(manager, job_id)
 
     @app.post("/api/v2/jobs/{job_id}/vocal/generate", response_model=JobResponse, status_code=202)
-    async def generate_v2_vocal(job_id: str) -> JobResponse:
+    async def generate_v2_vocal(job_id: str, payload: V2NotationRequest | None = Body(None)) -> JobResponse:
         try:
-            manager.generate_vocal_v2(job_id)
+            manager.generate_vocal_v2(job_id,
+                notation_engine=payload.notation_engine if payload else None,
+                direct_options=payload.direct_options.model_dump(mode="json") if payload and payload.direct_options is not None else None)
         except KeyError:
             raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "V2 任务不存在"}) from None
         except ValueError as exc:

@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .jianpu_score.direct_notation import DirectNotationOptions, NotationEngine
+
 
 class ApiError(BaseModel):
     code: str
@@ -62,8 +64,15 @@ class ArtifactsResponse(BaseModel):
 class V2SelectionRequest(BaseModel):
     """A durable selection snapshot for one instrumental recognition."""
 
+    notation_engine: NotationEngine | None = None
+    direct_options: DirectNotationOptions | None = None
     selected_track_ids: list[str] = Field(default_factory=list)
     merge_main_melody: bool = False
     bpm_override: float | None = Field(default=None, gt=0)
     key_override: str | None = None
     time_signature_override: str | None = None
+
+
+class V2NotationRequest(BaseModel):
+    notation_engine: NotationEngine | None = None
+    direct_options: DirectNotationOptions | None = None

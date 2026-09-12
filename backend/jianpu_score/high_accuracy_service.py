@@ -26,6 +26,7 @@ from typing import Any, Iterable, Mapping
 import mido
 
 from .domain import MusicAnalysis, NoteEvent, Score
+from .direct_notation import DIRECT_ENGINE, DirectNotationOptions, build_direct_score
 from .high_accuracy import (
     BEATNET_VERSION,
     MUSESCORE_IMPORT_PROFILE,
@@ -583,6 +584,10 @@ class HighAccuracyArtifactService:
             musescore_import_profile=selected_profile_name,
             musescore_import_profile_sha256=selected_profile_sha256,
         )
+        notation_engine = analysis.metadata.get("notation_engine", NOTATION_ENGINE)
+        if notation_engine == DIRECT_ENGINE:
+            manifest.update(notation_engine=DIRECT_ENGINE, musescore_version=None,
+                            musescore_import_profile=None, musescore_import_profile_sha256=None)
         artifacts: tuple[ServiceArtifact, ...] = ()
         performance_metadata: dict[str, Any] = {}
         score: Score | None = None
@@ -648,12 +653,12 @@ class HighAccuracyArtifactService:
                 **performance_metadata,
                 "instrument_id": instrument,
                 "source_variant": variant,
-                "notation_engine": NOTATION_ENGINE,
+                "notation_engine": notation_engine,
                 "beat_engine": BEAT_ENGINE,
                 "beatnet_version": BEATNET_VERSION,
-                "musescore_version": MUSESCORE_VERSION,
-                "musescore_import_profile": selected_profile_name,
-                "musescore_import_profile_sha256": selected_profile_sha256,
+                "musescore_version": None if notation_engine == DIRECT_ENGINE else MUSESCORE_VERSION,
+                "musescore_import_profile": None if notation_engine == DIRECT_ENGINE else selected_profile_name,
+                "musescore_import_profile_sha256": None if notation_engine == DIRECT_ENGINE else selected_profile_sha256,
                 "score_ticks_per_quarter": SCORE_TICKS_PER_QUARTER,
             }
             # Keep the complete Unicode title in JSON while recording the
@@ -696,42 +701,53 @@ class HighAccuracyArtifactService:
                     performance_metadata,
                 )
 
-            musicxml_path = _safe_child(destination, f"{safe_instrument}.{safe_variant}.notated.musicxml")
-            try:
-                musicxml_artifact: MusicXMLArtifact = convert_performance_midi(
-                    performance_path,
-                    musicxml_path,
-                    instrument_id=instrument,
-                    musescore_path=self.musescore_path,
-                    profile_path=selected_profile,
-                    timeout_sec=self.timeout_sec,
-                    overwrite=overwrite,
+            if notation_engine == DIRECT_ENGINE:
+                try:
+                    direct_options = DirectNotationOptions.model_validate(analysis.metadata.get("direct_options") or {})
+                    direct_mode = "vocal" if any(word in variant.lower() for word in ("vocal", "voice", "game", "main-melody")) else "polyphonic"
+                    score, alignment_report = build_direct_score(
+                        list(materialized), analysis, title=safe_title, mode=direct_mode, options=direct_options,
+                    )
+                except (ValueError, TypeError, RuntimeError) as exc:
+                    raise fail("direct_notation", exc) from exc
+                manifest["stages"]["musescore_import"] = {"status": "skipped", "reason": DIRECT_ENGINE}
+            else:
+                musicxml_path = _safe_child(destination, f"{safe_instrument}.{safe_variant}.notated.musicxml")
+                try:
+                    musicxml_artifact: MusicXMLArtifact = convert_performance_midi(
+                        performance_path,
+                        musicxml_path,
+                        instrument_id=instrument,
+                        musescore_path=self.musescore_path,
+                        profile_path=selected_profile,
+                        timeout_sec=self.timeout_sec,
+                        overwrite=overwrite,
+                    )
+                except (MuseScoreImportError, OSError, ValueError) as exc:
+                    raise fail("musescore_import", exc) from exc
+                musescore_log = ["command=" + " ".join(musicxml_artifact.command)]
+                musescore_log.extend(
+                    f"attempt_{index}=returncode:{return_code} command={' '.join(command)}"
+                    for index, (command, return_code) in enumerate(musicxml_artifact.attempts, start=1)
                 )
-            except (MuseScoreImportError, OSError, ValueError) as exc:
-                raise fail("musescore_import", exc) from exc
-            musescore_log = ["command=" + " ".join(musicxml_artifact.command)]
-            musescore_log.extend(
-                f"attempt_{index}=returncode:{return_code} command={' '.join(command)}"
-                for index, (command, return_code) in enumerate(musicxml_artifact.attempts, start=1)
-            )
-            _write_log(destination, "musescore_import", "\n".join(musescore_log))
-            manifest["stages"]["musescore_import"] = {
-                "status": "completed",
-                "attempt_count": len(musicxml_artifact.attempts),
-                "attempt_returncodes": [return_code for _, return_code in musicxml_artifact.attempts],
-                "origin_sentinel": musicxml_artifact.origin_sentinel,
-            }
+                _write_log(destination, "musescore_import", "\n".join(musescore_log))
+                manifest["stages"]["musescore_import"] = {
+                    "status": "completed",
+                    "attempt_count": len(musicxml_artifact.attempts),
+                    "attempt_returncodes": [return_code for _, return_code in musicxml_artifact.attempts],
+                    "origin_sentinel": musicxml_artifact.origin_sentinel,
+                }
 
-            try:
-                score, alignment_report = standardize_musicxml(
-                    musicxml_path,
-                    performance_metadata=performance_metadata,
-                    title=safe_title,
-                    notation_python=self.notation_python,
-                    timeout_sec=self.timeout_sec,
-                )
-            except (MusicXMLStandardizationError, OSError, ValueError) as exc:
-                raise fail("musicxml_standardize", exc) from exc
+                try:
+                    score, alignment_report = standardize_musicxml(
+                        musicxml_path,
+                        performance_metadata=performance_metadata,
+                        title=safe_title,
+                        notation_python=self.notation_python,
+                        timeout_sec=self.timeout_sec,
+                    )
+                except (MusicXMLStandardizationError, OSError, ValueError) as exc:
+                    raise fail("musicxml_standardize", exc) from exc
             required_alignment_fields = ("source_note_count", "accounted_source_count", "unresolved_count")
             missing_alignment_fields = [
                 name for name in required_alignment_fields if name not in alignment_report
@@ -757,6 +773,11 @@ class HighAccuracyArtifactService:
             unresolved_count = values["unresolved_count"]
             emitted_count = int(performance_metadata.get("note_count", -1))
             expected_source_count = int(performance_metadata.get("source_note_count", emitted_count))
+            if notation_engine == DIRECT_ENGINE:
+                # Direct notation accounts for its input events. Any earlier
+                # recognition cleanup has separate lineage in performance metadata.
+                alignment_report["upstream_source_note_count"] = expected_source_count
+                expected_source_count = emitted_count
             if (
                 len(materialized) != emitted_count
                 or source_count != expected_source_count
@@ -787,7 +808,7 @@ class HighAccuracyArtifactService:
             )
             _atomic_write_json(score_path, score.model_dump(mode="json"))
             _atomic_write_json(alignment_path, alignment_report)
-            manifest["stages"]["musicxml_standardize"] = {
+            manifest["stages"]["direct_notation" if notation_engine == DIRECT_ENGINE else "musicxml_standardize"] = {
                 "status": "completed",
                 "alignment_source_count": source_count,
                 "alignment_accounted_source_count": accounted_count,

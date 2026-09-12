@@ -89,6 +89,35 @@ def _manifest(path: Path) -> dict:
     return json.loads((path / "manifest.json").read_text(encoding="utf-8"))
 
 
+def test_direct_service_bypasses_musescore_and_verifies_render(monkeypatch, tmp_path):
+    kwargs = _valid_build_kwargs(tmp_path)
+    kwargs["analysis"].metadata.update(notation_engine="direct-jianpu", direct_options={"beat_divisor": 2})
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("direct mode must not invoke MuseScore or MusicXML")
+
+    monkeypatch.setattr(service_module, "convert_performance_midi", forbidden)
+    monkeypatch.setattr(service_module, "standardize_musicxml", forbidden)
+    result = service_module.HighAccuracyArtifactService().build(**kwargs)
+    manifest = _manifest(result.output_dir)
+    assert manifest["notation_engine"] == "direct-jianpu"
+    assert manifest["musescore_version"] is None
+    assert manifest["stages"]["musescore_import"]["status"] == "skipped"
+    assert manifest["stages"]["render"]["midi_verification"]
+    assert result.score.metadata["direct_notation"]["options"]["beat_divisor"] == 2
+    assert not any(a.kind == "musicxml" for a in result.artifacts)
+
+
+def test_direct_failure_never_falls_back_to_musescore(monkeypatch, tmp_path):
+    kwargs = _valid_build_kwargs(tmp_path)
+    kwargs["analysis"].metadata.update(notation_engine="direct-jianpu", direct_options={"subdivisions": 3})
+    monkeypatch.setattr(service_module, "convert_performance_midi", lambda *a, **k: pytest.fail("unexpected fallback"))
+    with pytest.raises(service_module.HighAccuracyServiceError) as exc:
+        service_module.HighAccuracyArtifactService().build(**kwargs)
+    assert exc.value.stage == "direct_notation"
+    assert _manifest(kwargs["output_dir"])["status"] == "failed"
+
+
 def test_service_selects_tempo_preserving_profile_for_game_variant() -> None:
     service = service_module.HighAccuracyArtifactService()
 

@@ -412,6 +412,8 @@ class JobManager:
         source_kind: str,
         title: str,
         separation_model: str | None = None,
+        notation_engine: str = "direct-jianpu",
+        direct_options: dict[str, Any] | None = None,
     ) -> tuple[str, Path]:
         """Create a V2 task while keeping its queue on this manager's worker."""
 
@@ -420,6 +422,8 @@ class JobManager:
             source_kind=source_kind,
             title=title,
             separation_model=separation_model,
+            notation_engine=notation_engine,
+            direct_options=direct_options,
         )
 
     def select_v2(
@@ -430,6 +434,8 @@ class JobManager:
         bpm_override: float | None = None,
         key_override: str | None = None,
         time_signature_override: str | None = None,
+        notation_engine: str | None = None,
+        direct_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.v2.select(
             job_id,
@@ -438,13 +444,15 @@ class JobManager:
             bpm_override=bpm_override,
             key_override=key_override,
             time_signature_override=time_signature_override,
+            notation_engine=notation_engine,
+            direct_options=direct_options,
         )
 
     def v2_tracks(self, job_id: str) -> dict[str, Any]:
         return self.v2.tracks(job_id)
 
-    def generate_vocal_v2(self, job_id: str) -> dict[str, Any]:
-        return self.v2.generate_vocal(job_id)
+    def generate_vocal_v2(self, job_id: str, *, notation_engine: str | None = None, direct_options: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.v2.generate_vocal(job_id, notation_engine=notation_engine, direct_options=direct_options)
 
     def input_path(self, job_id: str) -> Path:
         state = self._read(job_id)

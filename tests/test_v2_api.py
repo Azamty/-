@@ -42,6 +42,38 @@ def _instrumental_state(
     )
 
 
+def test_direct_notation_default_settings_and_legacy_selection(tmp_path):
+    manager = JobManager(tmp_path / "jobs")
+    job_id, _ = manager.create_v2_job(original_name="piece.wav", source_kind="instrumental", title="piece")
+    state = manager._read(job_id)
+    assert state["options"]["notation_engine"] == "direct-jianpu"
+    assert state["v2"]["notation_engine"] == "direct-jianpu"
+    assert state["v2"]["musescore_version"] is None
+    track_id = stable_track_id("acoustic_piano", 0, False)
+    _instrumental_state(manager, job_id,
+        [{"instrument_group": "acoustic_piano", "program": 0, "is_drum": False, "pitch": 60, "start_sec": 0, "end_sec": 1}],
+        [{"track_id": track_id, "instrument_group": "acoustic_piano", "program": 0, "is_drum": False, "label_zh": "钢琴"}])
+    manager.select_v2(job_id, [track_id], direct_options={"beat_divisor": 2, "key_changes": [{"bar": 2, "key": "E"}]})
+    state = manager._read(job_id)
+    assert state["v2"]["selection"]["direct_options"]["beat_divisor"] == 2
+    state["status"] = "completed"
+    manager._write(state)
+    manager.select_v2(job_id, [track_id], notation_engine="musescore-midi-import")
+    state = manager._read(job_id)
+    assert state["v2"]["notation_engine"] == "musescore-midi-import"
+    assert state["v2"]["selection_history"][0]["notation_engine"] == "direct-jianpu"
+    state["options"].pop("notation_engine")
+    state["v2"]["selection"] = None
+    assert manager.v2._notation_metadata(state)["notation_engine"] == "musescore-midi-import"
+
+
+def test_invalid_direct_settings_do_not_create_a_task(tmp_path):
+    manager = JobManager(tmp_path / "jobs")
+    with pytest.raises(ValueError):
+        manager.create_v2_job(original_name="piece.wav", source_kind="instrumental", title="piece", direct_options={"beat_divisor": 3})
+    assert not list((tmp_path / "jobs").glob("*/job.json"))
+
+
 def test_v2_selection_is_a_persistent_revision_snapshot(tmp_path: Path) -> None:
     manager = JobManager(tmp_path / "jobs")
     job_id, input_path = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture")

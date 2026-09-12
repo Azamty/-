@@ -4,6 +4,8 @@
 
 ## 版本与运行分支
 
+`codex/direct-jianpu` 接入了人声与复音伴奏分别整理的直接简谱方式，新 V2 任务默认启用，MuseScore 方式仍可切换。页面支持时值网格、半速记谱及按小节设置转调，详见 [直接简谱说明](docs/direct-jianpu.md)。
+
 `main` 固定 V1 首版，标签 `v1.0.0` 对应已验收的八度修复与完整 V1 pipeline。当前第二版开发在 `v2/muscriptor`；切换到该分支后执行 `.\scripts\start_server.ps1 -Background`，启动脚本会按当前 checkout 启动 V2 页面。不要把 V2 的识别任务目录、模型权重、用户音频或 Hugging Face 凭证提交进 git。
 
 ## 阶段1基础

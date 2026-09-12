@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 
 from .jianpu_score.analysis import analyze_audio, load_audio, probe_audio
+from .jianpu_score.direct_notation import DIRECT_ENGINE, DirectNotationOptions, combine_direct_scores
 from .jianpu_score.beat_grid import beat_grid_onsets_from_notes
 from .jianpu_score.domain import (
     MusicAnalysis,
@@ -49,7 +50,7 @@ from .jianpu_score.render import (
     render_score,  # noqa: F401 - legacy monkeypatch/import surface
 )
 from .jianpu_score.svg_long import merge_svg_pages
-from .jianpu_score.vocal_cleanup import VocalCleanupError, clean_vocal_events
+from .jianpu_score.vocal_cleanup import VocalCleanupError, VocalCleanupResult, clean_vocal_events
 from .muscriptor_v2 import (
     instrument_label_zh,
     stable_track_id,
@@ -157,6 +158,16 @@ class V2JobService:
     def __init__(self, manager: Any) -> None:
         self.manager = manager
 
+    @staticmethod
+    def _notation_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
+        options = dict(state.get("options") or {})
+        selection = dict((state.get("v2") or {}).get("selection") or {})
+        engine = selection.get("notation_engine") or options.get("notation_engine") or "musescore-midi-import"
+        settings = selection.get("direct_options", options.get("direct_options", {}))
+        return {**HIGH_ACCURACY_V2_METADATA, "notation_engine": engine,
+                "musescore_version": None if engine == DIRECT_ENGINE else MUSESCORE_VERSION,
+                "direct_options": settings}
+
     def create_job(
         self,
         *,
@@ -164,9 +175,14 @@ class V2JobService:
         source_kind: str,
         title: str,
         separation_model: str | None = None,
+        notation_engine: str = DIRECT_ENGINE,
+        direct_options: dict[str, Any] | None = None,
     ) -> tuple[str, Path]:
         if source_kind not in V2_SOURCE_KINDS:
             raise ValueError("V2 source_kind must be instrumental or vocal")
+        if notation_engine not in {DIRECT_ENGINE, "musescore-midi-import"}:
+            raise ValueError("不支持的简谱生成方式")
+        direct_options = DirectNotationOptions.model_validate(direct_options or {}).model_dump(mode="json")
         selected_model = normalize_demucs_model(separation_model)
         if source_kind != "vocal":
             selected_model = None
@@ -196,6 +212,8 @@ class V2JobService:
                 "separate": False,
                 "title": title,
                 "separation_model": selected_model,
+                "notation_engine": notation_engine,
+                "direct_options": direct_options,
             },
             "input": {
                 "original_name": self._filename(original_name),
@@ -234,6 +252,7 @@ class V2JobService:
                 **deepcopy(HIGH_ACCURACY_V2_METADATA),
             },
         }
+        state["v2"].update(self._notation_metadata(state))
         self.manager._write(state)
         self.manager._log(job_id, f"created V2 task: {state['input']['original_name']}")
         return job_id, input_path
@@ -272,7 +291,7 @@ class V2JobService:
     def _vocal_model_info(model: str) -> dict[str, Any]:
         return next(item for item in demucs_model_catalog() if item["id"] == model)
 
-    def generate_vocal(self, job_id: str) -> dict[str, Any]:
+    def generate_vocal(self, job_id: str, *, notation_engine: str | None = None, direct_options: dict[str, Any] | None = None) -> dict[str, Any]:
         """Queue GAME for a previously separated vocal stem.
 
         Separation is deliberately a separate durable state.  A repeated click
@@ -298,6 +317,13 @@ class V2JobService:
             self._validate_internal_vocal_path(job_id, prepared)
             v2 = dict(state.get("v2", {}))
             model = self._vocal_model(state)
+            settings = self._notation_metadata(state)
+            engine = notation_engine or settings["notation_engine"]
+            if engine not in {DIRECT_ENGINE, "musescore-midi-import"}:
+                raise ValueError("不支持的简谱生成方式")
+            values = DirectNotationOptions.model_validate(settings["direct_options"] if direct_options is None else direct_options).model_dump(mode="json")
+            state["options"] = {**state.get("options", {}), "notation_engine": engine, "direct_options": values}
+            v2.update(self._notation_metadata(state))
             v2["stage"] = "vocal_generate"
             v2["route"] = self._vocal_route(model)
             v2["progress_detail"] = {
@@ -333,6 +359,8 @@ class V2JobService:
         bpm_override: float | None = None,
         key_override: str | None = None,
         time_signature_override: str | None = None,
+        notation_engine: str | None = None,
+        direct_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self.manager._lock:
             state = self.manager._read(job_id)
@@ -359,7 +387,14 @@ class V2JobService:
             key = normalize_key(key_override or str(analysis.get("key") or "C"))
             time_signature = normalize_time_signature(time_signature_override or str(analysis.get("time_signature") or "4/4"))
             revision = int(state.get("v2", {}).get("selection_revision", 0)) + 1
+            settings = self._notation_metadata(state)
+            selected_engine = notation_engine or settings["notation_engine"]
+            if selected_engine not in {DIRECT_ENGINE, "musescore-midi-import"}:
+                raise ValueError("不支持的简谱生成方式")
+            selected_options = DirectNotationOptions.model_validate(settings["direct_options"] if direct_options is None else direct_options).model_dump(mode="json")
             selection = {
+                "notation_engine": selected_engine,
+                "direct_options": selected_options,
                 "revision": revision,
                 "selected_track_ids": requested,
                 "merge_main_melody": bool(merge_main_melody),
@@ -379,6 +414,7 @@ class V2JobService:
             v2["stage"] = "export"
             v2["selection_revision"] = revision
             v2["selection"] = selection
+            v2.update(self._notation_metadata({**state, "v2": v2}))
             v2["selection_history"] = [*v2.get("selection_history", []), deepcopy(selection)]
             state.update(
                 {
@@ -581,7 +617,7 @@ class V2JobService:
             v2 = dict(state.get("v2", {}))
             v2.update(
                 {
-                    **HIGH_ACCURACY_V2_METADATA,
+                    **self._notation_metadata(state),
                     "stage": "selection_ready",
                     "tracks": tracks,
                     "notes": notes,
@@ -612,7 +648,7 @@ class V2JobService:
                     "artifacts": artifacts,
                     "progress": 1.0,
                     "summary": {
-                        **HIGH_ACCURACY_V2_METADATA,
+                        **self._notation_metadata(state),
                         "source_kind": "instrumental",
                         "route": {"engine": "muscriptor", "use_demucs": False},
                         "note_count": len(notes),
@@ -883,7 +919,7 @@ class V2JobService:
             state = self.manager._read(job_id)
             v2 = dict(state.get("v2", {}))
             v2["generation"] = deepcopy(dict(generation))
-            v2.update(HIGH_ACCURACY_V2_METADATA)
+            v2.update(self._notation_metadata(state))
             state["v2"] = v2
             state["artifacts"] = [dict(item) for item in artifacts]
             state["updated_at"] = _utc_now()
@@ -1088,7 +1124,7 @@ class V2JobService:
             v2 = dict(state.get("v2", {}))
             v2.update(
                 {
-                    **HIGH_ACCURACY_V2_METADATA,
+                    **self._notation_metadata(state),
                     "stage": "vocal_ready",
                     "route": self._vocal_route(model),
                     "analysis": analysis_suggestion,
@@ -1107,7 +1143,7 @@ class V2JobService:
                     "artifacts": artifacts,
                     "progress": 1.0,
                     "summary": {
-                        **HIGH_ACCURACY_V2_METADATA,
+                        **self._notation_metadata(state),
                         "source_kind": "vocal",
                         "route": self._vocal_route(model),
                         "stage": "vocal_ready",
@@ -1128,6 +1164,7 @@ class V2JobService:
         model = self._vocal_model(state)
         vocal_path = self._prepared_vocal_path(job_id, state)
         original_analysis = self._prepared_analysis(job_id, state)
+        original_analysis = original_analysis.model_copy(update={"metadata": {**original_analysis.metadata, **self._notation_metadata(state)}})
         if not self._analysis_has_beatnet(original_analysis):
             raise ValueError("人声原曲的 BeatNet 拍点分析缺失或版本不匹配，无法生成高精度简谱")
         self.manager._set_phase(job_id, "recognizing")
@@ -1197,15 +1234,18 @@ class V2JobService:
         )
         self.manager._set_phase(job_id, "quantizing")
         try:
-            cleanup = clean_vocal_events(
-                raw_events,
-                bpm=original_analysis.bpm,
-                beat_context={
-                    "bpm": original_analysis.bpm,
-                    "beat_times": list(original_analysis.beat_times),
-                    "beat_grid": deepcopy(original_analysis.metadata.get("beat_grid", {})),
-                },
-            )
+            if original_analysis.metadata.get("notation_engine") == DIRECT_ENGINE:
+                cleanup = VocalCleanupResult(raw_events, {"schema_version": "direct-1", "stage": "deferred_to_direct_notation", "raw_count": len(raw_events)})
+            else:
+                cleanup = clean_vocal_events(
+                    raw_events,
+                    bpm=original_analysis.bpm,
+                    beat_context={
+                        "bpm": original_analysis.bpm,
+                        "beat_times": list(original_analysis.beat_times),
+                        "beat_grid": deepcopy(original_analysis.metadata.get("beat_grid", {})),
+                    },
+                )
         except (VocalCleanupError, TypeError, ValueError) as exc:
             report = getattr(exc, "report", None)
             if isinstance(report, Mapping):
@@ -1359,7 +1399,7 @@ class V2JobService:
             current_v2 = dict(current.get("v2", {}))
             current_v2.update(
                 {
-                    **HIGH_ACCURACY_V2_METADATA,
+                    **self._notation_metadata(state),
                     "stage": "vocal_complete",
                     "route": self._vocal_route(model),
                     "analysis": _analysis_suggestion(generation_analysis),
@@ -1379,7 +1419,7 @@ class V2JobService:
                     "progress": 1.0,
                     "warnings": list(dict.fromkeys([*generation_analysis.warnings, *separation.get("warnings", [])])),
                     "summary": {
-                        **HIGH_ACCURACY_V2_METADATA,
+                        **self._notation_metadata(state),
                         "source_kind": "vocal",
                         "route": self._vocal_route(model),
                         "stage": "completed",
@@ -1407,6 +1447,8 @@ class V2JobService:
         track_by_id = {str(track.get("track_id")): track for track in tracks}
         selected_tracks = [track_by_id[track_id] for track_id in selected_ids if track_id in track_by_id]
         base_analysis = self._persisted_instrumental_analysis(job_id, state)
+        if base_analysis is not None:
+            base_analysis = base_analysis.model_copy(update={"metadata": {**base_analysis.metadata, **self._notation_metadata(state)}})
         bpm = float(selection.get("bpm_override") if selection.get("bpm_override") is not None else (base_analysis.bpm if base_analysis else 120.0))
         key = normalize_key(str(selection.get("key_override") or (base_analysis.key if base_analysis else "C")))
         time_signature = normalize_time_signature(
@@ -1758,7 +1800,7 @@ class V2JobService:
             "main_melody_score_artifact_ids": main_melody_score_artifact_ids,
             "melody_harmony_score_artifact_ids": melody_harmony_score_artifact_ids,
             "melody_harmony_score": melody_harmony_score_report,
-            "metadata": {**HIGH_ACCURACY_V2_METADATA, "time_basis": "source_seconds", "velocity_policy": "playback_default", "note_event_velocity": None, "full_decode_reused": True},
+            "metadata": {**self._notation_metadata(state), "time_basis": "source_seconds", "velocity_policy": "playback_default", "note_event_velocity": None, "full_decode_reused": True},
         }
         selection_json = output / "selection.json"
         _safe_json(selection_json, selection_record)
@@ -1775,7 +1817,7 @@ class V2JobService:
         with self.manager._lock:
             current = self.manager._read(job_id)
             current_v2 = dict(current.get("v2", {}))
-            current_v2.update({**HIGH_ACCURACY_V2_METADATA, "score_refusal": score_refusal, "track_failures": track_failures, "main_melody_selection_artifact_id": main_melody_selection_artifact_id, "main_melody_score_artifact_ids": main_melody_score_artifact_ids, "melody_harmony_score_artifact_ids": melody_harmony_score_artifact_ids, "melody_harmony_score": melody_harmony_score_report, "progress_detail": {"status": "completed" if not score_refusal or score_refusal.get("code") == "no_pitched_tracks" else "failed", "revision": revision}})
+            current_v2.update({**self._notation_metadata(state), "score_refusal": score_refusal, "track_failures": track_failures, "main_melody_selection_artifact_id": main_melody_selection_artifact_id, "main_melody_score_artifact_ids": main_melody_score_artifact_ids, "melody_harmony_score_artifact_ids": melody_harmony_score_artifact_ids, "melody_harmony_score": melody_harmony_score_report, "progress_detail": {"status": "completed" if not score_refusal or score_refusal.get("code") == "no_pitched_tracks" else "failed", "revision": revision}})
             previous = [item for item in current.get("artifacts", []) if not str(item.get("artifact_id", "")).startswith(f"v2-selection-r{revision}-")]
             current.update(
                 {
@@ -1787,7 +1829,7 @@ class V2JobService:
                     "warnings": warnings,
                     "artifacts": [*previous, *artifacts],
                     "summary": {
-                        **HIGH_ACCURACY_V2_METADATA,
+                        **self._notation_metadata(state),
                         "source_kind": "instrumental",
                         "route": {"engine": "muscriptor", "use_demucs": False},
                         "selection_revision": revision,
@@ -1835,6 +1877,11 @@ class V2JobService:
 
         if not score_results:
             raise ValueError("melody+harmony composition requires at least one source Score")
+        if all(result.score is not None and result.score.metadata.get("notation_engine") == DIRECT_ENGINE for _track, _notes, result in score_results):
+            return combine_direct_scores([
+                (str(track["track_id"]), str(track.get("label_zh") or track["track_id"]), result.score)
+                for track, _notes, result in score_results
+            ], title=title)
         source_scores: list[tuple[str, Score]] = []
         for track, _track_notes, result in score_results:
             track_id = str(track.get("track_id"))

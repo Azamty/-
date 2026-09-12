@@ -140,7 +140,7 @@ def _analysis() -> MusicAnalysis:
 
 
 def _instrumental_fixture(manager: JobManager, tmp_path: Path, *, two_tracks: bool = False) -> tuple[str, str, list[str]]:
-    job_id, input_path = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture")
+    job_id, input_path = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture", notation_engine="musescore-midi-import")
     input_path.write_bytes(b"fixture")
     track_specs = [("acoustic_guitar", 24), ("violin", 40)] if two_tracks else [("acoustic_guitar", 24)]
     tracks = [
@@ -189,7 +189,7 @@ def test_recognition_retry_uses_new_attempt_and_preserves_raw_outputs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     manager = JobManager(tmp_path / "jobs")
-    job_id, input_path = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture")
+    job_id, input_path = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture", notation_engine="musescore-midi-import")
     input_path.write_bytes(b"fixture")
     manager.enqueue(job_id)
     analysis_calls = 0
@@ -651,7 +651,7 @@ def test_drum_only_export_stays_midi_only_without_notation_service(monkeypatch: 
 
 def test_v2_high_accuracy_registers_natural_page_numbers(tmp_path: Path) -> None:
     manager = JobManager(tmp_path / "jobs")
-    job_id, _input = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture")
+    job_id, _input = manager.create_v2_job(original_name="fixture.wav", source_kind="instrumental", title="fixture", notation_engine="musescore-midi-import")
     output_dir = tmp_path / "jobs" / job_id / "output" / "track"
     output_dir.mkdir(parents=True)
     paths = []
@@ -702,12 +702,13 @@ def test_v2_high_accuracy_registers_natural_page_numbers(tmp_path: Path) -> None
     assert score_ids == [f"v2-selection-r1-piano-score-svg-{page}" for page in range(1, 13)]
 
 
-def test_vocal_generation_persists_raw_cleanup_and_service_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("notation_engine", ["direct-jianpu", "musescore-midi-import"])
+def test_vocal_generation_persists_raw_cleanup_and_service_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, notation_engine: str) -> None:
     FakeHighAccuracyService.calls = []
     FakeHighAccuracyService.failures = set()
     monkeypatch.setattr("backend.v2_job_manager.HighAccuracyArtifactService", FakeHighAccuracyService)
     manager = JobManager(tmp_path / "jobs")
-    job_id, input_path = manager.create_v2_job(original_name="voice.wav", source_kind="vocal", title="voice")
+    job_id, input_path = manager.create_v2_job(original_name="voice.wav", source_kind="vocal", title="voice", notation_engine=notation_engine)
     input_path.write_bytes(b"fixture")
     job_dir = tmp_path / "jobs" / job_id
     vocal_path = job_dir / "output" / "vocal-prep" / "vocals.wav"
@@ -751,7 +752,8 @@ def test_vocal_generation_persists_raw_cleanup_and_service_outputs(monkeypatch: 
     assert any(item["kind"] == "vocal_score_midi" for item in result["artifacts"])
     assert result["v2"]["generation"]["analysis_reused_from_original"] is True
     assert result["summary"]["raw_note_count"] == 2
-    assert result["summary"]["note_count"] == 1
+    assert result["summary"]["note_count"] == (2 if notation_engine == "direct-jianpu" else 1)
+    assert result["v2"]["notation_engine"] == notation_engine
 
 
 def test_vocal_retry_keeps_previous_attempt_diagnostics_downloadable(
@@ -846,13 +848,14 @@ def test_vocal_retry_keeps_previous_attempt_diagnostics_downloadable(
 
 
 @pytest.mark.skipif(not REAL_READY, reason="pinned high-accuracy toolchain is unavailable")
-def test_v2_instrumental_real_musescore_stage56_class_bundle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("notation_engine", ["direct-jianpu", "musescore-midi-import"])
+def test_v2_instrumental_real_notation_bundle(tmp_path: Path, notation_engine: str) -> None:
     manager = JobManager(tmp_path / "jobs")
-    job_id, _input, ids = _instrumental_fixture(manager, tmp_path)
+    job_id, _input, ids = _instrumental_fixture(manager, tmp_path, two_tracks=notation_engine == "direct-jianpu")
     state = manager._read(job_id)
     state["v2"]["notes"][0].update({"start_sec": 0.0, "end_sec": 0.5})
     manager._write(state)
-    manager.select_v2(job_id, ids)
+    manager.select_v2(job_id, ids, notation_engine=notation_engine)
     state = manager._read(job_id)
     state.update({"status": "running", "phase": "rendering"})
     manager._write(state)
@@ -862,5 +865,7 @@ def test_v2_instrumental_real_musescore_stage56_class_bundle(tmp_path: Path) -> 
     result = manager._read(job_id)
     assert result["status"] == "completed"
     assert any(item["kind"] == "instrument_score_midi" for item in result["artifacts"])
-    assert any(item["kind"] == "instrument_musicxml" for item in result["artifacts"])
+    assert any(item["kind"] == "instrument_musicxml" for item in result["artifacts"]) == (notation_engine == "musescore-midi-import")
     assert any(item["kind"] == "instrument_score_svg_long" for item in result["artifacts"])
+    if notation_engine == "direct-jianpu":
+        assert result["v2"]["melody_harmony_score"]["policy"] == "preserve_direct_voices"

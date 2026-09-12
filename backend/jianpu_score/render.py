@@ -88,12 +88,16 @@ _COMPOSITION_REST_FILTER = """#(define (composition-filter-rest-heads grob)
 def _is_melody_harmony_score(score: Score) -> bool:
     """Enable the combined-score layout only for its explicit metadata marker."""
 
-    return isinstance(score.metadata.get("melody_harmony"), Mapping)
+    return isinstance(score.metadata.get("melody_harmony"), Mapping) or score.metadata.get("notation_engine") == "direct-jianpu"
 
 
 def _melody_harmony_role_label(label: str) -> tuple[str, str] | None:
     """Map a composed lane label to stable user-facing long and short labels."""
 
+    if any(role in label for role in ("高音", "和声", "低音", "人声")):
+        label = re.sub(r" chord lane (\d+)", r"分\1", label)
+        short_label = re.search(r"(?:高音|和声|低音|人声).*$", label)
+        return label, short_label.group(0) if short_label else label
     if label.startswith("主旋律"):
         return "主旋律", "主旋律"
     if label.startswith("伴奏和弦"):

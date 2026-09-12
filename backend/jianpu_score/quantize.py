@@ -937,7 +937,9 @@ def _measure_contexts(score: Score, spans: list[_MeasureSpan]) -> tuple[list[_Me
 
     contexts: list[_MeasureContext] = []
     tempo_index = 0
-    tempo_events = score.tempo_events
+    # Direct scores display the overall tempo. BeatNet's local timing still
+    # goes into the playback MIDI; printing its jitter each bar obscures notes.
+    tempo_events = [] if score.metadata.get("notation_engine") == "direct-jianpu" else score.tempo_events
     current_tempo = float(score.bpm)
     previous_meter: str | None = None
     for index, span in enumerate(spans):
