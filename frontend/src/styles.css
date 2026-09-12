@@ -205,6 +205,7 @@ input[type="range"] { width: 70px; accent-color: var(--coral); }
 .score-card small { display: block; margin-top: 4px; color: #727b73; font-size: 9px; }
 .download-line { display: inline-flex; margin-top: 17px; color: var(--coral-dark); font-size: 10px; text-decoration: none; }
 .download-line:hover { text-decoration: underline; }
+.combined-midi-download { border: 1px solid var(--coral); padding: 9px 12px; font-weight: 700; background: #fff8e9; }
 .high-accuracy-meta { display: grid; gap: 10px; margin: 18px 0 4px; }
 .engine-readout, .track-failure-list, .score-refusal { display: grid; gap: 4px; padding: 12px 14px; border-left: 4px solid var(--sage); background: #eef0df; }
 .engine-readout span, .track-failure-list strong, .score-refusal strong { color: var(--ink); font-size: 11px; }

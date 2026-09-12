@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canPersistSelection, parseSelectionDraft, resolveSelectionValues, SELECTION_DRAFT_SCHEMA, SELECTION_DRAFT_VERSION, selectionStorageKey } from "../src/selectionState.ts";
+import { canPersistSelection, isValidJobId, parseSelectionDraft, resolveInitialJobId, resolveSelectionValues, SELECTION_DRAFT_SCHEMA, SELECTION_DRAFT_VERSION, selectionStorageKey } from "../src/selectionState.ts";
 
 test("a first ready instrumental job uses the analysis suggestion", () => {
   assert.deepEqual(resolveSelectionValues(
@@ -49,4 +49,19 @@ test("selection draft schema rejects legacy and cross-job records", () => {
   assert.equal(parseSelectionDraft(marked, "job-a")?.bpm, 88);
   assert.equal(parseSelectionDraft(marked, "job-b"), null);
   assert.equal(parseSelectionDraft(JSON.stringify({ bpm: 120, key: "C", meter: "4/4" }), "job-a"), null);
+});
+
+test("direct job links are validated and take priority over the saved job", () => {
+  const direct = "a7428e72-c181-48cd-9953-f19247955d8e";
+  const saved = "7acc1e55-86ea-445a-bb8f-59f4478a0b2a";
+  assert.equal(isValidJobId(direct), true);
+  assert.equal(resolveInitialJobId(`?job=${direct}`, saved).jobId, direct);
+  assert.equal(resolveInitialJobId("", saved).jobId, saved);
+});
+
+test("an invalid direct job link does not fall back to an unrelated saved job", () => {
+  const result = resolveInitialJobId("?job=not-a-uuid", "7acc1e55-86ea-445a-bb8f-59f4478a0b2a");
+  assert.equal(result.jobId, null);
+  assert.equal(result.invalidQuery, true);
+  assert.equal(resolveInitialJobId("", "legacy-job-id").jobId, null);
 });

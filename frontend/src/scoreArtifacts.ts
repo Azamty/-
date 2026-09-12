@@ -10,6 +10,13 @@ export type ScoreArtifactBuckets = {
   paged: ScoreArtifact[];
 };
 
+export const MELODY_HARMONY_SCORE_KINDS = new Set([
+  "melody_harmony_score_svg_long",
+  "melody_harmony_score_svg",
+]);
+
+export const MELODY_HARMONY_MIDI_KIND = "melody_harmony_score_midi";
+
 const SCORE_KINDS = {
   instrument: new Set([
     "instrument_score_svg_long",
@@ -78,4 +85,30 @@ export function classifyScoreArtifacts<T extends ScoreArtifact>(
     long: matched.filter((artifact) => artifact.kind.endsWith("_long")),
     paged: matched.filter((artifact) => !artifact.kind.endsWith("_long")),
   };
+}
+
+export function classifyMelodyHarmonyScoreArtifacts<T extends ScoreArtifact>(
+  artifacts: readonly T[],
+  selectionRevision?: number | null,
+): { long: T[]; paged: T[] } {
+  const matched = filterArtifactsForSelectionRevision(artifacts, selectionRevision)
+    .filter((artifact) => MELODY_HARMONY_SCORE_KINDS.has(artifact.kind))
+    .sort((left, right) => {
+      const longDelta = Number(right.kind.endsWith("_long")) - Number(left.kind.endsWith("_long"));
+      return longDelta
+        || (Number(left.page || 0) - Number(right.page || 0))
+        || left.artifact_id.localeCompare(right.artifact_id);
+    });
+  return {
+    long: matched.filter((artifact) => artifact.kind.endsWith("_long")),
+    paged: matched.filter((artifact) => !artifact.kind.endsWith("_long")),
+  };
+}
+
+export function findMelodyHarmonyMidi<T extends ScoreArtifact>(
+  artifacts: readonly T[],
+  selectionRevision?: number | null,
+): T | undefined {
+  return filterArtifactsForSelectionRevision(artifacts, selectionRevision)
+    .find((artifact) => artifact.kind === MELODY_HARMONY_MIDI_KIND);
 }

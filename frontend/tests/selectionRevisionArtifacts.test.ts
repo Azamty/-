@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyScoreArtifacts, filterArtifactsForSelectionRevision, selectionArtifactRevision } from "../src/scoreArtifacts.ts";
+import { classifyMelodyHarmonyScoreArtifacts, classifyScoreArtifacts, filterArtifactsForSelectionRevision, findMelodyHarmonyMidi, selectionArtifactRevision } from "../src/scoreArtifacts.ts";
 
 test("R2 score view keeps the current part and hides the retained R1 main melody", () => {
   const result = classifyScoreArtifacts([
@@ -24,6 +24,42 @@ test("R2 score view keeps the current part and hides the retained R1 main melody
 
   assert.deepEqual(result.long.map((item) => item.artifact_id), ["v2-selection-r2-piano-score-svg-long"]);
   assert.deepEqual(result.paged.map((item) => item.artifact_id), ["v2-selection-r2-piano-score-svg-1"]);
+});
+
+test("R2 combined score view hides retained R1 harmony pages and MIDI", () => {
+  const artifacts = [
+    {
+      artifact_id: "v2-selection-r1-melody-harmony-score-svg-long",
+      kind: "melody_harmony_score_svg_long",
+      relative_path: "output/selections/rev-0001/melody-harmony/melody-harmony.long.svg",
+    },
+    {
+      artifact_id: "v2-selection-r1-melody-harmony-score-midi",
+      kind: "melody_harmony_score_midi",
+      relative_path: "output/selections/rev-0001/melody-harmony/melody-harmony.score.mid",
+    },
+    {
+      artifact_id: "v2-selection-r2-melody-harmony-score-svg-long",
+      kind: "melody_harmony_score_svg_long",
+      relative_path: "output/selections/rev-0002/melody-harmony/melody-harmony.long.svg",
+    },
+    {
+      artifact_id: "v2-selection-r2-melody-harmony-score-svg-1",
+      kind: "melody_harmony_score_svg",
+      page: 1,
+      relative_path: "output/selections/rev-0002/melody-harmony/melody-harmony-1.svg",
+    },
+    {
+      artifact_id: "v2-selection-r2-melody-harmony-score-midi",
+      kind: "melody_harmony_score_midi",
+      relative_path: "output/selections/rev-0002/melody-harmony/melody-harmony.score.mid",
+    },
+  ];
+
+  const result = classifyMelodyHarmonyScoreArtifacts(artifacts, 2);
+  assert.deepEqual(result.long.map((item) => item.artifact_id), ["v2-selection-r2-melody-harmony-score-svg-long"]);
+  assert.deepEqual(result.paged.map((item) => item.artifact_id), ["v2-selection-r2-melody-harmony-score-svg-1"]);
+  assert.equal(findMelodyHarmonyMidi(artifacts, 2)?.artifact_id, "v2-selection-r2-melody-harmony-score-midi");
 });
 
 test("artifacts without a revision marker remain visible for legacy compatibility", () => {

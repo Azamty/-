@@ -38,6 +38,29 @@ export type ResolvedSelectionValues = {
 export const SELECTION_DRAFT_SCHEMA = "jianpu-v2-selection";
 export const SELECTION_DRAFT_VERSION = 1;
 
+const JOB_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export type InitialJobId = {
+  jobId: string | null;
+  invalidQuery: boolean;
+};
+
+export function isValidJobId(value: string | null | undefined): value is string {
+  return typeof value === "string" && JOB_ID_PATTERN.test(value.trim());
+}
+
+/** Resolve a direct job link before the last job saved by the local app. */
+export function resolveInitialJobId(search: string, storedJobId: string | null): InitialJobId {
+  const queryJobId = new URLSearchParams(search).get("job")?.trim() || "";
+  if (queryJobId) {
+    return {
+      jobId: isValidJobId(queryJobId) ? queryJobId : null,
+      invalidQuery: !isValidJobId(queryJobId),
+    };
+  }
+  return { jobId: isValidJobId(storedJobId) ? storedJobId.trim() : null, invalidQuery: false };
+}
+
 const firstValue = <T>(...values: Array<T | null | undefined>): T | undefined => {
   const found = values.find((value) => value !== undefined && value !== null && String(value).trim() !== "");
   return found === null || found === undefined ? undefined : found;
