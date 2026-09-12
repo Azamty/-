@@ -6,6 +6,7 @@ import mido
 import pytest
 
 from backend.jianpu_score.domain import Score, ScoreNote, ScoreVoice
+from backend.jianpu_score.quantize import score_to_jianpu
 from backend.jianpu_score.render import LILYPOND, JIANPU, _is_melody_harmony_score, render_score
 
 
@@ -66,6 +67,59 @@ def _combined_fixture(*, combined: bool) -> Score:
     )
 
 
+def _sparse_combined_fixture() -> Score:
+    """Use q0/s0 placeholders before a later system with real accompaniment."""
+
+    quarter_ticks = 48
+    bar_pattern = [24, 24, 24, 24] + [12] * 8
+    positions: list[tuple[int, int]] = []
+    cursor = 0
+    for _ in range(8):
+        for duration in bar_pattern:
+            positions.append((cursor, duration))
+            cursor += duration
+    main_events = [
+        ScoreNote(start_tick=start, duration_tick=duration, midi=60 + (index % 4) * 2)
+        for index, (start, duration) in enumerate(positions)
+    ]
+    accompaniment_events = [
+        ScoreNote(
+            start_tick=start,
+            duration_tick=duration,
+            midi=None if index < len(positions) // 2 else 48 + (index % 4) * 2,
+        )
+        for index, (start, duration) in enumerate(positions)
+    ]
+    return Score(
+        title="sparse q s melody harmony fixture",
+        bpm=96,
+        key="C",
+        time_signature="4/4",
+        quarter_ticks=quarter_ticks,
+        total_ticks=cursor,
+        voices=[
+            ScoreVoice(
+                voice_id="melody:voice-0",
+                label="主旋律 helper",
+                stem_id="melody-harmony",
+                staff=1,
+                source_voice="melody",
+                events=main_events,
+            ),
+            ScoreVoice(
+                voice_id="accompaniment:voice-0",
+                label="伴奏和弦 helper",
+                stem_id="melody-harmony",
+                staff=2,
+                source_voice="accompaniment",
+                events=accompaniment_events,
+            ),
+        ],
+        source="melody-harmony-composition",
+        metadata={"melody_harmony": {"role_order": ["melody", "accompaniment"]}},
+    )
+
+
 def _midi_intervals(path: str, quarter_ticks: int) -> list[tuple[int, int, int]]:
     midi = mido.MidiFile(path)
     active: dict[tuple[int, int], list[int]] = {}
@@ -116,6 +170,33 @@ def test_combined_render_hides_empty_lanes_and_uses_short_role_labels(tmp_path: 
     assert _midi_intervals(artifacts.midi_path or "", score.quarter_ticks) == expected
 
 
+def test_combined_rest_hack_lane_hides_then_returns_without_midi_change(tmp_path: Path) -> None:
+    score = _sparse_combined_fixture()
+    jly = score_to_jianpu(score)
+    assert "q0" in jly
+    assert "s0" in jly
+
+    artifacts = render_score(score, tmp_path, basename="sparse-combined-layout")
+    lilypond = Path(artifacts.lilypond_path).read_text(encoding="utf-8")
+    svg = "\n".join(Path(path).read_text(encoding="utf-8") for path in artifacts.svg_paths)
+
+    # The rest hack's pitched c placeholders carry the marker but no longer
+    # keep the otherwise empty first-system lane alive.  The same lane has
+    # real notes later, so its short label still appears in the SVG.
+    assert lilypond.count("composition-rest") >= 1
+    assert "\\override VerticalAxisGroup.before-line-breaking = #composition-filter-rest-heads" in lilypond
+    assert "伴奏和弦" not in svg
+    assert "和弦" in svg
+
+    expected = sorted(
+        (event.midi, event.start_tick, event.end_tick)
+        for voice in score.voices
+        for event in voice.events
+        if event.midi is not None
+    )
+    assert _midi_intervals(artifacts.midi_path or "", score.quarter_ticks) == expected
+
+
 def test_non_combined_render_keeps_default_lilypond_layout(tmp_path: Path) -> None:
     score = _combined_fixture(combined=False)
     assert not _is_melody_harmony_score(score)
@@ -125,4 +206,5 @@ def test_non_combined_render_keeps_default_lilypond_layout(tmp_path: Path) -> No
 
     assert "\\RemoveAllEmptyStaves" not in lilypond
     assert "indent = 26\\mm" not in lilypond
+    assert "composition-filter-rest-heads" not in lilypond
     assert "untied pitches" in lilypond

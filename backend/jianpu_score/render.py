@@ -73,6 +73,16 @@ _LAYOUT_OPEN = re.compile(r"(?m)^(?P<indent>[ \t]*)\\layout[ \t]*\{(?P<eol>\r?\n
 _INSTRUMENT_NAME = re.compile(
     r'(?m)^(?P<indent>[ \t]*)instrumentName[ \t]*=[ \t]*"(?P<label>(?:\\[^\r\n]|[^\r\n"])*)"[ \t]*(?P<eol>\r?\n|$)'
 )
+_REST_HACK_NOTE = re.compile(r'''\\note-mod "0" c(?=[,']|[0-9])''')
+_COMPOSITION_REST_FILTER = """#(define (composition-filter-rest-heads grob)
+  (let ((items (ly:grob-object grob 'items-worth-living)))
+    (if (ly:grob-array? items)
+      (ly:grob-set-object! grob 'items-worth-living
+        (ly:grob-list->grob-array
+          (filter (lambda (item)
+            (not (assoc-get 'composition-rest (ly:grob-property item 'details '()) #f)))
+            (ly:grob-array->list items)))))))
+"""
 
 
 def _is_melody_harmony_score(score: Score) -> bool:
@@ -114,6 +124,17 @@ def _prepare_melody_harmony_lilypond(text: str) -> str:
         )
 
     prepared = _INSTRUMENT_NAME.sub(replace_instrument_name, text)
+    # jianpu-ly's rest hack writes a short zero placeholder as a pitched
+    # ``c`` note so it can keep beams intact.  LilyPond consequently treats
+    # an otherwise empty lane as alive.  Mark those generated placeholders
+    # so the VerticalAxisGroup callback below can remove them from
+    # ``items-worth-living`` while leaving their notation and beams visible.
+    prepared, _ = _REST_HACK_NOTE.subn(
+        lambda match: (
+            r"\tweak NoteHead.details #'((composition-rest . #t)) " + match.group(0)
+        ),
+        prepared,
+    )
     layout_matches = list(_LAYOUT_OPEN.finditer(prepared))
     if not layout_matches:
         raise RuntimeError("combined score LilyPond source has no layout block")
@@ -124,9 +145,15 @@ def _prepare_melody_harmony_lilypond(text: str) -> str:
         "  \\context {\n"
         "    \\RhythmicStaff\n"
         "    \\RemoveAllEmptyStaves\n"
+        "    \\override VerticalAxisGroup.before-line-breaking = #composition-filter-rest-heads\n"
         "  }\n"
     )
-    return prepared[: layout.end()] + layout_instructions + prepared[layout.end() :]
+    return (
+        _COMPOSITION_REST_FILTER
+        + prepared[: layout.end()]
+        + layout_instructions
+        + prepared[layout.end() :]
+    )
 
 
 def natural_svg_sort_key(path: str | Path) -> tuple[int, int, str]:
