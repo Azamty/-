@@ -2120,6 +2120,8 @@ def score_to_jianpu(score: Score) -> str:
                 )
             )
             slice_offset += len(slices)
+            if score.metadata.get("notation_engine") == "direct-jianpu" and (index+1) % 4 == 0 and index+1 < len(spans):
+                output.append(r"\break")
         lines.append(" ".join(output))
         if voice_index + 1 < len(serialization_voices):
             lines.append("NextPart")

@@ -116,7 +116,9 @@ def build_direct_score(
     if not kept:
         raise ValueError("direct notation has no notes after vocal cleanup")
 
-    total = max(max(n["z"] for n in kept), snap(analysis.duration_sec))
+    shared_ends = [n.end_sec for n in analysis.note_events]
+    shared_ends.extend(float(n["end_sec"]) for n in analysis.metadata.get("shared_timeline_event_bounds", []))
+    total = max(max(n["z"] for n in kept), snap(max(shared_ends, default=0)))
     total = math.ceil(total / bar_ticks) * bar_ticks
     changes: dict[int, str] = {}
     for change in opts.key_changes:

@@ -30,6 +30,7 @@ class RenderArtifacts(BaseModel):
     lilypond_path: str
     svg_paths: list[str]
     midi_path: str | None = None
+    pdf_path: str | None = None
     log_path: str
 
 
@@ -196,7 +197,7 @@ def render_score(score: Score, output_dir: str | Path, *, basename: str = "score
     lilypond_path = destination / f"{safe_name}.ly"
     prefix = destination / safe_name
     log_path = destination / f"{safe_name}.lilypond.log"
-    render_suffixes = {".jly", ".ly", ".svg", ".mid", ".midi", ".log"}
+    render_suffixes = {".jly", ".ly", ".svg", ".pdf", ".mid", ".midi", ".log"}
     for path in destination.glob(f"{safe_name}*"):
         # Keep adjacent score/diagnostic JSON and source artifacts.  The
         # service writes those before rendering so a later LilyPond failure
@@ -233,6 +234,12 @@ def render_score(score: Score, output_dir: str | Path, *, basename: str = "score
     log_path.write_text(lilypond.stdout + lilypond.stderr, encoding="utf-8")
     if lilypond.returncode:
         raise RuntimeError(f"LilyPond failed ({lilypond.returncode}): {lilypond.stderr[-4000:]}")
+    pdf = subprocess.run([os.fspath(LILYPOND), "--pdf", "-o", os.fspath(prefix), os.fspath(lilypond_path)],
+                         cwd=ROOT, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(pdf.stdout + pdf.stderr)
+    if pdf.returncode or not Path(str(prefix)+".pdf").is_file():
+        raise RuntimeError(f"LilyPond PDF failed: {pdf.stderr[-4000:]}")
 
     svg_paths = sorted(destination.glob(f"{safe_name}*.svg"), key=natural_svg_sort_key)
     midi_candidates = sorted(destination.glob(f"{safe_name}*.mid")) + sorted(destination.glob(f"{safe_name}*.midi"))
@@ -249,6 +256,7 @@ def render_score(score: Score, output_dir: str | Path, *, basename: str = "score
         lilypond_path=os.fspath(lilypond_path),
         svg_paths=[os.fspath(path) for path in svg_paths],
         midi_path=os.fspath(midi_candidates[0]) if midi_candidates else None,
+        pdf_path=os.fspath(Path(str(prefix)+".pdf")) if Path(str(prefix)+".pdf").is_file() else None,
         log_path=os.fspath(log_path),
     )
 

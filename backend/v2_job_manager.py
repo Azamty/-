@@ -19,6 +19,7 @@ import numpy as np
 
 from .jianpu_score.analysis import analyze_audio, load_audio, probe_audio
 from .jianpu_score.direct_notation import DIRECT_ENGINE, DirectNotationOptions, combine_direct_scores
+from .jianpu_score.notation_advice import recommend_notation
 from .jianpu_score.beat_grid import beat_grid_onsets_from_notes
 from .jianpu_score.domain import (
     MusicAnalysis,
@@ -106,13 +107,15 @@ def _analysis_suggestion(analysis: MusicAnalysis) -> dict[str, Any]:
     for candidate in tempo_summary.get("candidates", []):
         if isinstance(candidate, Mapping):
             candidate.pop("beat_times", None)
+    advice = metadata.get("notation_advice") or {}
     return {
-        "bpm": float(analysis.bpm),
-        "key": analysis.key,
+        "bpm": advice.get("bpm", float(analysis.bpm)),
+        "key": advice.get("key", analysis.key),
+        "notation_advice": advice,
         "time_signature": analysis.time_signature,
         "candidates": {
-            "bpm": list(metadata.get("bpm_candidates") or [float(analysis.bpm)]),
-            "key": list(metadata.get("key_candidates") or [analysis.key]),
+            "bpm": [c["bpm"] for c in advice["tempo_candidates"]] if advice else list(metadata.get("bpm_candidates") or [float(analysis.bpm)]),
+            "key": [c["key"] for c in advice["key_candidates"]] if advice else list(metadata.get("key_candidates") or [analysis.key]),
             "time_signature": list(metadata.get("time_signature_candidates") or [analysis.time_signature]),
         },
         "warnings": list(analysis.warnings),
@@ -392,7 +395,19 @@ class V2JobService:
             if selected_engine not in {DIRECT_ENGINE, "musescore-midi-import"}:
                 raise ValueError("不支持的简谱生成方式")
             selected_options = DirectNotationOptions.model_validate(settings["direct_options"] if direct_options is None else direct_options).model_dump(mode="json")
+            advice = {}
+            if selected_engine == DIRECT_ENGINE:
+                base = self._persisted_instrumental_analysis(job_id, state)
+                if base is not None:
+                    chosen = {(t["instrument_group"], t["program"], bool(t["is_drum"])) for t in tracks if t["track_id"] in requested}
+                    chosen_notes = [n for n in state["v2"].get("notes", []) if (n["instrument_group"], n["program"], bool(n["is_drum"])) in chosen]
+                    advice = recommend_notation(base, chosen_notes)
+                    if bpm_override is None:
+                        bpm = advice["bpm"]
+                    if key_override is None:
+                        key = advice["key"]
             selection = {
+                "notation_advice": advice,
                 "notation_engine": selected_engine,
                 "direct_options": selected_options,
                 "revision": revision,
@@ -414,6 +429,11 @@ class V2JobService:
             v2["stage"] = "export"
             v2["selection_revision"] = revision
             v2["selection"] = selection
+            if advice:
+                v2["analysis"] = {**analysis, "bpm": bpm, "key": key, "notation_advice": advice,
+                    "candidates": {**analysis.get("candidates", {}),
+                        "bpm": [c["bpm"] for c in advice["tempo_candidates"]],
+                        "key": [c["key"] for c in advice["key_candidates"]]}}
             v2.update(self._notation_metadata({**state, "v2": v2}))
             v2["selection_history"] = [*v2.get("selection_history", []), deepcopy(selection)]
             state.update(
@@ -530,6 +550,8 @@ class V2JobService:
             self.manager.input_path(job_id),
             source_onsets=beat_grid_onsets_from_notes(notes),
         )
+        if self._notation_metadata(state_at_start)["notation_engine"] == DIRECT_ENGINE:
+            analysis.metadata["notation_advice"] = recommend_notation(analysis, notes)
         analysis_suggestion = _analysis_suggestion(analysis)
         analysis_path = output / "analysis-suggestion.json"
         _safe_json(analysis_path, analysis_suggestion)
@@ -811,6 +833,9 @@ class V2JobService:
             elif name.endswith((".score.mid", ".score.midi")):
                 tag, kind, item_label = "score-midi", family_kind("score_midi"), f"{label}最终 Score MIDI"
                 score_ids.append(f"{prefix}-{tag}")
+            elif name.endswith(".pdf"):
+                tag, kind, item_label = "score-pdf", family_kind("score_pdf"), f"{label}简谱 PDF"
+                score_ids.append(f"{prefix}-{tag}")
             elif name.endswith(".notated.musicxml"):
                 tag, kind, item_label = "musicxml", family_kind("musicxml"), f"{label} MusicXML"
             elif name.endswith(".alignment_report.json"):
@@ -902,6 +927,8 @@ class V2JobService:
             return "application/vnd.recordare.musicxml+xml"
         if suffix.endswith(".svg"):
             return "image/svg+xml"
+        if suffix.endswith(".pdf"):
+            return "application/pdf"
         if suffix.endswith(".json"):
             return "application/json"
         if suffix.endswith((".jly", ".ly", ".log")):
@@ -1233,6 +1260,13 @@ class V2JobService:
             },
         )
         self.manager._set_phase(job_id, "quantizing")
+        if original_analysis.metadata.get("notation_engine") == DIRECT_ENGINE:
+            advice = recommend_notation(original_analysis, [
+                {"pitch": n.midi, "start_sec": n.start_sec, "end_sec": n.end_sec} for n in raw_events])
+            updated = self._selection_analysis_metadata(original_analysis, bpm=advice["bpm"],
+                key=advice["key"], time_signature=original_analysis.time_signature)
+            updated["notation_advice"] = advice
+            original_analysis = original_analysis.model_copy(update={"bpm": advice["bpm"], "key": advice["key"], "metadata": updated})
         try:
             if original_analysis.metadata.get("notation_engine") == DIRECT_ENGINE:
                 cleanup = VocalCleanupResult(raw_events, {"schema_version": "direct-1", "stage": "deferred_to_direct_notation", "raw_count": len(raw_events)})
@@ -2623,6 +2657,12 @@ class V2JobService:
             )
         )
         artifact_ids.append(f"{prefix}-svg-long")
+        if render_artifacts.pdf_path:
+            pdf_id = f"{prefix}-pdf"
+            artifacts.append(self.manager._register(job_dir, Path(render_artifacts.pdf_path),
+                artifact_id=pdf_id, kind="melody_harmony_score_pdf", label=f"{title}组合简谱 PDF",
+                media_type="application/pdf", stem_id="melody-harmony"))
+            artifact_ids.append(pdf_id)
         for page_number, path_text in enumerate(render_artifacts.svg_paths, start=1):
             page_path = Path(path_text)
             artifact_id = f"{prefix}-svg-{page_number}"
@@ -2787,16 +2827,16 @@ class V2JobService:
         beat_grid = metadata.get("beat_grid")
         if isinstance(beat_grid, Mapping):
             updated_grid = deepcopy(dict(beat_grid))
-            if bpm_manual:
+            if bpm_manual or (metadata.get("notation_engine") == DIRECT_ENGINE and abs(bpm-base_analysis.bpm) > 1e-6):
                 # Keep the detected beat phase/local shape, but scale score
                 # beat positions only when the user explicitly changed BPM.
                 tempo = deepcopy(dict(updated_grid.get("tempo") or {}))
                 detected = float(base_analysis.bpm)
                 scale = float(bpm) / detected if detected > 0 else 1.0
                 tempo["selected_bpm"] = float(bpm)
-                tempo["manual_bpm"] = float(bpm)
+                tempo["manual_bpm"] = float(bpm) if bpm_manual else None
                 tempo["manual_scale"] = scale
-                tempo["selection_reason"] = "用户选择 BPM 优先；导出保留 BeatNet 首拍与局部拍点"
+                tempo["selection_reason"] = "用户选择 BPM 优先；导出保留 BeatNet 首拍与局部拍点" if bpm_manual else "自动选择易读记谱速度；保留原始拍点时间"
                 updated_grid["tempo"] = tempo
                 mapping = deepcopy(dict(updated_grid.get("mapping") or {}))
                 mapping["manual_bpm_scale"] = scale

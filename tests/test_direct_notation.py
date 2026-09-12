@@ -90,6 +90,9 @@ def test_real_renderer_preserves_chromatic_chords_ties_and_key_changes(tmp_path)
     rendered = render_score(score, tmp_path)
     _verify_score_midi(score, rendered.midi_path)
     assert rendered.svg_paths
+    assert rendered.pdf_path
+    from pathlib import Path
+    assert Path(rendered.pdf_path).read_bytes().startswith(b"%PDF-")
 
 
 def test_direct_labels_keep_part_names_but_shorten_continuation_labels():
