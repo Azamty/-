@@ -109,7 +109,7 @@ def test_synth_pause_contract_destroys_worklet_queue_and_resumes_from_offset() -
     assert "synthPlaying || synthPaused ? synthTime : originalTime" in source
 
 
-def test_high_accuracy_result_contract_keeps_long_score_first_and_exposes_diagnostics() -> None:
+def test_result_contract_keeps_long_score_first_and_limits_downloads() -> None:
     source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
     score_artifacts = (ROOT / "frontend" / "src" / "scoreArtifacts.ts").read_text(encoding="utf-8")
     styles = (ROOT / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
@@ -122,16 +122,17 @@ def test_high_accuracy_result_contract_keeps_long_score_first_and_exposes_diagno
     assert "track_failures" in source
     assert "部分乐器未完成" in source
     assert "当前没有可生成的简谱" in source
-    assert "instrument_musicxml" in source
-    assert "instrument_alignment_report" in source
-    assert "instrument_performance_midi" in source
+    assert "isScoreDownload(item.kind)" in source
+    assert "instrument_musicxml" not in source
+    assert "instrument_alignment_report" not in source
+    assert "instrument_performance_midi" not in source
     assert "main_melody_score_svg_long" in score_artifacts
     assert 'data-score-group="long"' in source
     assert 'data-score-group="paged"' in source
-    assert "vocal_raw_notes" in source
-    assert "vocal_cleaned_notes" in source
-    assert "high_accuracy_manifest" in source
-    assert "high_accuracy_log" in source
+    assert "vocal_raw_notes" not in source
+    assert "vocal_cleaned_notes" not in source
+    assert "high_accuracy_manifest" not in source
+    assert "high_accuracy_log" not in source
+    assert "PDF · SVG · MIDI" in source
     assert "纵向长图 SVG · 默认预览" in source
     assert "artifact-download-panel" in styles
-    assert ".support-artifacts" in styles
