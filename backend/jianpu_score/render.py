@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import mido
@@ -68,6 +69,64 @@ def _safe_basename(value: str) -> str:
 
 
 _SVG_PAGE_SUFFIX = re.compile(r"(?:^|[-_.])(?:page[-_]?)?(\d+)\.svg$", re.IGNORECASE)
+_LAYOUT_OPEN = re.compile(r"(?m)^(?P<indent>[ \t]*)\\layout[ \t]*\{(?P<eol>\r?\n|$)")
+_INSTRUMENT_NAME = re.compile(
+    r'(?m)^(?P<indent>[ \t]*)instrumentName[ \t]*=[ \t]*"(?P<label>(?:\\[^\r\n]|[^\r\n"])*)"[ \t]*(?P<eol>\r?\n|$)'
+)
+
+
+def _is_melody_harmony_score(score: Score) -> bool:
+    """Enable the combined-score layout only for its explicit metadata marker."""
+
+    return isinstance(score.metadata.get("melody_harmony"), Mapping)
+
+
+def _melody_harmony_role_label(label: str) -> tuple[str, str] | None:
+    """Map a composed lane label to stable user-facing long and short labels."""
+
+    if label.startswith("主旋律"):
+        return "主旋律", "主旋律"
+    if label.startswith("伴奏和弦"):
+        return "伴奏和弦", "和弦"
+    return None
+
+
+def _prepare_melody_harmony_lilypond(text: str) -> str:
+    """Tidy composed-score labels and hide empty lanes per LilyPond system.
+
+    The jianpu serializer emits one RhythmicStaff per composed lane. Empty
+    lanes are expected when a sparse lane has no event in a system, so the
+    combined score opts into LilyPond's first-system-aware
+    ``\\RemoveAllEmptyStaves`` command. This changes notation layout only;
+    the separate MIDI score in the source remains untouched.
+    """
+
+    def replace_instrument_name(match: re.Match[str]) -> str:
+        role = _melody_harmony_role_label(match.group("label"))
+        if role is None:
+            return match.group(0)
+        long_label, short_label = role
+        indent = match.group("indent")
+        eol = match.group("eol") or "\n"
+        return (
+            f'{indent}instrumentName = "{long_label}"{eol}'
+            f'{indent}shortInstrumentName = "{short_label}"{eol}'
+        )
+
+    prepared = _INSTRUMENT_NAME.sub(replace_instrument_name, text)
+    layout_matches = list(_LAYOUT_OPEN.finditer(prepared))
+    if not layout_matches:
+        raise RuntimeError("combined score LilyPond source has no layout block")
+    layout = layout_matches[-1]
+    layout_instructions = (
+        "  indent = 26\\mm\n"
+        "  short-indent = 18\\mm\n"
+        "  \\context {\n"
+        "    \\RhythmicStaff\n"
+        "    \\RemoveAllEmptyStaves\n"
+        "  }\n"
+    )
+    return prepared[: layout.end()] + layout_instructions + prepared[layout.end() :]
 
 
 def natural_svg_sort_key(path: str | Path) -> tuple[int, int, str]:
@@ -127,7 +186,10 @@ def render_score(score: Score, output_dir: str | Path, *, basename: str = "score
     )
     if converter.returncode:
         raise RuntimeError(f"jianpu-ly failed ({converter.returncode}): {converter.stderr[-4000:]}")
-    lilypond_path.write_text(converter.stdout, encoding="utf-8")
+    lilypond_text = converter.stdout
+    if _is_melody_harmony_score(score):
+        lilypond_text = _prepare_melody_harmony_lilypond(lilypond_text)
+    lilypond_path.write_text(lilypond_text, encoding="utf-8")
     lilypond = subprocess.run(
         [os.fspath(LILYPOND), "--svg", "-o", os.fspath(prefix), os.fspath(lilypond_path)],
         cwd=ROOT,
