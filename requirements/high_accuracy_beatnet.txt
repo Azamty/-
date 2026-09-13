@@ -1,0 +1,15 @@
+# BeatNet 1.1.3 publishes a historical numba pin that is not installable on
+# Python 3.10+.  The installer therefore creates this environment with
+# Python 3.9.x and installs this file in the order documented by the script.
+BeatNet==1.1.3
+Cython==0.29.36
+numpy==1.20.3
+numba==0.54.1
+madmom==0.16.1
+librosa==0.8.1
+scipy==1.6.3
+mido==1.2.10
+matplotlib==3.5.3
+PyAudio==0.2.14
+torch @ https://download.pytorch.org/whl/cpu/torch-2.5.1%2Bcpu-cp39-cp39-win_amd64.whl \
+    --hash=sha256:2ebd0b6135dc60b96ce51349c92c9757b2b9634a6b90045dfab3eb4921a4d62f

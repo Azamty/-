@@ -1,0 +1,5 @@
+# Installed only in .venv-model-demucs by scripts/install_models.ps1.
+demucs==4.0.1
+soundfile==0.13.1
+torch==2.5.1+cpu
+torchaudio==2.5.1+cpu

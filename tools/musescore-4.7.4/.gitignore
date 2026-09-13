@@ -1,0 +1,4 @@
+*
+!.gitignore
+!midi_import_options.xml
+!midi_import_options_vocal.xml

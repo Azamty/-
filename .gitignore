@@ -1,0 +1,19 @@
+.venv/
+.venv-model-*/
+node_modules/
+frontend/dist/
+.idea/
+__pycache__/
+*.py[cod]
+.cache/
+artifacts/
+evidence/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Keep source and scripts in the repository; local models and the rebuildable
+# LilyPond bundle stay outside the index.
+/models/
+tools/lilypond-*/

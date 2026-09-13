@@ -1,0 +1,7 @@
+# Installed only in .venv-model-game by scripts/install_models.ps1.
+# GAME's unpinned runtime dependencies are vendored with the checked source;
+# torch and torchaudio are pinned to the already verified CPU environment.
+-r ..\vendor\GAME-1.0.3\requirements.txt
+torch==2.5.1+cpu
+torchaudio==2.5.1+cpu
+soundfile==0.13.1

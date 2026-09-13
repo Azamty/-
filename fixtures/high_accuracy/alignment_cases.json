@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0",
+  "description": "Anonymous alignment cases derived from the Luv Letter failure shape; no source audio or MusicXML is included.",
+  "cases": [
+    {
+      "name": "adaptive_shift_over_four_ticks",
+      "events": [
+        {"event_id": "shift", "start_tick": 12, "end_tick": 60, "pitches": [60], "tie_types": [null]}
+      ],
+      "sources": [
+        {"source_index": 0, "midi": 60, "start_tick": 0, "end_tick": 48}
+      ]
+    },
+    {
+      "name": "logical_tie_chain",
+      "events": [
+        {"event_id": "tie-start", "start_tick": 0, "end_tick": 24, "pitches": [60], "tie_types": ["start"]},
+        {"event_id": "tie-stop", "start_tick": 24, "end_tick": 48, "pitches": [60], "tie_types": ["stop"]}
+      ],
+      "sources": [
+        {"source_index": 0, "midi": 60, "start_tick": 0, "end_tick": 48}
+      ]
+    },
+    {
+      "name": "dense_chord_quantized_group",
+      "events": [
+        {"event_id": "chord", "start_tick": 12, "end_tick": 60, "pitches": [60, 64, 67], "tie_types": [null, null, null]}
+      ],
+      "sources": [
+        {"source_index": 0, "midi": 60, "start_tick": 0, "end_tick": 48},
+        {"source_index": 1, "midi": 64, "start_tick": 0, "end_tick": 48},
+        {"source_index": 2, "midi": 67, "start_tick": 0, "end_tick": 48}
+      ]
+    },
+    {
+      "name": "same_pitch_overlap",
+      "events": [
+        {"event_id": "overlap-a", "start_tick": 0, "end_tick": 48, "pitches": [60], "tie_types": [null]},
+        {"event_id": "overlap-b", "start_tick": 48, "end_tick": 96, "pitches": [60], "tie_types": [null]}
+      ],
+      "sources": [
+        {"source_index": 0, "midi": 60, "start_tick": 0, "end_tick": 96},
+        {"source_index": 1, "midi": 60, "start_tick": 48, "end_tick": 144}
+      ]
+    },
+    {
+      "name": "duplicate_source_merge",
+      "events": [
+        {"event_id": "one-note", "start_tick": 0, "end_tick": 48, "pitches": [60], "tie_types": [null]}
+      ],
+      "sources": [
+        {"source_index": 0, "midi": 60, "start_tick": 0, "end_tick": 48},
+        {"source_index": 1, "midi": 60, "start_tick": 0, "end_tick": 48}
+      ]
+    },
+    {
+      "name": "distant_same_pitch_is_unresolved",
+      "events": [
+        {"event_id": "near-zero", "start_tick": 0, "end_tick": 24, "pitches": [60], "tie_types": [null]}
+      ],
+      "sources": [
+        {"source_index": 0, "midi": 60, "start_tick": 144, "end_tick": 168}
+      ]
+    },
+    {
+      "name": "scattered_chord_does_not_support_remote_pitch",
+      "events": [
+        {"event_id": "scattered-60", "start_tick": 48, "end_tick": 96, "pitches": [60], "tie_types": [null]},
+        {"event_id": "scattered-64", "start_tick": 0, "end_tick": 48, "pitches": [64], "tie_types": [null]},
+        {"event_id": "scattered-67", "start_tick": 12, "end_tick": 60, "pitches": [67], "tie_types": [null]}
+      ],
+      "sources": [
+        {"source_index": 0, "midi": 60, "start_tick": 0, "end_tick": 48},
+        {"source_index": 1, "midi": 64, "start_tick": 0, "end_tick": 48},
+        {"source_index": 2, "midi": 67, "start_tick": 0, "end_tick": 48}
+      ]
+    }
+  ]
+}

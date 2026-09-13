@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "description": "Exploratory same-channel same-pitch overlap for the MuseScore MIDI importer",
+  "ticks_per_quarter": 480,
+  "time_signature": "4/4",
+  "key": "C",
+  "beat_times": [0.0, 0.5, 1.0, 1.5, 2.0],
+  "downbeat_index": 0,
+  "instrument_group": "acoustic_piano",
+  "program": 0,
+  "notes": [
+    {"midi": 60, "start_sec": 0.0, "end_sec": 1.0, "voice_id": "voice-1"},
+    {"midi": 60, "start_sec": 0.5, "end_sec": 1.5, "voice_id": "voice-2"}
+  ],
+  "expected_source_note_count": 2,
+  "stage5_policy": "MuseScore import result is exploratory; validate same-pitch voice allocation and durations before claiming complete overlap preservation."
+}

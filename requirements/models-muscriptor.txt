@@ -1,0 +1,3 @@
+# MuScriptor itself is installed by scripts/install_muscriptor.ps1 so uv can
+# select the CUDA-specific PyTorch wheel with --torch-backend.
+muscriptor==0.3.0
