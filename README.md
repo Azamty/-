@@ -1,190 +1,259 @@
-# 音频转简谱（jianpu-score）
+# 音频转简谱 · jianpu-score
 
-本项目把本机音频转换为可编辑的简谱数据，并通过 jianpu-ly 与 LilyPond 生成真实 SVG。首版运行在 `127.0.0.1`，不需要登录，不提供歌词编辑或云端 PDF 服务。
+在本机把歌曲人声、钢琴或其他乐器的音频转换成简谱，支持网页试听、乐器选择，以及 **PDF、SVG 和 MIDI** 下载。
 
-## 版本与运行分支
+本说明对应 **`normal` 分支**，默认使用「直接简谱」生成方式。项目面向 Windows 本地运行，音频处理在本机完成；首次安装依赖、准备模型和加载音色库可能需要联网。
 
-`normal` 接入了人声与复音伴奏分别整理的直接简谱方式，新 V2 任务默认启用，MuseScore 方式仍可切换。页面支持时值网格、半速记谱及按小节设置转调，详见 [直接简谱说明](docs/direct-jianpu.md)。
+## 快速启动
 
-`main` 固定 V1 首版，标签 `v1.0.0` 对应已验收的八度修复与完整 V1 pipeline。当前第二版开发在 `v2/muscriptor`；切换到该分支后执行 `.\scripts\start_server.ps1 -Background`，启动脚本会按当前 checkout 启动 V2 页面。不要把 V2 的识别任务目录、模型权重、用户音频或 Hugging Face 凭证提交进 git。
+**如果这台电脑已经配置好环境，直接双击项目根目录的 [`启动简谱PDF.cmd`](启动简谱PDF.cmd)。**
 
-## 阶段1基础
+脚本会启动后台服务并打开 [简谱网页](http://127.0.0.1:8012)。已经运行时会复用现有服务，不会重复启动。关闭浏览器或启动窗口后，服务仍会在后台运行。
 
-- Python 后端环境使用项目内 `.venv`，创建它的解释器优先为本机 `E:\develop\anaconda3\envs\py310\python.exe`（Python 3.10）。
-- 模型推理环境与后端环境分开，由 `scripts\install_models.ps1` 创建，后续通过子进程调用。
-- `vendor\jianpu-ly\jianpu-ly.py` 固定为项目使用的 jianpu-ly 源码；阶段1使用 LilyPond 2.24.4 项目内工具目录。
-- vendor 中保留了必要的本地兼容扩展，允许低于三组逗号或高于三组撇号的合法 MIDI 八度标记；每次扩展都用 LilyPond 编译并回读 MIDI 检查音高。
-- 渲染器只接受统一 Score 层之后的记谱文本；人工谱例位于 `fixtures\polyphony.jly`。
+也可以在项目根目录打开 PowerShell：
 
-## 本地初始化
+```powershell
+.\scripts\start_pdf_server.ps1
 
-在 Windows PowerShell 中运行：
+# 只启动服务，不自动打开浏览器
+.\scripts\start_pdf_server.ps1 -NoBrowser
+```
+
+启动脚本要求当前分支为 `normal`，且本机已有 Python 环境和前端构建。它不会自动安装依赖、下载模型或构建前端。新电脑请先完成下方的「首次安装」。
+
+> 本分支的 PDF 网页入口是 **8012**。旧的 `start_server.ps1` 默认使用 8000 和另一套任务目录，日常使用请以 `启动简谱PDF.cmd` 为入口。
+
+## 怎么使用
+
+支持 **MP3、WAV、FLAC、M4A**，单文件不超过 **100 MiB**、时长不超过 **15 分钟**。
+
+### 扒歌曲人声
+
+1. 上传音频，选择「人声」，保留默认的「直接简谱」。
+2. 选择人声分离模型：默认 `htdemucs`，也可以选择耗时更长的 `htdemucs_ft`。
+3. 等待人声分离完成，对比试听原曲和分离后的人声。
+4. 点击「下一步 · 生成人声简谱」，等待旋律识别与排版。
+5. 查看简谱，在下载区保存 PDF、SVG 或 MIDI。
+
+这条流程提取的是**人声主旋律**。分离出来的人声可能残留伴奏，多人合唱也不保证能完整拆成不同声部。
+
+### 扒钢琴、伴奏或纯音乐
+
+1. 上传音频，选择「伴奏 / 纯音乐」，保留默认的「直接简谱」。
+2. 等待 MuScriptor 完成整段音频的乐器与音符识别。
+3. 在乐器清单勾选需要的轨道，通过钢琴卷帘和「播放选中轨」检查结果。
+4. 点击「生成分谱」，查看组合谱、乐器分谱并下载。
+
+勾选的轨道同时控制卷帘显示、合成试听、选择 MIDI 和分谱。更换勾选后重新生成，会复用已经识别的音符，无需再次运行 MuScriptor。
+
+- **鼓组**可以保留在试听和选择 MIDI 中，不生成简谱。
+- **「另外生成单声部主旋律」**会另做一份只保留单音旋律的谱，会丢失和声。
+- **本机合成试听**是用识别音符重新演奏，不是从原曲分离出的真实乐器录音。
+
+### 下载文件
+
+| 格式 | 用途 |
+| --- | --- |
+| 简谱 PDF | 阅读、打印和分享分页乐谱 |
+| 简谱 SVG | 查看矢量长图，放大或导入支持 SVG 的软件 |
+| MIDI（`.mid`） | 在编曲软件中播放、检查和继续编辑音符 |
+
+下载区只提供这三类文件。任务内部的音符数据、JSON、日志等保存在本机目录，不作为普通下载项展示。页面同时提供分页 SVG 预览。
+
+## 不懂乐理也可以先用默认设置
+
+人声和伴奏都支持**自动选择记谱方案**，不需要先输入 BPM 或调性。系统会比较拍速与调性候选；伴奏生成时还会结合所选乐器重新选择。
+
+| 页面上的内容 | 含义 |
+| --- | --- |
+| BPM | 每分钟的拍数，表示谱面的记谱速度 |
+| 拍号，如 `4/4` | 以四分音符为一拍，每小节四拍 |
+| 调性，如 `F#m` | F♯ 小调；下拉框会同时显示中文名和简谱对应关系 |
+| `1=A` | 简谱数字 `1` 对应 A 音，与 BPM 无关 |
+| 高音、和声、低音 | 为复音排版划分的声部，不等于已经识别钢琴左右手 |
+
+本项目的小调采用相对大调的数字对应关系，所以 **F♯ 小调可以显示为 `F#m · 1=A`**，主音 F♯ 对应数字 `6`。
+
+多行谱要按共同的小节和拍点一起读：**同一时刻的不同声部一起弹**，不是弹完高音一行再弹和声、低音。休止符表示该声部在对应位置停顿。
+
+如果试听或谱面明显不合适，再勾选「手动调整调性与速度（可选）」覆盖 BPM、调性和拍号。直接简谱还支持：
+
+- **最短时值**：默认十六分音符，也可选择八分或三十二分音符，影响音符起止位置的量化精细程度。
+- **半速记谱**：同时调整记谱 BPM 和音符位置，设计上保持实际试听速度。自动选择后通常不需要额外开启。
+- **调号与转调**：例如 `1:Eb, 56:E`，表示第 1 小节为降 E、第 56 小节起改为 E。小节编号从完整谱的开头计算，包含前奏；目前需要手动指定转调。
+
+更详细的处理规则见 [直接简谱说明](docs/direct-jianpu.md)。
+
+## 首次安装
+
+以下步骤在 **Windows PowerShell** 中执行。安装脚本会下载依赖，请按实际需要安装人声或伴奏环境；已经配置好的电脑无需重复执行。
+
+### 1. 准备运行环境和源码
+
+| 组件 | 用途与要求 |
+| --- | --- |
+| Git、PowerShell | 获取源码、运行启动及安装脚本 |
+| Python 3.10 | 用于后端及人声、MuScriptor 的独立环境 |
+| Python 3.9 | 单独供 BeatNet 使用，其固定的旧版依赖不能直接装进 Python 3.10 |
+| uv | 创建并安装 BeatNet、MuScriptor 环境，命令需在 PATH 中可用 |
+| Node.js | 前端安装、构建与测试；可使用 22.12 或更高的 22.x 版本 |
+| FFmpeg、ffprobe | 音频解码和信息读取，命令需在 PATH 中可用 |
+| NVIDIA 显卡及可用 CUDA 驱动 | 当前网页的 MuScriptor 伴奏识别使用 CUDA；人声 GAME 使用 CPU |
+
+```powershell
+git clone --branch normal https://github.com/Azamty/-.git jianpu-score
+cd jianpu-score
+```
+
+已有仓库时直接进入项目目录，不需要重新克隆。后续命令均从项目根目录执行。
+
+### 2. 安装后端、排版工具和拍点模型
+
+确保默认 `python` 指向 Python 3.10，且 `uv python find 3.9` 能找到已安装的 Python 3.9：
 
 ```powershell
 .\scripts\bootstrap.ps1
 .\scripts\install_lilypond.ps1
-.\scripts\check_toolchain.ps1
-.\scripts\render_fixture.ps1
+.\scripts\install_high_accuracy.ps1 -SkipMusic21
 ```
 
-`install_lilypond.ps1` 会从项目缓存或 LilyPond 官方 2.24.4 压缩包重建被忽略的本地工具目录。`render_fixture.ps1` 会在 `artifacts\stage1\` 保存输入、jianpu-ly 生成的 LilyPond 文件、LilyPond 日志、SVG 和 MIDI。脚本不会下载模型权重。
+这会分别准备 `.venv`、项目内的 LilyPond 2.24.4 和 `.venv-model-beatnet`。直接简谱由 LilyPond 生成 PDF，不需要 MuseScore 或 music21。
 
-## 可选模型环境
+有多个 Python 时，可给 `bootstrap.ps1` 传 `-PythonExe`，给 `install_high_accuracy.ps1` 传 `-Python39` 指定解释器的完整路径。若提示未找到 Python 3.9，说明 BeatNet 被跳过了，仍需补齐后才能完成拍点分析。
+
+### 3. 安装需要的识别模型
+
+**生成人声简谱：**
 
 ```powershell
-.\scripts\install_models.ps1 -Model basic-pitch
 .\scripts\install_models.ps1 -Model demucs
 .\scripts\install_models.ps1 -Model game
-.\scripts\install_models.ps1 -Model tsumugi
 ```
 
-每个模型依赖安装在自己的项目内 `.venv-model-*`，不修改全局 conda。安装脚本先升级 pip、安装锁定的 CPU 依赖并执行 `pip check` 与 import probe；`game`、`tsumugi` 只使用子进程调用。tsumugi 的 CPU 路径故意不安装 `triton-windows`，避免官方 GPU 默认索引覆盖 CPU 配置。
+另外需要准备 GAME small 预训练模型。来源说明见 [随项目保留的 GAME README](vendor/GAME-1.0.3/README.md)，默认目录应包含：
 
-GAME 源码在 `vendor\GAME-1.0.3`，small 权重、`config.yaml` 和 `lang_map.json` 在 `.cache\models\game\GAME-1.0-small`。GAME 的中文和日文语言 ID 每次从选定权重旁的 `lang_map.json` 读取；混合语言会省略 `--language`，使用官方语言无关默认值，并在结果中记录没有猜测 ID。当前权重的映射是 `zh=4`、`ja=2`，这不是代码中的硬编码。
-
-tsumugi 源码在 `vendor\tsumugi-57b79ac4e1fa30c6f3eb95f14c77271fab637eeb`，各轨道使用独立 checkpoint：人声和声 `vocal_harmony_v1_5`、贝斯 `bass_v2`、其他乐器 `other_v1_5`。人声主旋律使用 GAME；tsumugi 人声模型是和声模型，结果会带有明确提示，不能当作 GAME 主旋律结果。所有适配器都会保留 stem、秒级起止、raw pitch、velocity 和原始模型元数据。
-
-## 阶段2本地闭环
-
-基础环境就绪后，可直接把 WAV、MP3、FLAC 或 M4A 转成 Score JSON、jianpu-ly 输入、LilyPond SVG 与 MIDI：
-
-```powershell
-& .\.venv\Scripts\python.exe -m backend.jianpu_score `
-  --input .\input.wav `
-  --output .\artifacts\job `
-  --engine basic-pitch `
-  --voice-mode monophonic `
-  --bpm 80 --key C --time-signature 4/4
+```text
+.cache/models/game/GAME-1.0-small/
+├── model.pt
+├── config.yaml
+└── lang_map.json
 ```
 
-`--engine librosa` 是 CPU 基础音高后备；需要按人声或乐器声部识别时，`--separate` 会在独立 Demucs 环境调用 htdemucs。基础引擎未开启分轨时仍直接分析原始混音。所有推理结果先进入 `NoteEvent`、`MusicAnalysis`、`Score` 数据契约，再交给 jianpu-ly/LilyPond 渲染。
+也可用环境变量 `JIANPU_GAME_MODEL` 指定 `model.pt`，配置与语言映射文件仍需放在权重旁边。依赖安装成功不代表这些权重已就绪；Demucs 也需要对应分离模型的权重。
 
-## 阶段3专用引擎与能力检测
-
-```powershell
-# 查看当前本机真正可用的环境、权重和路由
-& .\.venv\Scripts\python.exe -m backend.jianpu_score --print-capabilities
-
-# 人声单旋律：Demucs vocals -> GAME
-& .\.venv\Scripts\python.exe -m backend.jianpu_score `
-  --input .\input.wav --output .\artifacts\game-job `
-  --engine specialist --source vocal --separate --voice-mode monophonic `
-  --language zh
-
-# 纯音乐单旋律：Demucs other -> tsumugi other_v1_5
-& .\.venv\Scripts\python.exe -m backend.jianpu_score `
-  --input .\input.wav --output .\artifacts\tsumugi-job `
-  --engine specialist --source instrumental --separate --voice-mode monophonic
-
-# 纯音乐多声部：Demucs bass/other -> 对应 tsumugi checkpoint
-& .\.venv\Scripts\python.exe -m backend.jianpu_score `
-  --input .\input.wav --output .\artifacts\tsumugi-poly-job `
-  --engine specialist --source instrumental --separate --voice-mode polyphonic
-```
-
-`specialist` 会按来源和声部显式路由：vocal/monophonic 使用 GAME，instrumental/monophonic 使用 `other_v1_5`，instrumental/polyphonic 使用 `bass_v2` 与 `other_v1_5`，vocal/polyphonic 会对 vocals 使用和声 checkpoint 并同时处理 bass/other。缺少环境、权重或不支持的路由会抛出明确的 unavailable 错误，不会静默改用 Basic Pitch。`librosa` 在能力结果中标为 fallback；chordscope 仍是 Windows 兼容性未验证的 optional unavailable。
-
-## 阶段4本机网页工作台
-
-先在 `frontend\` 安装并构建一次前端，然后以前台方式启动本机服务：
-
-```powershell
-Push-Location .\frontend
-npm install --no-audit --no-fund
-npm run build
-Pop-Location
-.\scripts\start_server.ps1
-```
-
-浏览器打开 `http://127.0.0.1:8000`。当前 V2 页面支持拖入 MP3、WAV、FLAC、M4A，选择伴奏 / 纯音乐或人声来源，并在选择导出前覆盖 BPM、调性和拍号；任务按单 worker 串行执行，刷新后会按本机保存的 V2 job UUID 恢复。完成任务会登记识别 MIDI、选择版本 MIDI、分页 SVG、纵向长图 SVG、Score JSON、LilyPond/jianpu-ly 源文本与任务日志。服务只监听 `127.0.0.1`，原文件最大 100 MB、时长最大 15 分钟，结束任务保留 24 小时。
-
-API 入口为 `GET /api/capabilities`、`POST /api/jobs`、`GET /api/jobs/{job_id}`、`GET /api/jobs/{job_id}/score` 和 `GET /api/jobs/{job_id}/artifacts`；产物下载只接受持久化登记的 artifact ID。服务启动会把上次运行中的任务标记为“中断待重试”，不会删除模型缓存；`-Background` 可启动隐藏后台进程。
-
-### V2 MuScriptor 工作台
-
-`v2/muscriptor` 的页面只使用 `/api/v2/...` 任务入口，来源固定为“伴奏 / 纯音乐（MuScriptor）”或“人声（GAME）”。纯音乐任务会先做一次 MuScriptor medium 全量识别，进入“识别完成，等待选择”，页面按中文乐器名、模型分类名和 note count 展示轨道，并用颜色对应时间同步钢琴卷帘。每条轨道只有一个 checkbox，它同时控制卷帘显示、SpessaSynth 试听、选择 MIDI 和分谱；鼓组可以试听并保留在选择 MIDI 中，但不会生成简谱。人声任务先运行 Demucs：默认是快速的 `htdemucs`，也可在上传前选择质量优先的 `htdemucs_ft`；任务创建后控件锁定并显示实际模型，避免误以为切换会作用于已经生成的 stem。分离阶段只登记并展示 `vocals` stem 供原曲/分离人声试听，用户点击“下一步 · 生成人声简谱”后才把该 stem 交给 GAME；刷新会保留 `vocal_ready` 和模型选择。页面的本机合成试听使用浏览器 SpessaSynth + 官方 MuseScore General SF3，识别 NoteEvent 的 `velocity` 保持 `None`，试听只使用固定 playback default。
-
-识别阶段会复用 `MusicAnalysis` 返回 BPM、调性、拍号建议、候选值和警告；拍号自动分析未启用时会按 `4/4` 回退并要求生成前确认。选择导出前的覆盖值会写入 selection revision，并实际作用于选择 MIDI 与每轨分谱渲染。原曲 `<audio>` 与合成试听分开。每个多页结果都登记纵向合并的矢量长图并在页面首位默认展示，分页 SVG 仍按页保留并放入可展开区域，全部分页页面仍进入 ZIP；长图合并器通过 XML 解析重命名重复 id 和引用，拒绝脚本、外部资源和超限尺寸。刷新会按 job UUID 恢复 V2 job、选择、覆盖值和钢琴卷帘状态；创建新任务会清空旧任务的覆盖值。`?fixture=multitrack` 可载入不调用模型的受控三轨（钢琴、小提琴、鼓组）页面，`?fixture=vocal-ready` 可载入分离完成的人声页面，用于验证两阶段试听和下一步按钮。
-
-## 最终本地验收与使用边界
-
-- 输入格式是 MP3、WAV、FLAC、M4A；上传文件上限 100 MB，解码后的音频时长上限 900 秒。文件、任务状态和生成文件保存在 `artifacts\jobs\<job_id>\`，已结束任务保留 24 小时，可从网页下载谱页、MIDI 和 SVG ZIP。
-- 基础档调用独立环境中的 Basic Pitch，适合先快速试谱；专用档按来源调用 GAME 或 tsumugi。所有模型优先 CPU，耗时取决于时长和机器性能。阶段验收中 6 秒样本约 51 秒，180 秒合成曲的完整 API 任务约 214 秒；这些是本机参考值，不是性能保证。
-- BPM、调性和拍号可以在生成前覆盖。自动拍号当前只给出 `2/4`、`3/4`、`4/4`、`6/8` 候选并回退到 `4/4`，结果会提示确认；音符先经过共享拍点时间线和 Score，再生成 SVG 与 MIDI。
-- 简谱级数、主旋律连续性和分轨结果会受到混音、噪声、复音和模型能力影响。现有真实模型验收使用短参考音阶和 180 秒合成规模样本；没有把中日文或混合语言真实歌曲准确度宣称为已验证，生成结果需要人工复核。
-- MuScriptor 负责伴奏/纯音乐的全量识别但不提供原始音轨分离；乐器误分类、漏检、复音重叠和鼓音高映射都可能影响轨道与分谱。V2 instrumental 不调用 Demucs；V2 vocal 只用所选 Demucs 模型提取 vocals，GAME 不接收原始混音或伴奏 stem，分离残留和 GAME 漏检仍需人工复核。Demucs 官方 README 将 `htdemucs` 列为默认模型，并说明 `htdemucs_ft` 是 fine-tuned 版本，分离约慢 4 倍但可能略好；本地页面沿用这两个官方模型 ID 和提示，来源为 [Demucs 官方 README](https://github.com/facebookresearch/demucs#separating-tracks)。自动拍号当前只提供 `2/4`、`3/4`、`4/4`、`6/8` 候选，无法可靠判断时回退到 `4/4` 并显示警告。
-- 180 秒规模验收记录在 `artifacts\review\stage5-final\run-20260904T120124Z\summary.json`：输入 180.0 秒，真实 Demucs + Basic Pitch 用时约 213.8 秒，分析首个事件约 0.012 秒、末个事件约 178.792 秒，Score 为 2 页，总谱和器乐分谱 MIDI 都是 180.0 秒。该目录中的 JSON、SVG、MIDI 和 ZIP 是可复查证据。
-
-后台启动可双击 `scripts\start_server.cmd`，或执行 `.\scripts\start_server.ps1 -Background`；当前 `v2/muscriptor` checkout 启动的是 V2 页面。服务 PID 保存在 `artifacts\server.pid`。停止后台服务可双击 `scripts\stop_server.cmd`，或执行 `.\scripts\stop_server.ps1`，脚本会结束已核验的服务进程树，避免模型子进程残留和下一次启动重复 worker。前台运行 `.\scripts\start_server.ps1` 时，在该窗口按 Ctrl+C 退出。
-
-## 模型来源与许可证
-
-GAME 源码随项目放在 `vendor\GAME-1.0.3`，其 `LICENSE` 为 MIT；使用的官方 small 权重及其 `config.yaml`、语言映射位于 `.cache\models\game\GAME-1.0-small`。tsumugi 源码随项目放在 `vendor\tsumugi-57b79ac4e1fa30c6f3eb95f14c77271fab637eeb`，其 `LICENSE` 为 MIT；三个 checkpoint 的来源 revision、SHA256 和文件名记录在 `.cache\models\tsumugi\provenance.json`。权重只保存在本机项目缓存中，不进入后端全局环境。
-
-## V2 阶段B（本机 MuScriptor smoke）
-
-V2 的伴奏路径直接把完整混音交给 MuScriptor，先完成一次全量识别，再按识别出的乐器选择分谱；鼓保留试听和 MIDI，跳过简谱渲染。人声路径在任务创建时选择 Demucs `htdemucs`（默认）或 `htdemucs_ft`，把选择持久化并按模型名写入分离目录，先提取并持久化 vocals，再由用户操作触发 GAME。依赖安装在独立的 `.venv-model-muscriptor` 中，Windows GPU 默认选择 CUDA 12.8：
+**生成伴奏 / 纯音乐简谱：**
 
 ```powershell
 .\scripts\install_muscriptor.ps1
-.\.venv-model-muscriptor\Scripts\python.exe .\scripts\muscriptor_smoke.py `
-  .\artifacts\review\scale_reference.wav --device cuda
 ```
 
-smoke 会记录 CUDA 设备、模型加载和解码耗时、峰值显存、完整乐器清单、鼓事件以及选中乐器的分谱计数，并写出完整识别 MIDI 与 `artifacts\review\stageB-muscriptor\smoke.json`。MuScriptor 权重和 Hugging Face 缓存均留在本机忽略目录。
+默认安装 MuScriptor 0.3.0 和 `cu128` PyTorch 环境。脚本也接受 `-TorchBackend cu126` 或 `cu124`；应与本机驱动能力匹配。虽然安装器有 `cpu` 参数，**当前网页的伴奏任务仍默认使用 CUDA**。
 
-MuScriptor medium 权重按其非商业许可使用；首次准备模型前由用户在本机完成 Hugging Face 登录并接受对应许可，脚本只读取本机缓存，不把 token 写入任务、日志或 API 响应。浏览器试听需要官方 MIT MuseScore General SF3，后端按需缓存到 `.cache\muscriptor`，来源、SHA-256、许可和预取脚本记录在 `docs\muscriptor-soundfont.md`。
+MuScriptor medium 权重需要另行准备。可复用本机 Hugging Face 的 `MuScriptor/muscriptor-medium` 缓存，或用 `MUSCRIPTOR_MODEL_PATH` 指向本地 `model.safetensors`。需要访问授权的模型，应先在本机完成相应授权和认证。
 
-## V2 阶段C（持久两阶段 API）
+上述模型安装脚本均可通过 `-PythonExe` 指定 Python 3.10。第三方源码、模型权重和音色库分别以各自的许可与使用说明为准。
 
-V2 API 与 V1 共用一个持久单 worker。`POST /api/v2/jobs` 的来源只接受
-`instrumental`（界面名称：伴奏/纯音乐）或 `vocal`（人声）。伴奏由隔离的
-MuScriptor medium CUDA worker 全量识别一次，任务进入 `selection_ready`；
-`GET /api/v2/jobs/{id}/tracks` 返回稳定 `track_id`、中文乐器名、GM program、鼓标记、音符数量和试听可用状态，并返回原音 `MusicAnalysis` 的 BPM、调性、拍号建议、候选值和警告。
-
-选择通过 `POST /api/v2/jobs/{id}/selection` 或
-`POST /api/v2/jobs/{id}/selection/export` 提交 `selected_track_ids`，并可选
-`merge_main_melody`。每个选中的有音高乐器都有独立分谱 artifact；鼓只保留在
-选中 MIDI 和试听中。没有有音高乐器时仍可导出 MIDI，但 API 会记录
-`no_pitched_tracks` 简谱拒绝。合并主旋律是单声部可选产物，会明确标记和声损失，
-不称为总谱。每次选择都会产生递增 revision，旧 artifact 保留并使用不同 ID。
-
-人声路径先由 `POST /api/v2/jobs` 排入所选 Demucs 模型（`separation_model` 只接受
-`htdemucs` 和 `htdemucs_ft`，缺省兼容为 `htdemucs`），任务到达 `vocal_ready` 后提供原曲和
-`v2-vocals-audio` 分离 stem；`POST /api/v2/jobs/{id}/vocal/generate` 才排入 GAME，
-并复用原音 `MusicAnalysis`，不会重复分离或把伴奏送入 GAME。完成后提供人声主旋律
-Score/SVG/MIDI 和长图 SVG。MuScriptor NoteEvent 的 `velocity` 保持 `null`，MIDI 试听
-才使用 metadata 标记的固定 `playback_default`。`GET /api/capabilities` 的 `v2.routes`
-字段分别报告 instrumental 的 `use_demucs=false` 与 vocal 的 `use_demucs=true`，并报告
-CUDA、medium 模型和 MuScriptor 的非商业许可证限制。
-
-真实短 API 验收可运行：
+### 4. 构建前端并启动
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\v2_api_smoke.py
+Push-Location .\frontend
+npm ci
+npm run build
+Pop-Location
+
+.\scripts\start_pdf_server.ps1
 ```
 
-验收 JSON 默认写入被忽略的 `artifacts\review\stageC-api\smoke.json`。
+之后日常使用只需双击 `启动简谱PDF.cmd`。更新前端源码后需要重新执行 `npm run build`。
 
-## V2 高精度链路（Stage10）
+高质量合成试听使用 SpessaSynth 和 MuseScore General SF3，首次使用可能需要下载音色库，也可使用页面提供的轻量试听。缓存与可选预取步骤见 [音色库说明](docs/muscriptor-soundfont.md)。
 
-当前网页只走 `/api/v2/...`。`/api/jobs` 和 `backend/jianpu_score/pipeline.py` 仍保留一个版本周期，便于 Git 回退和对照；它们不是当前网页入口。V2 生产任务使用 BeatNet → 480 PPQ performance MIDI → MuseScore MIDI 导入 → MusicXML → music21 48 TPQ Score → jianpu-ly/LilyPond，运行时不会调用旧的 `quantize_events` 均匀网格量化器。
+## 任务、缓存与日志
 
-V2 每个有音高乐器的最终结果都登记 `score.mid`、MusicXML、alignment report、performance MIDI、Score JSON、JLY、LilyPond、分页 SVG、纵向长图 SVG 和高精度 manifest；网页将长图排在分页结果之前，并将最终文件和人声 GAME 原始/清理后音符放在醒目的下载区域。鼓组只提供 MIDI。BeatNet、MuseScore、MusicXML 标准化或单轨失败会保留诊断清单和日志；部分失败显示轨道与阶段，全部失败会明确拒绝简谱，不会静默回退旧链路。结果区显示 `notation_engine`、`beat_engine`、版本和 48 TPQ。
+通过 PDF 启动脚本运行时，任务保存在：
 
-先准备隔离工具链并检查能力：
+```text
+artifacts/review/direct-jianpu/
+├── jobs/<任务 ID>/       # 音频、识别结果、简谱和任务记录
+├── server.stdout.log    # 服务标准输出
+├── server.stderr.log    # 服务错误日志
+└── server.pid           # 启动进程记录
+```
+
+可以收藏页面带有 `?job=...` 的地址，之后在同一台电脑、同一份项目中打开已有结果。PDF 启动入口关闭了通用服务的定时过期清理，任务会保留在磁盘上；空间不足时需自行备份并清理不再需要的任务。
+
+模型、缓存、用户音频和生成结果不随源码一起迁移。换电脑后，即使从 GitHub 拉取了项目，也需要重新配置环境，并单独迁移需要保留的任务和模型。
+
+## 常见问题
+
+| 现象 | 检查方式 |
+| --- | --- |
+| 双击提示分支不符 | 用 `git branch --show-current` 检查是否为 `normal`；脚本不会自动切换分支 |
+| 提示缺少 Python 环境 | 检查 `.venv/Scripts/python.exe`，首次安装运行 `bootstrap.ps1` |
+| 提示缺少前端构建 | 在 `frontend` 目录执行 `npm ci`、`npm run build` |
+| 8012 被占用 | 确认是否有其他程序占用；启动器只复用本项目服务，不会自动结束其他进程 |
+| 页面打开了，识别却失败 | 查看任务失败阶段和服务日志；网页可访问只表示后端已启动，不表示模型、CUDA 和权重都齐全 |
+| 音频读取失败 | 检查格式、大小、时长及 ffmpeg/ffprobe；也可通过 `JIANPU_FFMPEG`、`JIANPU_FFPROBE` 指定可执行文件路径 |
+| 找不到 PDF 下载 | 等待简谱生成完成并查看下载区；旧任务不会自动补出新产物，必要时用「直接简谱」重新生成 |
+| 旧任务不见了 | 确认打开的是 8012，任务目录仍在当前项目中；8000 的通用服务使用另一套任务目录 |
+| 觉得谱面或 MIDI 变快了 | 对照原曲检查起拍、拍速和音符时值；自动拍点、倍速判断及量化都可能出错，不要只凭 BPM 数值判断 |
+| 高质量试听一直加载 | 检查音色库下载状态，或点击「立即使用轻量试听」 |
+
+需要观察启动日志并用 `Ctrl+C` 结束服务时，可在 **8012 未被后台服务占用** 的情况下以前台方式运行：
 
 ```powershell
-.\scripts\install_high_accuracy.ps1
-.\scripts\check_toolchain.ps1
+.\.venv\Scripts\python.exe .\scripts\direct_jianpu_server.py
 ```
 
-BeatNet 使用独立 `.venv-model-beatnet`，MusicXML worker 使用独立 `.venv-notation`；MuseScore 4.7.4 的固定 MSI 和校验文件位于本地忽略目录 `.cache\packages`，项目解包目录是 `tools\musescore-4.7.4\MuseScore 4\bin\MuseScore4.exe`，也支持已安装的 `C:\Program Files\MuseScore 4\bin\MuseScore4.exe`。MuseScore 可以直接启动检查：`& '.\tools\musescore-4.7.4\MuseScore 4\bin\MuseScore4.exe'`；服务内的 CLI 调用从启动到退出串行执行。
+健康检查：[服务状态](http://127.0.0.1:8012/api/health)。环境信息：[能力检测](http://127.0.0.1:8012/api/capabilities)。能力检测会同时列出旧引擎组件；直接简谱不依赖其中的 MuseScore 和 music21。
 
-可重复的候选登记和指标验收见 [docs/high-accuracy-acceptance.md](docs/high-accuracy-acceptance.md)：
+## 工作原理与开发
+
+```mermaid
+flowchart TD
+    Audio[音频] --> Demucs[Demucs 人声分离]
+    Demucs --> GAME[GAME 主旋律识别]
+    Audio --> MuScriptor[MuScriptor 多乐器识别]
+    MuScriptor --> Selection[选择所需轨道]
+    Audio --> BeatNet[BeatNet 拍点与小节分析]
+    GAME --> Advice[自动记谱方案]
+    Selection --> Advice
+    BeatNet --> Advice
+    Advice --> Direct[direct_notation 音符整理]
+    Direct --> Score[统一 Score]
+    Score --> Render[jianpu-ly / LilyPond]
+    Render --> Output[PDF / SVG / MIDI]
+```
+
+人声按单旋律整理，伴奏保留复音和各音符的独立时值；统一 Score 负责小节、休止、延音与转调的表达。旧的 MuseScore 记谱路径仍可在页面选择，但需要另行准备其依赖。
+
+| 目录 | 内容 |
+| --- | --- |
+| `backend/` | FastAPI 接口、任务调度、模型适配和简谱生成 |
+| `frontend/` | React / TypeScript 页面、钢琴卷帘与合成试听 |
+| `scripts/` | 环境安装、启动、诊断与回归脚本 |
+| `requirements/` | 后端及各模型环境的依赖约束 |
+| `vendor/` | 随项目保留的第三方源码与兼容调整 |
+| `tests/` | 后端与记谱测试 |
+| `docs/` | 处理规则与专项说明 |
+
+在已安装开发依赖的环境中，可运行直接简谱相关测试和前端检查：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\high_accuracy_benchmark.py --check
+.\.venv\Scripts\python.exe -m pytest tests/test_direct_notation.py tests/test_notation_advice.py tests/test_frontend_contract.py -q
+
+Push-Location .\frontend
+npm run test:frontend
+npm run build
+Pop-Location
 ```
 
-登记表包含 PJS `pjs001`–`pjs005` 和本机 `E:\edge\first\Luv Letter.mp3`，但不提交音频。Luv Letter 的同名 MIDI 目前只用于版本/时长核对和人工听谱，因缺少可靠的音频对齐标注，不用于 pitch/rhythm 或“精度提升20%”结论；脚本没有结果目录时保持所有指标为 `null`。
+已有音符和拍点缓存时，可以用 `scripts/direct_notation_smoke.py` 复跑记谱流程，参数见 `--help`。歌曲回归测试 `tests/test_direct_song_regression.py` 依赖本机音频处理缓存，缺少缓存时会跳过。
+
+提交代码前查看 `git status`，只暂存需要的源码或文档。不要提交虚拟环境、模型权重、认证信息、用户音频和生成结果；`.artifacts/` 与 `artifacts/` 是两个不同目录，不能假定前者也被 Git 忽略。
+
+## 当前边界
+
+自动生成的简谱适合作为试听、练习和人工修订的起点。复杂复音、弱起、自由速度、三连音、滑音、踏板及乐器误分类仍可能影响结果；目前不自动识别转调和钢琴左右手。
+
+项目会回读排版生成的 MIDI，检查它与内部 Score 的音高、起止时值是否一致。这能验证记谱输出的一致性，**不代表音频识别准确率**。目前没有足够的人工标注实曲评测来给出可信的统一正确率，建议先用熟悉的片段对照原曲检查。
