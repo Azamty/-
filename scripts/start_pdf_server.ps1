@@ -3,8 +3,8 @@ param([switch]$NoBrowser)
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $branch = & git -C $projectRoot branch --show-current
-if ($LASTEXITCODE -ne 0 -or $branch -ne "codex/direct-jianpu") {
-    throw "The PDF website requires branch codex/direct-jianpu. Current branch: $branch"
+if ($LASTEXITCODE -ne 0 -or $branch -ne "normal") {
+    throw "The PDF website requires branch normal. Current branch: $branch"
 }
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $server = Join-Path $PSScriptRoot "direct_jianpu_server.py"
